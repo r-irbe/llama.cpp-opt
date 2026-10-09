@@ -4,6 +4,7 @@
 #include "mma_new.cuh"
 #include "vecdotq.cuh"
 #include "iqk_cuda_common.h"
+#include "cp-async.cuh"
 
 #include <vector>
 #include <climits>
@@ -192,6 +193,10 @@ struct tile_x_sizes {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+#define FP8_MMA_AVAILABLE
+#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
 
 #ifdef __CUDACC__
 template<typename... Args>
@@ -3458,6 +3463,27 @@ struct mmq_type_traits_id<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
 
 #include "mmq_kt_tail.cuh"
 
+template <int nwarps, int warp_size>
+static __device__ __forceinline__ void load_y_async_id(
+    int * __restrict__ dst_tile, const int * __restrict__ src_y, const int mmq_x) {
+#ifdef CP_ASYNC_AVAILABLE
+    const unsigned int dst_u32 = ggml_cuda_cvta_generic_to_shared(dst_tile);
+    const int total_16b = (mmq_x * MMQ_TILE_Y_K) / 4;
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    const int nthreads = nwarps * warp_size;
+
+#pragma unroll
+    for (int idx = tid; idx < total_16b; idx += nthreads) {
+        cp_async_cg_16<128>(dst_u32 + idx * 16, src_y + idx * 4);
+    }
+#else
+    GGML_UNUSED(dst_tile);
+    GGML_UNUSED(src_y);
+    GGML_UNUSED(mmq_x);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool has_tail>
 static __device__ __forceinline__ void mul_mat_q_process_tile_id(
         const char * __restrict__ x, const int * __restrict__ y,
@@ -3473,7 +3499,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_id(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + mmq_x;
-    int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+    constexpr int shmem_y_stride = GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+#ifdef CP_ASYNC_AVAILABLE
+    int * tile_x = tile_y + 2 * shmem_y_stride;
+#else
+    int * tile_x = tile_y + shmem_y_stride;
+#endif
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits_id<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
@@ -3489,6 +3520,53 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_id(
 
     const int kb0_full_stop = has_tail ? min(kb0_stop, ncols_x/qk) : kb0_stop;
     int kb0 = kb0_start;
+
+#ifdef CP_ASYNC_AVAILABLE
+    int * tile_y_0 = tile_y;
+    int * tile_y_1 = tile_y + shmem_y_stride;
+
+    // Pre-fetch sub-block 0 for first iteration directly to SMEM via cp.async
+    if (kb0 < kb0_full_stop) {
+        const int * by0 = y + ncols_y*(kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 0*sizeof(block_q8_1_mmq)/sizeof(int));
+        load_y_async_id<nwarps, warp_size>(tile_y_0, by0, mmq_x);
+        cp_async_commit_group();
+    }
+
+    for (; kb0 < kb0_full_stop; kb0 += blocks_per_iter) {
+        load_tiles(x, tile_x, kb0, tile_x_max_i, stride_row_x);
+
+        // Wait for sub-block 0 async copy to complete
+        cp_async_wait_group<0>();
+        __syncthreads();
+
+        // Pre-fetch sub-block 1
+        {
+            const int * by1 = y + ncols_y*(kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 1*sizeof(block_q8_1_mmq)/sizeof(int));
+            load_y_async_id<nwarps, warp_size>(tile_y_1, by1, mmq_x);
+            cp_async_commit_group();
+        }
+
+        // Tensor Core computation on sub-block 0 overlaps with background copy of sub-block 1
+        vec_dot(tile_x, tile_y_0, sum, 0);
+
+        // Wait for sub-block 1 async copy to complete
+        cp_async_wait_group<0>();
+        __syncthreads();
+
+        // Pre-fetch next iteration's sub-block 0 if more iterations remain
+        const int next_kb0 = kb0 + blocks_per_iter;
+        if (next_kb0 < kb0_full_stop) {
+            const int * next_by0 = y + ncols_y*(next_kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 0*sizeof(block_q8_1_mmq)/sizeof(int));
+            load_y_async_id<nwarps, warp_size>(tile_y_0, next_by0, mmq_x);
+            cp_async_commit_group();
+        }
+
+        // Tensor Core computation on sub-block 1 overlaps with background copy of next sub-block 0
+        vec_dot(tile_x, tile_y_1, sum, MMQ_TILE_NE_K);
+
+        __syncthreads();
+    }
+#else
     for (; kb0 < kb0_full_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, kb0, tile_x_max_i, stride_row_x);
 
@@ -3524,6 +3602,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_id(
 
         __syncthreads();
     }
+#endif // CP_ASYNC_AVAILABLE
 
     if constexpr (has_tail) {
         if (kb0 < kb0_stop) {
@@ -3974,8 +4053,9 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
     const size_t nbs_ids = mmq_x*sizeof(int);
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
-    const size_t nbs_y = mmq_x*sizeof(block_q8_1_mmq);
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+    const size_t nbs_y_padded = GGML_PAD(mmq_x*sizeof(block_q8_1_mmq), nwarps*warp_size*sizeof(int));
+    const size_t n_stages = cp_async_available(cc) ? 2 : 1;
+    return nbs_ids + nbs_x + n_stages * nbs_y_padded;
 }
 
 template <ggml_type type, int mmq_x, bool has_tail>

@@ -393,4 +393,310 @@ namespace ggml_cuda_mma {
         NO_DEVICE_CODE;
 #endif // INT8_MMA_AVAILABLE
     }
+
+    // =========================================================================
+    // Ada Lovelace (sm_89) & Hopper (sm_90) Native FP8 MMA Primitives
+    // =========================================================================
+
+    enum class fp8_type {
+        e4m3,
+        e5m2,
+    };
+
+    struct fp8x4_e4m3 {
+        uint32_t u;
+    };
+
+    struct fp8x4_e5m2 {
+        uint32_t u;
+    };
+
+    // Generic template for FP8 MMA with .f32 accumulator: m16n8k32
+    template <fp8_type atype = fp8_type::e4m3, fp8_type btype = fp8_type::e4m3, typename TileA, typename TileB>
+    static __device__ __forceinline__ void mma_fp8(
+            tile<16, 8, float> & D, const TileA & A, const TileB & B) {
+        static_assert(sizeof(TileA) == 16, "TileA must be 16 bytes per thread (4 physical 32-bit registers)");
+        static_assert(sizeof(TileB) == 8,  "TileB must be 8 bytes per thread (2 physical 32-bit registers)");
+#ifdef FP8_MMA_AVAILABLE
+#if __CUDA_ARCH__ >= CC_ADA_LOVELACE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        } else if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e5m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        }
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= CC_ADA_LOVELACE
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // FP8_MMA_AVAILABLE
+    }
+
+    // Generic template for FP8 MMA with .f32 accumulator: 16x16 tile (2x m16n8k32)
+    template <fp8_type atype = fp8_type::e4m3, fp8_type btype = fp8_type::e4m3, typename TileA, typename TileB>
+    static __device__ __forceinline__ void mma_fp8(
+            tile<16, 16, float> & D, const TileA & A, const TileB & B) {
+        static_assert(sizeof(TileA) == 16, "TileA must be 16 bytes per thread (4 physical 32-bit registers)");
+        static_assert(sizeof(TileB) == 16, "TileB must be 16 bytes per thread (4 physical 32-bit registers)");
+#ifdef FP8_MMA_AVAILABLE
+#if __CUDA_ARCH__ >= CC_ADA_LOVELACE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        } else if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e5m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e5m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        }
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= CC_ADA_LOVELACE
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // FP8_MMA_AVAILABLE
+    }
+
+    // Generic template for FP8 MMA with .f16 accumulator: m16n8k32
+    template <fp8_type atype = fp8_type::e4m3, fp8_type btype = fp8_type::e4m3, typename TileA, typename TileB>
+    static __device__ __forceinline__ void mma_fp8(
+            tile<16, 4, half2> & D, const TileA & A, const TileB & B) {
+        static_assert(sizeof(TileA) == 16, "TileA must be 16 bytes per thread (4 physical 32-bit registers)");
+        static_assert(sizeof(TileB) == 8,  "TileB must be 8 bytes per thread (2 physical 32-bit registers)");
+#ifdef FP8_MMA_AVAILABLE
+#if __CUDA_ARCH__ >= CC_ADA_LOVELACE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        } else if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e5m2.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e5m2.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e5m2.e5m2.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+        }
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= CC_ADA_LOVELACE
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // FP8_MMA_AVAILABLE
+    }
+
+    // Direct typed overloads: e4m3 x e4m3 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<8, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: e4m3 x e5m2 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<8, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Direct typed overloads: e5m2 x e4m3 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<8, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: e5m2 x e5m2 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<8, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e4m3 x e4m3 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<16, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e4m3 x e5m2 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<16, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e5m2 x e4m3 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<16, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e5m2 x e5m2 -> f32
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<16, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Direct typed overloads: e4m3 x e4m3 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 4, half2> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<8, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: e4m3 x e5m2 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 4, half2> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<8, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Direct typed overloads: e5m2 x e4m3 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 4, half2> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<8, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: e5m2 x e5m2 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 4, half2> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<8, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Generic template for FP8 MMA with .f16 accumulator: 16x16 tile (2x m16n8k32)
+    template <fp8_type atype = fp8_type::e4m3, fp8_type btype = fp8_type::e4m3, typename TileA, typename TileB>
+    static __device__ __forceinline__ void mma_fp8(
+            tile<16, 8, half2> & D, const TileA & A, const TileB & B) {
+        static_assert(sizeof(TileA) == 16, "TileA must be 16 bytes per thread (4 physical 32-bit registers)");
+        static_assert(sizeof(TileB) == 16, "TileB must be 16 bytes per thread (4 physical 32-bit registers)");
+#ifdef FP8_MMA_AVAILABLE
+#if __CUDA_ARCH__ >= CC_ADA_LOVELACE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        } else if constexpr (atype == fp8_type::e4m3 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e5m2.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e5m2.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e4m3) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e5m2.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e5m2.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        } else if constexpr (atype == fp8_type::e5m2 && btype == fp8_type::e5m2) {
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e5m2.e5m2.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[0]), "+r"(Dxi[1])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+            asm("mma.sync.aligned.m16n8k32.row.col.f16.e5m2.e5m2.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                : "+r"(Dxi[2]), "+r"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+        }
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= CC_ADA_LOVELACE
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // FP8_MMA_AVAILABLE
+    }
+
+    // Direct typed overloads: 16x16 tile e4m3 x e4m3 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, half2> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<16, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e4m3 x e5m2 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, half2> & D, const tile<16, 8, fp8x4_e4m3> & A, const tile<16, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e4m3, fp8_type::e5m2>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e5m2 x e4m3 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, half2> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<16, 8, fp8x4_e4m3> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e4m3>(D, A, B);
+    }
+
+    // Direct typed overloads: 16x16 tile e5m2 x e5m2 -> f16
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, half2> & D, const tile<16, 8, fp8x4_e5m2> & A, const tile<16, 8, fp8x4_e5m2> & B) {
+        mma_fp8<fp8_type::e5m2, fp8_type::e5m2>(D, A, B);
+    }
+
 }
