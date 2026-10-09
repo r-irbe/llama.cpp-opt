@@ -91,6 +91,7 @@ add_library(${TARGET} STATIC
     paged-kv-cache.h
     tiered-kv-cache.h
     superchip-unified-pipeline.h
+    npmc-discrete-structures.h
     regex-partial.cpp
     regex-partial.h
     reasoning-budget.cpp
