@@ -105,6 +105,45 @@ struct cluster_node_endpoint {
     int expert_end_idx{0}; // [start, end)
 };
 
+// =========================================================================================
+// Network-Oblivious D-BSP Hierarchical Token Dispatch (Bilardi et al. JACM 2016)
+// Decomposes token communication into recursive sub-supersteps:
+//   Tier 0: Intra-CCX (L3 Cache / 128B SPSC Ring Buffer)
+//   Tier 1: Intra-Socket / Inter-CCX (Local Socket NUMA Domain via xGMI)
+//   Tier 2: Inter-Socket (Cross-Socket Interconnect on same physical host)
+//   Tier 3: Inter-Node (Remote Cluster Host via RDMA / 3FS / RoCE v2)
+// =========================================================================================
+
+enum class dbsp_topology_tier {
+    INTRA_CCX = 0,    // L3 Cache / 128B SPSC Ring Buffer
+    INTRA_SOCKET = 1, // Local Socket NUMA Domain (xGMI intra-socket)
+    INTER_SOCKET = 2, // Remote NUMA Socket on same host
+    INTER_NODE = 3    // Remote Cluster Host via RDMA / 3FS
+};
+
+struct dbsp_routed_token {
+    int token_idx{0};
+    int expert_id{0};
+    int target_rank{0};
+    int target_socket{-1};
+    int target_numa_node{-1};
+    dbsp_topology_tier tier{dbsp_topology_tier::INTRA_CCX};
+};
+
+struct dbsp_subsuperstep_plan {
+    std::vector<dbsp_routed_token> tier_0_intra_ccx;
+    std::vector<dbsp_routed_token> tier_1_intra_socket;
+    std::vector<dbsp_routed_token> tier_2_inter_socket;
+    std::vector<dbsp_routed_token> tier_3_inter_node;
+
+    size_t total_tokens() const {
+        return tier_0_intra_ccx.size() + 
+               tier_1_intra_socket.size() + 
+               tier_2_inter_socket.size() + 
+               tier_3_inter_node.size();
+    }
+};
+
 class cluster_moe_router {
 public:
     cluster_moe_router(int local_rank, int world_size, int total_experts = 256)
@@ -151,6 +190,68 @@ public:
                 remote_experts_by_rank[target_rank].push_back(exp_id);
             }
         }
+    }
+
+    // Bilardi et al. (JACM 2016) Network-Oblivious D-BSP Hierarchical Recursive Token Dispatch
+    // Decomposes token communication into recursive sub-supersteps across topology tiers:
+    //   Tier 0: Intra-CCX (L3 cache / SPSC ring buffer)
+    //   Tier 1: Intra-Socket / Inter-CCX (Local socket NUMA via xGMI)
+    //   Tier 2: Inter-Socket (Cross-socket interconnect crossbar)
+    //   Tier 3: Inter-Node (Remote cluster host via RDMA / 3FS)
+    dbsp_subsuperstep_plan partition_expert_batch_dbsp(
+            const std::vector<int> & selected_experts,
+            int local_socket = 0,
+            int local_numa_node = 0,
+            int local_ccx_id = 0) const {
+        
+        dbsp_subsuperstep_plan plan;
+        for (size_t i = 0; i < selected_experts.size(); ++i) {
+            int exp_id = selected_experts[i];
+            int target_rank = get_expert_node_rank(exp_id);
+            if (target_rank < 0) continue;
+
+            dbsp_routed_token tok;
+            tok.token_idx = static_cast<int>(i);
+            tok.expert_id = exp_id;
+            tok.target_rank = target_rank;
+
+            if (target_rank != local_rank_) {
+                // Tier 3: Inter-Node (Remote RDMA)
+                tok.target_socket = -1;
+                tok.target_numa_node = -1;
+                tok.tier = dbsp_topology_tier::INTER_NODE;
+                plan.tier_3_inter_node.push_back(tok);
+            } else {
+                // Local node: resolve socket and NUMA node within local host
+                int experts_on_node = nodes_[local_rank_].expert_end_idx - nodes_[local_rank_].expert_start_idx;
+                int local_exp_offset = exp_id - nodes_[local_rank_].expert_start_idx;
+                int numa_count = std::max(1, nodes_[local_rank_].numa_nodes_count);
+                int socket_count = std::max(1, nodes_[local_rank_].socket_count);
+                int numa_per_socket = numa_count / socket_count;
+
+                int target_numa = (local_exp_offset * numa_count) / std::max(1, experts_on_node);
+                int target_socket = target_numa / std::max(1, numa_per_socket);
+                int target_ccx = target_numa; // In NPS4, 1 NUMA node = 1 CCX/CCD
+
+                tok.target_numa_node = target_numa;
+                tok.target_socket = target_socket;
+
+                if (target_socket != local_socket) {
+                    // Tier 2: Inter-Socket Crossbar
+                    tok.tier = dbsp_topology_tier::INTER_SOCKET;
+                    plan.tier_2_inter_socket.push_back(tok);
+                } else if (target_ccx != local_ccx_id) {
+                    // Tier 1: Intra-Socket / Inter-CCX
+                    tok.tier = dbsp_topology_tier::INTRA_SOCKET;
+                    plan.tier_1_intra_socket.push_back(tok);
+                } else {
+                    // Tier 0: Intra-CCX (local L3 / SPSC ring)
+                    tok.tier = dbsp_topology_tier::INTRA_CCX;
+                    plan.tier_0_intra_ccx.push_back(tok);
+                }
+            }
+        }
+        return plan;
     }
 
     int get_local_rank() const { return local_rank_; }

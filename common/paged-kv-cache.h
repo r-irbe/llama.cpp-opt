@@ -300,6 +300,32 @@ public:
 
     const paged_kv_config & config() const { return m_config; }
 
+    // Direct zero-copy memory descriptor for io_uring / PCIe direct DMA splicing
+    bool get_block_dma_target(int32_t block_id, void *& out_ptr, size_t & out_bytes) const {
+        if (block_id < 0 || (uint32_t)block_id >= m_config.max_blocks) {
+            out_ptr = nullptr;
+            out_bytes = 0;
+            return false;
+        }
+        out_ptr = m_blocks[block_id].k_data;
+        out_bytes = m_total_block_bytes;
+        return true;
+    }
+
+    uint8_t * get_block_k(int32_t block_id) const {
+        if (block_id < 0 || (uint32_t)block_id >= m_config.max_blocks) return nullptr;
+        return m_blocks[block_id].k_data;
+    }
+
+    uint8_t * get_block_v(int32_t block_id) const {
+        if (block_id < 0 || (uint32_t)block_id >= m_config.max_blocks) return nullptr;
+        return m_blocks[block_id].v_data;
+    }
+
+    size_t get_block_aligned_bytes() const {
+        return m_aligned_block_bytes;
+    }
+
 private:
     paged_kv_config m_config;
     size_t m_block_bytes_k;

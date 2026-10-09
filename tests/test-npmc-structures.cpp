@@ -144,6 +144,49 @@ int main() {
     std::cout << "  Morton Z-Order 2D bit-interleaving roundtrip verified for all test coordinates.\n";
     std::cout << "  Morton Z-Order Engine PASSED OK.\n\n";
 
+    // -------------------------------------------------------------------------------------
+    // Test 5: Kernel Fusion for Roaring Bitmap Logit Masking
+    // -------------------------------------------------------------------------------------
+    std::cout << "[5] Testing Kernel Fusion for Roaring Bitmap Logit Masking...\n";
+    const size_t test_vocab_size = 1024;
+    std::vector<float> logits(test_vocab_size, 1.0f);
+
+    // Build allowed set: allow tokens in [100..200]
+    roaring_token_set allowed_set;
+    for (uint32_t t = 100; t <= 200; ++t) {
+        allowed_set.add(t);
+    }
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+    allowed_set.mask_logits_fused(logits.data(), test_vocab_size, -1e9f);
+    auto t_end = std::chrono::high_resolution_clock::now();
+
+    auto mask_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
+    std::cout << "  Fused logit masking completed in " << mask_ns << " ns across " << test_vocab_size << " logits\n";
+
+    // Verify: logits[0..99] should be -1e9f, logits[100..200] should be 1.0f, logits[201..1023] should be -1e9f
+    bool mask_valid = true;
+    for (size_t t = 0; t < test_vocab_size; ++t) {
+        if (t >= 100 && t <= 200) {
+            if (logits[t] != 1.0f) {
+                std::cerr << "FAIL: Allowed token " << t << " was improperly masked to " << logits[t] << "\n";
+                mask_valid = false;
+                break;
+            }
+        } else {
+            if (logits[t] != -1e9f) {
+                std::cerr << "FAIL: Blocked token " << t << " was not masked! Value = " << logits[t] << "\n";
+                mask_valid = false;
+                break;
+            }
+        }
+    }
+
+    if (!mask_valid) {
+        return 1;
+    }
+    std::cout << "  Kernel Fusion for Roaring Bitmap Logit Masking PASSED OK.\n\n";
+
     std::cout << "=================================================================\n";
     std::cout << "  ALL GGUF-X / NPMC DISCRETE MATHEMATICAL TESTS PASSED (100%)    \n";
     std::cout << "=================================================================\n";

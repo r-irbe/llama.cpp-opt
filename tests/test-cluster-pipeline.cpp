@@ -109,6 +109,37 @@ int main() {
               << " (" << node1_lookup.prefix_length << " tokens, cohort: " << node1_lookup.cohort_id << ")\n";
     std::cout << "  Decentralized Cohort Prefix Sync PASSED OK.\n\n";
 
+    // -------------------------------------------------------------------------------------
+    // Test 4: Network-Oblivious D-BSP Hierarchical Token Dispatch (Bilardi et al. JACM 2016)
+    // -------------------------------------------------------------------------------------
+    std::cout << "[4] Testing Network-Oblivious D-BSP Hierarchical Token Dispatch...\n";
+    std::vector<int> dbsp_batch = {0, 10, 45, 200};
+    auto plan = router.partition_expert_batch_dbsp(dbsp_batch, 0 /* local_socket */, 0 /* local_numa */, 0 /* local_ccx */);
+
+    if (plan.tier_0_intra_ccx.size() != 1 || plan.tier_0_intra_ccx[0].expert_id != 0) {
+        std::cerr << "FAIL: Tier 0 Intra-CCX routing mismatch!\n";
+        return 1;
+    }
+    if (plan.tier_1_intra_socket.size() != 1 || plan.tier_1_intra_socket[0].expert_id != 10) {
+        std::cerr << "FAIL: Tier 1 Intra-Socket routing mismatch!\n";
+        return 1;
+    }
+    if (plan.tier_2_inter_socket.size() != 1 || plan.tier_2_inter_socket[0].expert_id != 45) {
+        std::cerr << "FAIL: Tier 2 Inter-Socket routing mismatch!\n";
+        return 1;
+    }
+    if (plan.tier_3_inter_node.size() != 1 || plan.tier_3_inter_node[0].expert_id != 200) {
+        std::cerr << "FAIL: Tier 3 Inter-Node routing mismatch!\n";
+        return 1;
+    }
+
+    std::cout << "  D-BSP Sub-Superstep Plan (total tokens: " << plan.total_tokens() << "):\n";
+    std::cout << "    Tier 0 (Intra-CCX):      " << plan.tier_0_intra_ccx.size() << " tokens (expert " << plan.tier_0_intra_ccx[0].expert_id << ")\n";
+    std::cout << "    Tier 1 (Intra-Socket):   " << plan.tier_1_intra_socket.size() << " tokens (expert " << plan.tier_1_intra_socket[0].expert_id << ")\n";
+    std::cout << "    Tier 2 (Inter-Socket):   " << plan.tier_2_inter_socket.size() << " tokens (expert " << plan.tier_2_inter_socket[0].expert_id << ")\n";
+    std::cout << "    Tier 3 (Inter-Node):     " << plan.tier_3_inter_node.size() << " tokens (expert " << plan.tier_3_inter_node[0].expert_id << ")\n";
+    std::cout << "  Network-Oblivious D-BSP Hierarchical Token Dispatch PASSED OK.\n\n";
+
     std::cout << "=================================================================\n";
     std::cout << "  ALL DISTRIBUTED CLUSTER SCALE-OUT TESTS PASSED (100% SUCCESS)  \n";
     std::cout << "=================================================================\n";

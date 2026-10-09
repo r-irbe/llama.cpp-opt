@@ -168,6 +168,30 @@ int main() {
     }
     std::cout << "  Dynamic Block Sizing PASSED OK.\n\n";
 
+    // -------------------------------------------------------------------------------------
+    // Test 5: Van Emde Boas Cache-Oblivious Speculative Draft Buffer
+    // -------------------------------------------------------------------------------------
+    std::cout << "[5] Testing Van Emde Boas Speculative Draft Buffer...\n";
+    veb_speculative_draft_buffer draft_buf;
+    std::vector<llama_token> draft_tokens = {101, 102, 103, 104, 105, 106, 107};
+    std::vector<float> draft_probs = {0.9f, 0.85f, 0.8f, 0.75f, 0.7f, 0.65f, 0.6f};
+
+    draft_buf.pack_draft_sequence(draft_tokens.data(), draft_probs.data(), draft_tokens.size());
+    if (draft_buf.count != 7 || draft_buf.packed_tokens.size() != 7) {
+        std::cerr << "FAIL: Speculative draft buffer size mismatch!\n";
+        return 1;
+    }
+
+    // Verify all original tokens are preserved in the permutation
+    std::vector<llama_token> sorted_packed = draft_buf.packed_tokens;
+    std::sort(sorted_packed.begin(), sorted_packed.end());
+    if (sorted_packed != draft_tokens) {
+        std::cerr << "FAIL: Speculative draft buffer lost or corrupted tokens during vEB packing!\n";
+        return 1;
+    }
+    std::cout << "  Packed 7 draft tokens into cache-oblivious vEB sequence.\n";
+    std::cout << "  vEB Speculative Draft Buffer PASSED OK.\n\n";
+
     std::cout << "=================================================================\n";
     std::cout << "  ALL VAN EMDE BOAS & DYNAMIC BLOCK SIZE TESTS PASSED (100%)     \n";
     std::cout << "=================================================================\n";

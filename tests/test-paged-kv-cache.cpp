@@ -112,6 +112,22 @@ int main() {
     printf("  All %u blocks cleanly returned to free list (zero memory leaks).\n", cfg.max_blocks);
     printf("  Recycling check PASSED OK.\n\n");
 
+    // -------------------------------------------------------------------------------------
+    // Test 8: Direct Zero-Copy DMA Target Resolution (io_uring / PCIe Direct Splicing)
+    // -------------------------------------------------------------------------------------
+    printf("[8] Verifying Direct Zero-Copy DMA Target Resolution (io_uring Splicing)...\n");
+    void * dma_ptr = nullptr;
+    size_t dma_bytes = 0;
+    bool dma_ok = kv.get_block_dma_target(0, dma_ptr, dma_bytes);
+    assert(dma_ok);
+    assert(dma_ptr != nullptr);
+    assert(dma_bytes == (cfg.block_size_tokens * cfg.n_embd_k + cfg.block_size_tokens * cfg.n_embd_v));
+    assert(((uintptr_t)dma_ptr & 127) == 0); // 128-byte cache line alignment
+    assert(kv.get_block_k(0) == dma_ptr);
+    assert(kv.get_block_v(0) == (uint8_t *)dma_ptr + (cfg.block_size_tokens * cfg.n_embd_k));
+    printf("  Block 0 resolved DMA target: %p (bytes: %zu, 128B aligned)\n", dma_ptr, dma_bytes);
+    printf("  Direct DMA Splicing target check PASSED OK.\n\n");
+
     printf("=================================================================\n");
     printf("  ALL HOST-RAM PAGED ATTENTION TESTS PASSED WITH 100%% SUCCESS    \n");
     printf("=================================================================\n");

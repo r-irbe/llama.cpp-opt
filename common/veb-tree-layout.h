@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -258,3 +259,53 @@ public:
         return veb_nodes;
     }
 };
+
+// =========================================================================================
+// 4. Van Emde Boas Cache-Oblivious Speculative Draft Buffer
+// Arranges speculative draft token sequences and probabilities into a cache-oblivious
+// layout so verification passes experience minimal L1/L2 data cache misses.
+// =========================================================================================
+
+struct veb_speculative_draft_buffer {
+    std::vector<llama_token> packed_tokens;
+    std::vector<float> packed_probs;
+    size_t count{0};
+
+    void pack_draft_sequence(const llama_token * tokens, const float * probs, size_t n_tokens) {
+        count = n_tokens;
+        if (n_tokens == 0) return;
+
+        packed_tokens.resize(n_tokens);
+        if (probs) {
+            packed_probs.resize(n_tokens);
+        }
+
+        // Apply recursive vEB layout permutation for complete binary tree sizes (n = 2^(h+1) - 1 >= 7)
+        uint32_t h = 0;
+        while (((1U << (h + 1)) - 1) < n_tokens) {
+            h++;
+        }
+        uint32_t cap = (1U << (h + 1)) - 1;
+
+        if (n_tokens == cap && n_tokens >= 7) {
+            veb_layout_mapper mapper(h);
+            for (size_t i = 0; i < n_tokens; ++i) {
+                uint32_t eyt_idx = static_cast<uint32_t>(i + 1);
+                uint32_t veb_idx = mapper.to_veb(eyt_idx);
+                if (veb_idx < n_tokens) {
+                    packed_tokens[veb_idx] = tokens[i];
+                    if (probs) {
+                        packed_probs[veb_idx] = probs[i];
+                    }
+                }
+            }
+        } else {
+            // Short sequences (< 7) or non-complete trees already fit in contiguous cache lines
+            std::memcpy(packed_tokens.data(), tokens, n_tokens * sizeof(llama_token));
+            if (probs) {
+                std::memcpy(packed_probs.data(), probs, n_tokens * sizeof(float));
+            }
+        }
+    }
+};
+

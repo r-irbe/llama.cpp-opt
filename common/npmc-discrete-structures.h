@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -118,6 +119,82 @@ public:
             total += pair.second->count();
         }
         return total;
+    }
+
+    // Direct Fused Logit Masking:
+    // Takes logits array of size n_vocab. Tokens allowed in this roaring token set remain untouched.
+    // Tokens blocked (bit is 0 or chunk not present) have logits set to mask_val (-INFINITY).
+    // Word-level fast path:
+    // - If a 64-bit word is ~0ULL (all 64 tokens allowed): zero writes, completely skipped!
+    // - If a 64-bit word is 0ULL (all 64 tokens blocked): vectorized store of mask_val!
+    // - If mixed: test bits and mask only the blocked tokens.
+    void mask_logits_fused(float * logits, size_t n_vocab, float mask_val = -INFINITY) const {
+        if (!logits || n_vocab == 0) return;
+
+        size_t n_chunks = (n_vocab + 65535) / 65536;
+        for (size_t c = 0; c < n_chunks; ++c) {
+            uint16_t chunk_key = static_cast<uint16_t>(c);
+            size_t chunk_base = c * 65536;
+            size_t chunk_limit = std::min<size_t>(65536, n_vocab - chunk_base);
+
+            auto it = chunks_.find(chunk_key);
+            if (it == chunks_.end()) {
+                // Entire chunk is absent: all tokens in this chunk are blocked
+#if defined(__AVX2__)
+                __m256 v_mask = _mm256_set1_ps(mask_val);
+                size_t v_end = (chunk_limit / 8) * 8;
+                for (size_t i = 0; i < v_end; i += 8) {
+                    _mm256_storeu_ps(&logits[chunk_base + i], v_mask);
+                }
+                for (size_t i = v_end; i < chunk_limit; ++i) {
+                    logits[chunk_base + i] = mask_val;
+                }
+#else
+                for (size_t i = 0; i < chunk_limit; ++i) {
+                    logits[chunk_base + i] = mask_val;
+                }
+#endif
+                continue;
+            }
+
+            const auto & container = it->second;
+            size_t n_words = (chunk_limit + 63) / 64;
+            for (size_t w = 0; w < n_words; ++w) {
+                size_t word_base = chunk_base + (w << 6);
+                size_t tokens_in_word = std::min<size_t>(64, n_vocab - word_base);
+                uint64_t mask = container->words[w];
+
+                if (mask == ~0ULL && tokens_in_word == 64) {
+                    // All 64 tokens allowed: zero memory writes!
+                    continue;
+                }
+
+                if (mask == 0ULL) {
+                    // All tokens in this word are blocked
+#if defined(__AVX2__)
+                    __m256 v_mask = _mm256_set1_ps(mask_val);
+                    size_t v_end = (tokens_in_word / 8) * 8;
+                    for (size_t i = 0; i < v_end; i += 8) {
+                        _mm256_storeu_ps(&logits[word_base + i], v_mask);
+                    }
+                    for (size_t i = v_end; i < tokens_in_word; ++i) {
+                        logits[word_base + i] = mask_val;
+                    }
+#else
+                    for (size_t i = 0; i < tokens_in_word; ++i) {
+                        logits[word_base + i] = mask_val;
+                    }
+#endif
+                } else {
+                    // Mixed bits: selectively mask zero bits
+                    for (size_t bit = 0; bit < tokens_in_word; ++bit) {
+                        if ((mask & (1ULL << bit)) == 0) {
+                            logits[word_base + bit] = mask_val;
+                        }
+                    }
+                }
+            }
+        }
     }
 
 private:
