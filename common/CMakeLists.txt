@@ -87,6 +87,7 @@ add_library(${TARGET} STATIC
     ngram-mod.h
     suffix-tree.cpp
     suffix-tree.h
+    ccd-suffix-trie.h
     regex-partial.cpp
     regex-partial.h
     reasoning-budget.cpp

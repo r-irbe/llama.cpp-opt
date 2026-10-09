@@ -233,6 +233,9 @@ target_include_directories(test-mpsc-ring PRIVATE ${PROJECT_SOURCE_DIR}/common)
 llama_build_and_test(test-bench-server-queue.cpp)
 target_include_directories(test-bench-server-queue PRIVATE ${PROJECT_SOURCE_DIR}/common)
 
+llama_build_and_test(test-ccd-suffix-trie.cpp)
+target_include_directories(test-ccd-suffix-trie PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
