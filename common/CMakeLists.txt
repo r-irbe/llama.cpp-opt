@@ -93,6 +93,7 @@ add_library(${TARGET} STATIC
     superchip-unified-pipeline.h
     npmc-discrete-structures.h
     distributed-cluster-pipeline.h
+    veb-tree-layout.h
     regex-partial.cpp
     regex-partial.h
     reasoning-budget.cpp

@@ -64,6 +64,29 @@ struct paged_kv_config {
     uint32_t max_blocks{4096};      // Total block pool capacity
     bool use_hugetlb{true};         // Pre-fault with HugeTLB / Transparent Huge Pages
     bool pin_host_memory{true};     // Pin host pages for direct PCIe DMA
+
+    // Dynamic block size autotuning for modern hardware architectures:
+    // - For short context / high concurrency (< 4096 tokens): 16 tokens minimizes tail fragmentation
+    // - For long context (>= 4096 tokens) or Hopper/Blackwell TMA: 32 tokens maximizes TMA 128B warp efficiency
+    static paged_kv_config auto_tune(uint32_t context_length, 
+                                     bool has_hopper_blackwell_tma, 
+                                     uint32_t n_embd_k = 1024, 
+                                     uint32_t n_embd_v = 1024,
+                                     uint32_t max_blocks = 4096) {
+        paged_kv_config cfg;
+        cfg.n_embd_k = n_embd_k;
+        cfg.n_embd_v = n_embd_v;
+        cfg.max_blocks = max_blocks;
+        cfg.use_hugetlb = true;
+        cfg.pin_host_memory = true;
+
+        if (has_hopper_blackwell_tma || context_length >= 4096) {
+            cfg.block_size_tokens = 32; // 128 KB per layer, matches TMA 128B transaction units
+        } else {
+            cfg.block_size_tokens = 16; // 64 KB per layer, minimizes tail fragmentation
+        }
+        return cfg;
+    }
 };
 
 class common_paged_kv_cache {
