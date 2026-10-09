@@ -254,6 +254,9 @@ target_include_directories(test-cluster-pipeline PRIVATE ${PROJECT_SOURCE_DIR}/c
 llama_build_and_test(test-veb-layout.cpp)
 target_include_directories(test-veb-layout PRIVATE ${PROJECT_SOURCE_DIR}/common)
 
+llama_build_and_test(test-eytzinger-layout.cpp)
+target_include_directories(test-eytzinger-layout PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
