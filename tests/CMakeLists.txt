@@ -239,6 +239,9 @@ target_include_directories(test-ccd-suffix-trie PRIVATE ${PROJECT_SOURCE_DIR}/co
 llama_build_and_test(test-paged-kv-cache.cpp)
 target_include_directories(test-paged-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/common)
 
+llama_build_and_test(test-tiered-kv-cache.cpp)
+target_include_directories(test-tiered-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
