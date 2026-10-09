@@ -90,6 +90,7 @@ add_library(${TARGET} STATIC
     ccd-suffix-trie.h
     paged-kv-cache.h
     tiered-kv-cache.h
+    superchip-unified-pipeline.h
     regex-partial.cpp
     regex-partial.h
     reasoning-budget.cpp

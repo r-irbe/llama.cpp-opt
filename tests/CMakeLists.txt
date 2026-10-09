@@ -242,6 +242,9 @@ target_include_directories(test-paged-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/com
 llama_build_and_test(test-tiered-kv-cache.cpp)
 target_include_directories(test-tiered-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/common)
 
+llama_build_and_test(test-superchip-pipeline.cpp)
+target_include_directories(test-superchip-pipeline PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 

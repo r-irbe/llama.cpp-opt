@@ -234,6 +234,7 @@ def probe_cpu_topology(sysfs_root="/sys"):
                     if len(parts) >= 4:
                         free_bytes = int(parts[3]) * 1024
 
+            is_cxl = (len(node_cpus) == 0 and tot_bytes > 0)
             numa_nodes.append({
                 "id": node_id,
                 "socket_id": node_pkg,
@@ -241,9 +242,11 @@ def probe_cpu_topology(sysfs_root="/sys"):
                 "core_count": len(node_cores),
                 "total_bytes": tot_bytes,
                 "free_bytes": free_bytes,
+                "is_cxl": is_cxl,
             })
 
     total_numa_nodes = len(numa_nodes)
+    cxl_node_ids = [n["id"] for n in numa_nodes if n.get("is_cxl")]
     nodes_per_socket = total_numa_nodes // num_sockets if num_sockets > 0 else 1
     nps_mode = f"NPS{nodes_per_socket}" if total_numa_nodes > 1 else "UMA / NPS0"
 
@@ -258,6 +261,7 @@ def probe_cpu_topology(sysfs_root="/sys"):
         "total_logical_cpus": total_logical_cpus,
         "smt_threads_per_core": smt_threads_per_core,
         "numa_nodes": numa_nodes,
+        "cxl_node_ids": cxl_node_ids,
         "total_numa_nodes": total_numa_nodes,
         "nodes_per_socket": nodes_per_socket,
         "nps_mode": nps_mode,
@@ -328,7 +332,11 @@ def probe_pci_gpus(sysfs_root="/sys"):
         ("0x10de", "0x2322"): "NVIDIA H100 SXM5",
         ("0x1a03", "0x2000"): "ASPEED AST2500 BMC Graphics",
         ("0x1002", "0x7408"): "AMD Radeon RX 7900 XTX (Navi 31)",
-        ("0x1002", "0x7448"): "AMD Instinct MI300X",
+        ("0x1002", "0x740c"): "AMD Instinct MI300A APU (128GB HBM3 @ 5.3 TB/s)",
+        ("0x1002", "0x7448"): "AMD Instinct MI300X OAM",
+        ("0x10de", "0x2340"): "NVIDIA Grace Hopper (GH200 NVLink-C2C 900 GB/s)",
+        ("0x10de", "0x2341"): "NVIDIA Grace Hopper (GH200 NVLink-C2C 900 GB/s)",
+        ("0x10de", "0x2941"): "NVIDIA Grace Blackwell (GB200 NVLink-C2C 1,800 GB/s)",
     }
 
     for dev_path in sorted(glob.glob(os.path.join(pci_dir, "*"))):
