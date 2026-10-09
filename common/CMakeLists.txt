@@ -92,6 +92,7 @@ add_library(${TARGET} STATIC
     tiered-kv-cache.h
     superchip-unified-pipeline.h
     npmc-discrete-structures.h
+    distributed-cluster-pipeline.h
     regex-partial.cpp
     regex-partial.h
     reasoning-budget.cpp
