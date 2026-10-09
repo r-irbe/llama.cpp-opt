@@ -113,6 +113,33 @@ The container specification establishes a strict mathematical crossover boundary
 - **Problem**: In multi-NUMA heterogeneous serving, partitioning 256 experts across 8 NUMA nodes without expert compute collisions requires solving an Exact Cover problem across pipeline stages.
 - **Algorithm X via DLX (Knuth 2000, TAOCP 4B)**: NPMC pre-encodes the sparse compatibility matrix using circular doubly linked lists (Dancing Links). Traversal covers and uncovers matrix columns in $O(1)$ operations with zero heap allocation, solving conflict-free stage assignments in $<5\ \mu\text{s}$.
 
+### 3.7 Multi-Tier Memory Layout Specification & Zero-Copy View Descriptors
+
+To maximize throughput across heterogeneous memory hierarchies (L1/L2/L3 CPU caches, GPU VRAM / shared memory, NUMA host RAM, and NVMe Direct I/O), GGUF-X / NPMC containers encode multi-tier spatial layouts per tensor via container metadata keys:
+- `npmc.tensor_layout_default`: Default layout identifier (`GGUF_TYPE_UINT32`, default: `0 = LINEAR`).
+- `npmc.tensor_layout.<tensor_name>`: Specialized tensor layout tag (`GGUF_TYPE_UINT32`).
+
+#### 3.7.1 Layout Type Taxonomy
+
+| Layout ID | Layout Name | Mathematical / Algorithmic Foundation | Hardware Target & Access Pattern | Typical In-Tree Usage |
+|---|---|---|---|---|
+| `0` | `LINEAR` | Standard row-major contiguous memory | General CPU/GPU compute, linear GEMM passes | Default dense projection weights |
+| `1` | `EYTZINGER_BFS` | Michael von Aitzing (1590), Williams (1964), Khuong & Morin (2017): 1-based implicit binary search tree breadth-first array | In-cache L1/L2/L3 search, 100% branchless CMOV arithmetic, single-cycle `TZCNT` decoding, software prefetching | Token sets, vocabulary index tables, MoE router top-$k$ gating |
+| `2` | `VEB_TREE` | Van Emde Boas (1975), Prokop (1999): Recursive cache-oblivious tree bisection with $O(\log_B N)$ cache transfers | Multi-level cache hierarchies with unknown cache-line sizes, medium-to-large static search trees | Suffix trie lookup index, speculative draft token hierarchies |
+| `3` | `MORTON_2D` | Morton (1966): 2D Morton Z-order space-filling curve with $64 \times 64$ macro-tiles accelerated via BMI2 `PDEP`/`PEXT` | 2D spatial locality for matrix sub-blocks, eliminating row-stride DRAM bank conflict aliasing | Critical attention matrices, KV cache activation blocks |
+| `4` | `SOA_SWIZZLED` | Structure-of-Arrays with bank-conflict-free XOR/bit-rotation swizzling | GPU shared memory and Tensor Core MMA operands | Tensor Core register fragment tiles |
+| `5` | `NVME_BPLUS_EXTENT` | Knuth (TAOCP 3 §6.2.4): 4KB sector-aligned and 2MB HugeTLB-aligned B+Tree extents | High-throughput Direct I/O via Linux `io_uring` + `O_DIRECT` | Routed MoE expert weights staged directly from NVMe RAID0 |
+
+#### 3.7.2 Zero-Copy View Semantics & Pointer Shift Mechanics
+
+In-memory structures often suffer from heap allocation overhead when deserialized. NPMC specifies zero-copy, non-owning view abstractions (`eytzinger_tree_view<Key, Value>`, `eytzinger_key_view<Key>`) that bind directly to mmapped container buffers without memory allocation or copying:
+- **1-Based Indexing Impedance Match**: Eytzinger and Williams binary heap layouts utilize 1-based root arithmetic: left child $= 2k$, right child $= 2k+1$, parent $= \lfloor k/2 \rfloor$. To avoid allocating a dummy element at index 0 or adding $+1$ arithmetic on every cycle, non-owning views apply a single pointer shift during view construction:
+  $$\text{data\_} = \text{ptr} - 1$$
+  This ensures that $k=1$ transparently accesses memory byte offset 0 (`ptr[0]`), and $k=n$ accesses `ptr[n-1]`.
+- **Single-Cycle Trailing-Zero Bit Manipulation**: The search terminates when $k > n$. The lower-bound leaf is decoded in a single cycle without branching using the hardware trailing-zero count of the bitwise inverse:
+  $$\text{idx} = k \gg (\text{\_\_builtin\_ctzll}(\sim k) + 1)$$
+  On x86-64 CPUs with BMI1/BMI2, this compiles directly into the single-cycle `_tzcnt_u64` instruction.
+
 ---
 
 ## 4. High-Ratio Line-Rate Streaming Decompression

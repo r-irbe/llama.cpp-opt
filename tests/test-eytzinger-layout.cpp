@@ -176,9 +176,53 @@ int main() {
     std::cout << "  Eytzinger Flat Key Array PASSED OK.\n\n";
 
     // -------------------------------------------------------------------------------------
-    // Test 3: Microarchitectural Comparative Benchmarks Across Cache Regimes
+    // Test 3: Zero-Copy Non-Owning View (eytzinger_tree_view & eytzinger_key_view) over Raw Memory
     // -------------------------------------------------------------------------------------
-    std::cout << "[3] Running Comparative Microarchitectural Benchmarks (100,000 queries)...\n";
+    std::cout << "[3] Verifying Zero-Copy Non-Owning Views over Raw Buffer Memory...\n";
+    // 3a. Export compact nodes into raw byte buffer (simulating mmapped GGUF-X tensor)
+    auto compact_nodes = tree.export_compact();
+    assert(compact_nodes.size() == 63);
+
+    // Instantiate non-owning view on raw void* pointer
+    eytzinger_tree_view<int, int> tree_view(compact_nodes.data(), compact_nodes.size());
+    if (tree_view.size() != 63) {
+        std::cerr << "FAIL: eytzinger_tree_view size mismatch! Expected 63, got " << tree_view.size() << "\n";
+        return 1;
+    }
+
+    for (int i = 0; i < 63; ++i) {
+        int expected_key = (i + 1) * 2;
+        int val = 0;
+        if (!tree_view.search(expected_key, val) || val != (i + 100)) {
+            std::cerr << "FAIL: eytzinger_tree_view search failed for key " << expected_key << "\n";
+            return 1;
+        }
+    }
+
+    // 3b. Export compact keys into raw uint32_t buffer
+    auto compact_keys = key_arr.export_compact();
+    eytzinger_key_view<uint32_t> key_view(compact_keys.data(), compact_keys.size());
+    if (key_view.size() != compact_keys.size()) {
+        std::cerr << "FAIL: eytzinger_key_view size mismatch!\n";
+        return 1;
+    }
+
+    for (uint32_t t : vocab_tokens) {
+        if (!key_view.contains(t)) {
+            std::cerr << "FAIL: eytzinger_key_view missed token " << t << "\n";
+            return 1;
+        }
+    }
+    if (key_view.contains(11) || key_view.contains(14)) {
+        std::cerr << "FAIL: eytzinger_key_view falsely matched invalid token!\n";
+        return 1;
+    }
+    std::cout << "  Zero-Copy Non-Owning Views PASSED OK (Direct buffer access with zero heap allocation).\n\n";
+
+    // -------------------------------------------------------------------------------------
+    // Test 4: Microarchitectural Comparative Benchmarks Across Cache Regimes
+    // -------------------------------------------------------------------------------------
+    std::cout << "[4] Running Comparative Microarchitectural Benchmarks (100,000 queries)...\n";
     const size_t num_bench_queries = 100000;
 
     // Regime A: L1 Cache Resident (N = 64 entries)

@@ -45,6 +45,23 @@ GGUF_TYPE_UINT64  = 10
 GGUF_TYPE_INT64   = 11
 GGUF_TYPE_FLOAT64 = 12
 
+# NPMC Multi-Tier Layout Descriptors
+NPMC_LAYOUT_LINEAR            = 0  # Standard row-major contiguous array
+NPMC_LAYOUT_EYTZINGER_BFS     = 1  # 1-based breadth-first array (Khuong & Morin 2017)
+NPMC_LAYOUT_VEB_TREE          = 2  # Van Emde Boas cache-oblivious bisection tree (Prokop 1999)
+NPMC_LAYOUT_MORTON_2D         = 3  # 2D Morton Z-order macro-tiles (Morton 1966)
+NPMC_LAYOUT_SOA_SWIZZLED      = 4  # GPU bank-conflict-free swizzled tiles
+NPMC_LAYOUT_NVME_BPLUS_EXTENT = 5  # Direct I/O 4KB sector aligned extents
+
+NPMC_LAYOUT_NAMES = {
+    NPMC_LAYOUT_LINEAR: "LINEAR",
+    NPMC_LAYOUT_EYTZINGER_BFS: "EYTZINGER_BFS",
+    NPMC_LAYOUT_VEB_TREE: "VEB_TREE",
+    NPMC_LAYOUT_MORTON_2D: "MORTON_2D",
+    NPMC_LAYOUT_SOA_SWIZZLED: "SOA_SWIZZLED",
+    NPMC_LAYOUT_NVME_BPLUS_EXTENT: "NVME_BPLUS_EXTENT",
+}
+
 # GGML Tensor Types & Bitrates (matching scripts/gguf-lint.py and gguf-py)
 GGML_TYPE_NAMES = {
     0: ("F32", 4.0),
@@ -800,7 +817,9 @@ def calculate_intra_row_padding(t: Dict[str, Any]) -> Tuple[int, int, int]:
 def plan_npmc_repack(model_info: Dict[str, Any],
                      target_alignment: int = GGUF_DEFAULT_ALIGNMENT,
                      pad_bank_aliasing: bool = True,
-                     expert_grouping: str = "layer-first") -> Dict[str, Any]:
+                     expert_grouping: str = "layer-first",
+                     layout_overrides: Optional[Dict[str, int]] = None,
+                     auto_assign_layouts: bool = True) -> Dict[str, Any]:
     """
     Constructs the target GGUF-X / NPMC memory layout:
     1. Enforces target alignment (e.g. 2097152 bytes for 2MB HugeTLB conformity).
@@ -934,6 +953,44 @@ def plan_npmc_repack(model_info: Dict[str, Any],
             "val_type_raw": struct.pack("<I", GGUF_TYPE_ARRAY),
             "val": padded_tensor_names,
             "val_raw": pack_string_array_raw(padded_tensor_names)
+        })
+
+    # Add Multi-Tier Layout Metadata
+    updated_kv.append({
+        "key": "npmc.tensor_layout_default",
+        "key_raw": pack_string("npmc.tensor_layout_default"),
+        "val_type": GGUF_TYPE_UINT32,
+        "val_type_raw": struct.pack("<I", GGUF_TYPE_UINT32),
+        "val": NPMC_LAYOUT_LINEAR,
+        "val_raw": struct.pack("<I", NPMC_LAYOUT_LINEAR)
+    })
+
+    tensor_layouts = {}
+    if auto_assign_layouts:
+        for t in ordered_tensors:
+            tname = t["name"]
+            # Router gating / token index tables: Eytzinger BFS (Khuong & Morin 2017)
+            if "router" in tname or "ffn_gate_inp" in tname:
+                tensor_layouts[tname] = NPMC_LAYOUT_EYTZINGER_BFS
+            elif "token_embd" in tname or "vocab" in tname:
+                tensor_layouts[tname] = NPMC_LAYOUT_EYTZINGER_BFS
+            elif is_moe_tensor(tname):
+                tensor_layouts[tname] = NPMC_LAYOUT_NVME_BPLUS_EXTENT
+            elif is_critical_tensor(tname) and len(t.get("dims", [])) >= 2:
+                tensor_layouts[tname] = NPMC_LAYOUT_MORTON_2D
+
+    if layout_overrides:
+        tensor_layouts.update(layout_overrides)
+
+    for tname, layout_id in tensor_layouts.items():
+        meta_k = f"npmc.tensor_layout.{tname}"
+        updated_kv.append({
+            "key": meta_k,
+            "key_raw": pack_string(meta_k),
+            "val_type": GGUF_TYPE_UINT32,
+            "val_type_raw": struct.pack("<I", GGUF_TYPE_UINT32),
+            "val": layout_id,
+            "val_raw": struct.pack("<I", layout_id)
         })
 
     # 5. Measure base header size to calculate 2MB-aligned data_start_offset
@@ -1222,6 +1279,9 @@ def main():
     parser.add_argument("--pad-bank-aliasing", dest="pad_bank_aliasing", action="store_true", default=True, help="Apply intra-row padding to break power-of-two DRAM bank aliasing (default: True)")
     parser.add_argument("--no-pad-bank-aliasing", dest="pad_bank_aliasing", action="store_false", help="Disable intra-row DRAM bank aliasing padding")
     parser.add_argument("--expert-grouping", choices=["layer-first", "expert-first"], default="layer-first", help="MoE expert grouping order: layer-first (default) or expert-first")
+    parser.add_argument("--auto-layouts", action="store_true", default=True, help="Automatically assign multi-tier layouts (Eytzinger BFS, Morton 2D, B+Tree extents) (default: True)")
+    parser.add_argument("--no-auto-layouts", dest="auto_layouts", action="store_false", help="Disable automatic multi-tier layout assignment")
+    parser.add_argument("--layout", action="append", default=[], help="Explicit layout override in format <tensor_pattern>=<layout_id_or_name>, e.g. token_embd=1 or blk.0.attn_q=3")
     parser.add_argument("--validate", action="store_true", help="Execute scripts/gguf-lint.py on the output container to verify score 100/100")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose progress output")
@@ -1239,6 +1299,30 @@ def main():
     input_model_target = input_paths if len(input_paths) > 1 else input_primary
 
     try:
+        # Parse layout overrides
+        layout_overrides = {}
+        for l_spec in args.layout:
+            if "=" in l_spec:
+                tname, l_val = l_spec.split("=", 1)
+                l_val_clean = l_val.strip().upper()
+                if l_val_clean in ["0", "LINEAR"]:
+                    layout_overrides[tname.strip()] = NPMC_LAYOUT_LINEAR
+                elif l_val_clean in ["1", "EYTZINGER_BFS", "EYTZINGER"]:
+                    layout_overrides[tname.strip()] = NPMC_LAYOUT_EYTZINGER_BFS
+                elif l_val_clean in ["2", "VEB_TREE", "VEB"]:
+                    layout_overrides[tname.strip()] = NPMC_LAYOUT_VEB_TREE
+                elif l_val_clean in ["3", "MORTON_2D", "MORTON"]:
+                    layout_overrides[tname.strip()] = NPMC_LAYOUT_MORTON_2D
+                elif l_val_clean in ["4", "SOA_SWIZZLED", "SWIZZLED"]:
+                    layout_overrides[tname.strip()] = NPMC_LAYOUT_SOA_SWIZZLED
+                elif l_val_clean in ["5", "NVME_BPLUS_EXTENT", "BPLUS"]:
+                    layout_overrides[tname.strip()] = NPMC_LAYOUT_NVME_BPLUS_EXTENT
+                else:
+                    try:
+                        layout_overrides[tname.strip()] = int(l_val)
+                    except ValueError:
+                        pass
+
         # 1. Load model and hardware info
         model_info = load_unified_model(input_model_target)
 
@@ -1268,7 +1352,9 @@ def main():
             model_info=model_info,
             target_alignment=args.alignment,
             pad_bank_aliasing=args.pad_bank_aliasing,
-            expert_grouping=args.expert_grouping
+            expert_grouping=args.expert_grouping,
+            layout_overrides=layout_overrides,
+            auto_assign_layouts=args.auto_layouts
         )
 
         # 4. Evaluate predicted repacked score
