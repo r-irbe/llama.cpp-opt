@@ -88,6 +88,7 @@ add_library(${TARGET} STATIC
     suffix-tree.cpp
     suffix-tree.h
     ccd-suffix-trie.h
+    paged-kv-cache.h
     regex-partial.cpp
     regex-partial.h
     reasoning-budget.cpp

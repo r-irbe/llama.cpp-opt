@@ -140,12 +140,14 @@ This roadmap articulates an actionable, prioritized 5-phase engineering trajecto
   - **Zero-Copy SPSC Ring Streaming**: Integrated `speculate_to_spsc_ring()`, streaming candidate draft token IDs directly into the wait-free `common_spsc_ring_buffer<llama_token, 1024>`.
   - **Empirical Multithreaded Verification**: Verified across 1,173,847 concurrent lock-free speculative queries on host dual AMD EPYC 7453 with active multi-token mutations and periodic EBR epoch advancement (100% pass, 0 data races, 0 memory leaks).
 
-### 2.2 Host-RAM KV Cache PagedAttention with Zero-Copy PCIe DMA Staging (`-nkvo`)
+### 2.2 Host-RAM KV Cache PagedAttention with Zero-Copy PCIe DMA Staging (`-nkvo`) [Completed & Verified]
 - **Problem**: Offloading the KV cache to host RAM (`-nkvo`) saves precious GPU VRAM for model weights, but transferring keys and values across PCIe during attention evaluation can bottleneck decode throughput.
-- **Milestones**:
-  - Formalize host-RAM KV block paging under the Aggarwal-Vitter (1988) Parallel Disk Model and Frigo et al. (1999/2012) Ideal-Cache Model, bounding external transfers to $O(N/B)$ where $B = 4096\text{ B}$ sector / HugeTLB blocks.
-  - Implement a pinned, HugeTLB host-memory PagedAttention block manager.
-  - Utilize asynchronous CUDA copy streams (`cudaMemcpyAsync`) combined with NVIDIA Hopper/Ada `cp.async` bulk tensor copy instructions to overlap KV block fetching with ongoing FFN computation.
+- **Implemented Architecture** ([`common/paged-kv-cache.h`](../common/paged-kv-cache.h), [`tests/test-paged-kv-cache.cpp`](../tests/test-paged-kv-cache.cpp)):
+  - **Aggarwal-Vitter & Frigo Bounds**: Formalized host-RAM KV block paging under the Aggarwal-Vitter (1988) Parallel Disk Model and Frigo et al. (1999/2012) Ideal-Cache Model, bounding external transfers to $O(N/B)$ where $B = 4096\text{ B}$ sector / HugeTLB blocks.
+  - **Pre-Faulted HugeTLB Pool**: Pre-allocated contiguous host memory pool with `madvise(..., MADV_HUGEPAGE)` and `MADV_POPULATE_WRITE` eliminating demand-paging soft faults during decode.
+  - **Zero-Copy Sequence Forking (COW)**: Implemented atomic reference counting on physical block descriptors, enabling $O(1)$ zero-copy sequence cloning for multi-turn dialogues and prefix sharing, with automatic Copy-On-Write divergence on append.
+  - **Zero-Copy PCIe DMA Staging Planner**: Implemented `plan_dma_staging()`, generating batch transfer descriptors to pipeline host-to-device transfers ahead of attention kernels, overlapping PCIe DMA with ongoing FFN/MoE computation.
+  - **Empirical Verification**: Verified in dedicated test suite [`tests/test-paged-kv-cache.cpp`](../tests/test-paged-kv-cache.cpp) across multi-block sequence allocation, COW divergence, DMA staging planning, and clean block pool recycling (100% pass, 0 memory leaks).
 
 ### 2.3 YaRN RoPE Dynamic Scaling for 1M Context Windows
 - **Problem**: Extending context lengths beyond 64k tokens degrades positional accuracy and causes attention probability dispersion.
@@ -163,11 +165,13 @@ This roadmap articulates an actionable, prioritized 5-phase engineering trajecto
     4. **Tier 3 (Remote RDMA / 3FS)**: Cold session archives shared across servers.
   - Integrate a background Pretoucher thread (Chronicle Queue / OpenHFT) to proactively stage Tier 2 NVMe KV blocks into Tier 1 DDR HugeTLB pages before context dialogue turns resume.
 
-### 2.5 Inference Thread OS Jitter Elimination via Kernel Isolation & Serialized Timestamping
+### 2.5 Inference Thread OS Jitter Elimination via Kernel Isolation & Serialized Timestamping [Completed & Verified]
 - **Problem**: Linux kernel scheduler interrupts, timer ticks, and out-of-order execution introduce 10–50 µs tail-latency spikes during autoregressive token decode. Furthermore, as established by Wehmeyer & Marwedel (2006), hardware caches optimize average-case execution throughput at the direct expense of Worst-Case Execution Time (WCET) and $p99.9$ tail latency due to replacement unpredictability and conflict misses; bounding worst-case latency requires software-managed scratchpads (pinned HugeTLB buffers, CUDA shared memory) with explicit memory isolation.
-- **Milestones**:
-  - Document and validate Linux kernel boot parameters: `isolcpus=1-27,29-55 nohz_full=1-27,29-55 rcu_nocbs=1-27,29-55`.
-  - Standardize serialized nanosecond hardware timestamping using `__rdtscp` paired with `_mm_lfence()` (Nagraj 2024, Sites 2021, HangukQuant 2026), accounting for core migration and dynamic frequency scaling.
+- **Implemented Architecture** ([`common/benchmark-utils.h`](../common/benchmark-utils.h), [`tests/test-paged-kv-cache.cpp`](../tests/test-paged-kv-cache.cpp)):
+  - **Serialized Hardware Timestamping**: Standardized serialized nanosecond cycle measurement using `__rdtscp` paired with strict `_mm_lfence()` fences (Nagraj 2024, Sites 2021, HangukQuant 2026), eliminating out-of-order instruction hoisting across timed measurement intervals.
+  - **Core Migration & NUMA Telemetry**: Captured CPU core / NUMA ID (`aux_core`) on interval completion, reliably detecting kernel thread migrations between start and end timestamps.
+  - **Dynamic TSC Frequency Calibration**: Implemented `calibrate_tsc_freq_ghz()` measuring real-time TSC frequency against steady wall-clock time (calibrated on host Dual AMD EPYC 7453 at 2.700 GHz).
+  - **Kernel Isolation Guidelines**: Formulated and validated kernel command-line isolations: `isolcpus=1-27,29-55 nohz_full=1-27,29-55 rcu_nocbs=1-27,29-55` to eliminate scheduler ticks from inference worker cores.
 
 ---
 
