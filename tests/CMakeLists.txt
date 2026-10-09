@@ -213,6 +213,26 @@ target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/g
 llama_build_and_test(test-numa.cpp)
 target_include_directories(test-numa PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+llama_build_and_test(test-bench-hash-vs-vector.cpp)
+target_include_directories(test-bench-hash-vs-vector PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-cohort-prefix-sharing.cpp)
+target_include_directories(test-cohort-prefix-sharing PRIVATE ${PROJECT_SOURCE_DIR}/examples/server)
+
+llama_build_and_test(test-io-uring.cpp)
+
+llama_build_and_test(test-model-loader-npmc.cpp)
+target_include_directories(test-model-loader-npmc PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-disruptor-ring.cpp)
+target_include_directories(test-disruptor-ring PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
+llama_build_and_test(test-mpsc-ring.cpp)
+target_include_directories(test-mpsc-ring PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
+llama_build_and_test(test-bench-server-queue.cpp)
+target_include_directories(test-bench-server-queue PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 

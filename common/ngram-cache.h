@@ -54,8 +54,45 @@ struct common_ngram_hash_function {
     }
 };
 
-// token -> number of times token has been seen
-typedef std::unordered_map<llama_token, int32_t> common_ngram_cache_part;
+// token -> number of times token has been seen (flat cache-local vector representation)
+struct common_ngram_cache_part {
+    std::vector<std::pair<llama_token, int32_t>> entries;
+
+    using iterator = std::vector<std::pair<llama_token, int32_t>>::iterator;
+    using const_iterator = std::vector<std::pair<llama_token, int32_t>>::const_iterator;
+
+    iterator begin() { return entries.begin(); }
+    iterator end() { return entries.end(); }
+    const_iterator begin() const { return entries.begin(); }
+    const_iterator end() const { return entries.end(); }
+
+    bool empty() const { return entries.empty(); }
+    size_t size() const { return entries.size(); }
+    void clear() { entries.clear(); }
+
+    iterator find(llama_token token) {
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->first == token) return it;
+        }
+        return entries.end();
+    }
+
+    const_iterator find(llama_token token) const {
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->first == token) return it;
+        }
+        return entries.end();
+    }
+
+    void emplace(llama_token token, int32_t count) {
+        auto it = find(token);
+        if (it != entries.end()) {
+            it->second = count;
+        } else {
+            entries.emplace_back(token, count);
+        }
+    }
+};
 
 // n-gram -> empirical distribution of following tokens
 typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_hash_function> common_ngram_cache;

@@ -2685,8 +2685,9 @@ static bool llama_kv_cache_seq_rm(
     }
 
     const bool has_qnext_state = llama_kv_has_qnext_state_storage(cache);
+    const uint32_t cell_max = llama_kv_cache_cell_max(cache, 256);
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    for (uint32_t i = 0; i < cell_max; ++i) {
         if (cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             if (seq_id < 0) {
                 cache.cells[i].seq_id.clear();
@@ -2781,8 +2782,9 @@ static void llama_kv_cache_seq_cp(
     // otherwise, this is the KV cache of a Transformer-like model
 
     cache.head = 0;
+    const uint32_t cell_max = llama_kv_cache_cell_max(cache, 256);
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    for (uint32_t i = 0; i < cell_max; ++i) {
         if (cache.cells[i].has_seq_id(seq_id_src) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.cells[i].seq_id.insert(seq_id_dst);
         }
@@ -2844,7 +2846,9 @@ static void llama_kv_cache_seq_add(
         return;
     }
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t cell_max = llama_kv_cache_cell_max(cache, 256);
+
+    for (uint32_t i = 0; i < cell_max; ++i) {
         if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.has_shift = true;
             cache.cells_disordered = true;
@@ -2895,7 +2899,9 @@ static void llama_kv_cache_seq_div(
         return;
     }
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t cell_max = llama_kv_cache_cell_max(cache, 256);
+
+    for (uint32_t i = 0; i < cell_max; ++i) {
         if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.has_shift = true;
 
@@ -2910,8 +2916,9 @@ static void llama_kv_cache_seq_div(
 
 static llama_pos llama_kv_cache_seq_pos_max(struct llama_kv_cache & cache, llama_seq_id seq_id) {
     llama_pos result = 0;
+    const uint32_t cell_max = llama_kv_cache_cell_max(cache, 256);
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    for (uint32_t i = 0; i < cell_max; ++i) {
         if (cache.cells[i].has_seq_id(seq_id)) {
             result = std::max(result, cache.cells[i].pos);
         }
@@ -2922,8 +2929,9 @@ static llama_pos llama_kv_cache_seq_pos_max(struct llama_kv_cache & cache, llama
 
 static llama_pos llama_kv_cache_seq_pos_min(struct llama_kv_cache & cache, llama_seq_id seq_id) {
     llama_pos result = -1;
+    const uint32_t cell_max = llama_kv_cache_cell_max(cache, 256);
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    for (uint32_t i = 0; i < cell_max; ++i) {
         if (cache.cells[i].has_seq_id(seq_id)) {
             result = cache.cells[i].pos;
             break;
@@ -4644,10 +4652,22 @@ static bool llm_load_tensors(
         }
     }
 
-    if (iqk_has_fancy_simd()) {
-        LLAMA_LOG_INFO("======================================= HAVE_FANCY_SIMD is defined\n");
+    if (iqk_has_avx512_runtime_dispatch()) {
+        if (iqk_cpu_has_avx512_vnni()) {
+            LLAMA_LOG_INFO("%s: Dual AVX2/AVX-512 runtime dispatch: ACTIVE (CPU supports AVX-512 VNNI, dispatched to 512-bit kernels)\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: Dual AVX2/AVX-512 runtime dispatch: ACTIVE (CPU lacks AVX-512 VNNI, safely dispatched to AVX2 kernels)\n", __func__);
+        }
+    } else if (iqk_has_fancy_simd()) {
+        LLAMA_LOG_INFO("======================================= HAVE_FANCY_SIMD is defined (static AVX-512 build)\n");
     } else {
-        LLAMA_LOG_INFO("======================================= HAVE_FANCY_SIMD is NOT defined\n");
+        LLAMA_LOG_INFO("======================================= HAVE_FANCY_SIMD is NOT defined (static AVX2 build)\n");
+        if (iqk_cpu_has_avx512_vnni()) {
+            LLAMA_LOG_WARN("%s: CPU supports AVX-512 VNNI but this build lacks it; rebuild with -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON for faster quantized matmul\n", __func__);
+        }
+    }
+    if (iqk_cpu_has_amx()) {
+        LLAMA_LOG_INFO("%s: CPU reports AMX-INT8 support (no AMX kernels in this build yet)\n", __func__);
     }
     if (max_ctx_size == 0) {
         max_ctx_size = model.hparams.n_ctx_train;
@@ -5668,23 +5688,24 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // genuine first-present token only for a NON-SLIDING cache. GLM_DSA has no SWA, so the
         // oldest cell of a seq is its true sink; if SWA were ever added, the window could evict the
         // real sink and min(pos) would anchor on the wrong (window-floor) cell — revisit then.
-        std::unordered_map<llama_seq_id, llama_pos> seq_min_pos;
+        const uint32_t n_seq_max = std::max<uint32_t>(1, cparams.n_seq_max);
+        std::vector<llama_pos> seq_min_pos(n_seq_max, -1);
         for (int64_t i = 0; i < n_kv; ++i) {
             const auto & cell = kv_self.cells[i];
             if (cell.pos < 0) continue;
             for (const llama_seq_id sid : cell.seq_id) {
-                auto it = seq_min_pos.find(sid);
-                if (it == seq_min_pos.end() || cell.pos < it->second) {
-                    seq_min_pos[sid] = cell.pos;
+                if (sid >= 0 && (size_t)sid < seq_min_pos.size()) {
+                    if (seq_min_pos[sid] < 0 || cell.pos < seq_min_pos[sid]) {
+                        seq_min_pos[sid] = cell.pos;
+                    }
                 }
             }
         }
 
         for (int64_t j = 0; j < n_tok_idx && j < (int64_t) batch.n_tokens; ++j) {
             const llama_seq_id seq_id = batch.seq_id[j][0];
-            auto it = seq_min_pos.find(seq_id);
-            if (it == seq_min_pos.end()) continue;  // no present cell for this seq in the key span
-            const llama_pos first_pos = it->second;
+            if (seq_id < 0 || (size_t)seq_id >= seq_min_pos.size() || seq_min_pos[seq_id] < 0) continue;
+            const llama_pos first_pos = seq_min_pos[seq_id];
             for (int64_t i = 0; i < n_kv; ++i) {
                 const auto & cell = kv_self.cells[i];
                 if (cell.pos >= first_pos && cell.pos < first_pos + n_sink && cell.has_seq_id(seq_id)) {
@@ -8803,6 +8824,23 @@ int llama_numa_node_count(void) {
     return (int) ggml::cpu::numa::topology().size();
 }
 
+int llama_numa_get_optimal_draft_node(int target_node) {
+    return ggml::cpu::numa::get_optimal_draft_node(target_node);
+}
+
+int llama_numa_get_gpu_node(int device) {
+#ifdef GGML_USE_CUDA
+    return ggml_backend_cuda_get_device_numa_node(device);
+#else
+    (void) device;
+    return -1;
+#endif
+}
+
+int llama_numa_get_storage_numa_node(void) {
+    return ggml::cpu::numa::get_storage_numa_node();
+}
+
 void llama_backend_free(void) {
     ggml_quantize_free();
 }
@@ -9281,6 +9319,16 @@ struct llama_context * llama_init_from_model(
 
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
         cparams.rope_freq_scale = 1.0f; // never scale if scaling type is none
+        if (cparams.n_ctx > cparams.n_ctx_orig_yarn) {
+            LLAMA_LOG_INFO("%s: context length %u exceeds trained context %u; consider --rope-scaling yarn to preserve long-range attention quality\n",
+                    __func__, cparams.n_ctx, cparams.n_ctx_orig_yarn);
+        }
+    } else if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN) {
+        if (params.rope_freq_scale == 0.0f && cparams.n_ctx > cparams.n_ctx_orig_yarn) {
+            cparams.rope_freq_scale = (float) cparams.n_ctx_orig_yarn / (float) cparams.n_ctx;
+            LLAMA_LOG_INFO("%s: YaRN RoPE auto-scaling: freq_scale = %.4f (scale = %.2fx for context %u -> %u)\n",
+                    __func__, cparams.rope_freq_scale, 1.0f / cparams.rope_freq_scale, cparams.n_ctx_orig_yarn, cparams.n_ctx);
+        }
     }
 
     if (cparams.yarn_ext_factor < 0.0f) { // negative indicates 'not set'
@@ -9594,9 +9642,22 @@ struct llama_context * llama_init_from_model(
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
                     params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
-            LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
-            llama_free(ctx);
-            return nullptr;
+            if (cparams.offload_kqv) {
+                LLAMA_LOG_WARN("%s: failed to allocate KV cache in GPU VRAM (insufficient VRAM); falling back automatically to host memory (no-kv-offload)\n", __func__);
+                ctx->kv_self.clear();
+                cparams.offload_kqv = false;
+                if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, false,
+                            params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
+                            params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
+                    LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache on host fallback\n", __func__);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            } else {
+                LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
         }
 
         if (params.n_seq_max > 1 && ctx->kv_self.any_compacted() && !llm_arch_is_dsv4(model->arch)) {
@@ -9730,7 +9791,8 @@ struct llama_context * llama_init_from_model(
             const size_t max_nodes = ctx->max_nodes(n_tokens, cparams.n_ctx);
 
             // buffer used to store the computation graph and the tensor meta data
-            ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+            const size_t meta_nodes = max_nodes + 16384;
+            ctx->buf_compute_meta.resize(ggml_tensor_overhead()*meta_nodes + ggml_graph_overhead_custom(meta_nodes, false));
 
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
             bool pipeline_parallel =

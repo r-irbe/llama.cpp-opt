@@ -77,6 +77,9 @@ struct slot_params {
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+
+    // Cohort prefix sharing
+    std::string cohort_id; // cohort identification key (explicit X-Cohort-ID, prompt_cache_key, or auto-prefix)
 };
 
 struct server_task {

@@ -26,6 +26,11 @@
         #if defined(_POSIX_MEMLOCK_RANGE)
             #include <sys/resource.h>
         #endif
+        #if defined(__linux__)
+            #include <sys/stat.h>
+            #include "ggml-cpu-numa.h"
+            #include "llama-io-uring.h"
+        #endif
     #endif
 #endif
 
@@ -301,6 +306,13 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
+        struct stat st;
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+            int snode = ggml::cpu::numa::detect_dev_numa_node(st.st_dev);
+            if (snode >= 0) {
+                ggml::cpu::numa::set_storage_numa_node(snode);
+            }
+        }
         if (prefetch) { flags |= MAP_POPULATE; }
         if (use_thp) {
             size_t huge = get_default_huge_page_size();
@@ -309,6 +321,27 @@ struct llama_mmap::impl {
             if (addr != MAP_FAILED) {
                 printf("%s: using THP with page size %zu MiB ", __func__, huge/(1024*1024));
                 fflush(stdout);
+
+                bool loaded_via_io_uring = false;
+                const char * env_no_uring = getenv("LLAMA_NO_IO_URING");
+                if (!env_no_uring || env_no_uring[0] == '0') {
+                    if (llama_io_uring_available()) {
+                        llama_io_uring_stats stats;
+                        llama_io_uring_config uring_cfg;
+                        const char * path = file->get_path().c_str();
+                        if (path && path[0] != '\0') {
+                            loaded_via_io_uring = llama_io_uring_read_file(path, addr, file->size(), size, uring_cfg, &stats);
+                        }
+                        if (loaded_via_io_uring) {
+                            printf("(io_uring DMA %s: %.2f GB/s) done\n",
+                                   stats.mode_str.c_str(), stats.throughput_gb_s);
+                            mapped_fragments.emplace_back(0, file->size());
+                            mapped_page_size = huge;
+                            return;
+                        }
+                    }
+                }
+
                 const size_t file_size = file->size();
                 constexpr size_t CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunks
                 const size_t n_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;

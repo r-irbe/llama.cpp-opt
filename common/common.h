@@ -260,6 +260,7 @@ struct common_params_speculative {
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::string cache_type_k = ""; // KV cache data type for K for the draft model
     std::string cache_type_v = ""; // KV cache data type for V for the draft model
+    std::string cuda_params = ""; // persistent storage for draft cparams.cuda_params
 
     bool autotune = false; // automatically optimize speculative params for max tokens/sec
 
@@ -553,6 +554,9 @@ struct gpt_params {
     std::string sqlite_zstd_ext_file;
 
     float slot_prompt_similarity = 0.1f;
+    bool cohort_prefix_sharing = true;         // enable cross-slot zero-copy prompt prefix sharing for cohorts
+    int32_t cohort_min_prefix_tokens = 16;     // min shared prompt tokens to trigger cross-slot KV replication
+    int32_t cohort_max_idle_sec = 0;           // max idle seconds before reclaiming private cohort slot (0 = disabled)
 
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot
@@ -571,6 +575,7 @@ struct gpt_params {
     std::vector<int32_t> n_pp;
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
+    std::vector<int32_t> n_pps; // number of prompt clusters subdividing n_pl
 
     // retrieval params
     std::vector<std::string> context_files; // context files to embed

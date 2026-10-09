@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "iqk_gemm_symbols.h"
+
 #if defined IQK_IMPLEMENT
 #undef IQK_IMPLEMENT
 #endif

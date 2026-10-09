@@ -16,9 +16,11 @@
 #include <forward_list>
 #include <limits>
 #include <map>
+#include <memory>
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 //
 // helpers
@@ -27,42 +29,56 @@
 struct naive_trie {
     naive_trie() : has_value(false), value(0) {
     }
+    ~naive_trie() = default;
+    naive_trie(naive_trie &&) = default;
+    naive_trie & operator=(naive_trie &&) = default;
+    naive_trie(const naive_trie &) = delete;
+    naive_trie & operator=(const naive_trie &) = delete;
+
     void insert(const char * key, size_t len, int32_t value = 0) {
         if (len == 0) {
             this->has_value = true;
             this->value = value;
             return;
         }
-        char c = key[0];
-        auto res = children.find(c);
-        if (res != children.end()) {
-            res->second.insert(key + 1, len - 1, value);
+        const uint8_t uc = static_cast<uint8_t>(key[0]);
+        auto it = std::lower_bound(children.begin(), children.end(), uc,
+            [](const std::pair<uint8_t, std::unique_ptr<naive_trie>> & p, uint8_t val) {
+                return p.first < val;
+            });
+        if (it != children.end() && it->first == uc) {
+            it->second->insert(key + 1, len - 1, value);
         } else {
-            auto res = children.insert(std::make_pair(c, naive_trie()));
-            res.first->second.insert(key + 1, len - 1, value);
+            auto new_node = std::make_unique<naive_trie>();
+            naive_trie * ptr = new_node.get();
+            children.insert(it, std::make_pair(uc, std::move(new_node)));
+            ptr->insert(key + 1, len - 1, value);
         }
     }
     std::pair<const char *, size_t> get_longest_prefix(const char * key, size_t len, size_t offset = 0) const {
         if (len == 0 || offset == len) {
             return std::make_pair(key, offset);
         }
-        char c = key[offset];
-        auto res = children.find(c);
-        if (res != children.end()) {
-            return res->second.get_longest_prefix(key, len, offset + 1);
+        const naive_trie * next = traverse(key[offset]);
+        if (next != nullptr) {
+            return next->get_longest_prefix(key, len, offset + 1);
         }
 
         return std::make_pair(key, offset);
     }
     const struct naive_trie * traverse(const char c) const {
-        auto res = children.find(c);
-        if (res != children.end()) {
-            return &res->second;
+        const uint8_t uc = static_cast<uint8_t>(c);
+        for (const auto & child : children) {
+            if (child.first == uc) {
+                return child.second.get();
+            }
+            if (child.first > uc) {
+                return nullptr;
+            }
         }
-
-        return NULL;
+        return nullptr;
     }
-    std::map<char, struct naive_trie> children;
+    std::vector<std::pair<uint8_t, std::unique_ptr<naive_trie>>> children;
     bool has_value;
     llama_token value;
 };

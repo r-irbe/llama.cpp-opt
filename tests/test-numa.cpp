@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "llama.h"
+#include "speculative.h"
 
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,12 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <thread>
+#include <atomic>
+
+#if defined(__gnu_linux__) || defined(__linux__)
+#include <sys/sysmacros.h>
+#endif
 
 using namespace ggml::cpu::numa;
 
@@ -229,6 +236,256 @@ int main() {
             }
 
             check(llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_SUCCESS, "second call is idempotent");
+        }
+    }
+
+    printf("hardware topology simulations (nps0, nps1, nps2, nps4, naples, intel snc)\n");
+    {
+        // 1. NPS0 / UMA: 1 node total (Node 0, Socket 0)
+        std::vector<node> topo_nps0 = {
+            { 0, 0, {0,1,2,3}, {0,1,2,3}, 4, 32ULL<<30, 30ULL<<30 }
+        };
+        check(socket_count(topo_nps0) == 1, "NPS0: socket_count == 1");
+        check(node_socket(topo_nps0, 0) == 0, "NPS0: node 0 socket is 0");
+        check(get_optimal_draft_node(topo_nps0, 0) == -1, "NPS0: draft node is -1 (no secondary NUMA domain)");
+
+        // 2. NPS1 (Dual Socket): 2 nodes (Node 0 on Socket 0, Node 1 on Socket 1)
+        std::vector<node> topo_nps1 = {
+            { 0, 0, {0,1,2,3}, {0,1,2,3}, 4, 64ULL<<30, 60ULL<<30 },
+            { 1, 1, {4,5,6,7}, {4,5,6,7}, 4, 64ULL<<30, 60ULL<<30 }
+        };
+        check(socket_count(topo_nps1) == 2, "NPS1: socket_count == 2");
+        check(node_socket(topo_nps1, 0) == 0, "NPS1: node 0 socket is 0");
+        check(node_socket(topo_nps1, 1) == 1, "NPS1: node 1 socket is 1");
+        check(get_optimal_draft_node(topo_nps1, 0) == 1, "NPS1: target 0 selects draft node 1 on Socket 1");
+        check(get_optimal_draft_node(topo_nps1, 1) == 0, "NPS1: target 1 selects draft node 0 on Socket 0");
+
+        // 3. NPS2 (Dual Socket): 4 nodes total (Nodes 0,1 on Socket 0; Nodes 2,3 on Socket 1)
+        std::vector<node> topo_nps2 = {
+            { 0, 0, {0,1}, {0,1}, 2, 32ULL<<30, 30ULL<<30 },
+            { 1, 0, {2,3}, {2,3}, 2, 32ULL<<30, 30ULL<<30 },
+            { 2, 1, {4,5}, {4,5}, 2, 32ULL<<30, 30ULL<<30 },
+            { 3, 1, {6,7}, {6,7}, 2, 32ULL<<30, 30ULL<<30 }
+        };
+        check(socket_count(topo_nps2) == 2, "NPS2: socket_count == 2");
+        check(get_optimal_draft_node(topo_nps2, 0) == 2, "NPS2: target 0 selects draft node 2 on Socket 1");
+        check(get_optimal_draft_node(topo_nps2, 1) == 2, "NPS2: target 1 selects draft node 2 on Socket 1");
+        check(get_optimal_draft_node(topo_nps2, 2) == 0, "NPS2: target 2 selects draft node 0 on Socket 0");
+        check(get_optimal_draft_node(topo_nps2, 3) == 0, "NPS2: target 3 selects draft node 0 on Socket 0");
+
+        // 4. NPS4 (Dual Socket EPYC Milan - target machine configuration): 8 nodes total
+        // Nodes 0-3 on Socket 0; Nodes 4-7 on Socket 1
+        std::vector<node> topo_nps4;
+        for (int i = 0; i < 8; ++i) {
+            topo_nps4.push_back({ i, i < 4 ? 0 : 1, {i*2, i*2+1}, {i*2, i*2+1}, 2, 128ULL<<30, 120ULL<<30 });
+        }
+        check(socket_count(topo_nps4) == 2, "NPS4: socket_count == 2");
+        check(get_optimal_draft_node(topo_nps4, 0) == 4, "NPS4: target 0 selects draft node 4 on Socket 1");
+        check(get_optimal_draft_node(topo_nps4, 2) == 4, "NPS4: target 2 selects draft node 4 on Socket 1");
+        check(get_optimal_draft_node(topo_nps4, 4) == 0, "NPS4: target 4 selects draft node 0 on Socket 0");
+        check(get_optimal_draft_node(topo_nps4, 7) == 0, "NPS4: target 7 selects draft node 0 on Socket 0");
+
+        // 5. AMD Naples / Zen 1 Single Socket: 4 NUMA nodes on Socket 0
+        std::vector<node> topo_naples = {
+            { 0, 0, {0,1}, {0,1}, 2, 16ULL<<30, 15ULL<<30 },
+            { 1, 0, {2,3}, {2,3}, 2, 16ULL<<30, 15ULL<<30 },
+            { 2, 0, {4,5}, {4,5}, 2, 16ULL<<30, 15ULL<<30 },
+            { 3, 0, {6,7}, {6,7}, 2, 16ULL<<30, 15ULL<<30 }
+        };
+        check(socket_count(topo_naples) == 1, "Naples single socket: socket_count == 1");
+        check(get_optimal_draft_node(topo_naples, 0) == 2, "Naples single socket: target 0 selects opposite quadrant 2");
+        check(get_optimal_draft_node(topo_naples, 1) == 3, "Naples single socket: target 1 selects opposite quadrant 3");
+
+        // 6. Intel Xeon Quad-Socket (4 sockets, 1 node each)
+        std::vector<node> topo_intel_quad = {
+            { 0, 0, {0,1,2,3}, {0,1,2,3}, 4, 32ULL<<30, 30ULL<<30 },
+            { 1, 1, {4,5,6,7}, {4,5,6,7}, 4, 32ULL<<30, 30ULL<<30 },
+            { 2, 2, {8,9,10,11}, {8,9,10,11}, 4, 32ULL<<30, 30ULL<<30 },
+            { 3, 3, {12,13,14,15}, {12,13,14,15}, 4, 32ULL<<30, 30ULL<<30 }
+        };
+        check(socket_count(topo_intel_quad) == 4, "Intel Quad-Socket: socket_count == 4");
+        check(get_optimal_draft_node(topo_intel_quad, 0) == 1, "Intel Quad-Socket: target 0 selects remote socket 1");
+        check(get_optimal_draft_node(topo_intel_quad, 1) == 0, "Intel Quad-Socket: target 1 selects remote socket 0");
+
+        // 7. AMD Genoa / Turin Single-Socket NPS4 (4 quadrants, 12 memory channels on Socket 0)
+        std::vector<node> topo_genoa_1s = {
+            { 0, 0, {0,1,2}, {0,1,2}, 3, 48ULL<<30, 45ULL<<30 },
+            { 1, 0, {3,4,5}, {3,4,5}, 3, 48ULL<<30, 45ULL<<30 },
+            { 2, 0, {6,7,8}, {6,7,8}, 3, 48ULL<<30, 45ULL<<30 },
+            { 3, 0, {9,10,11}, {9,10,11}, 3, 48ULL<<30, 45ULL<<30 }
+        };
+        check(socket_count(topo_genoa_1s) == 1, "AMD Genoa 1S NPS4: socket_count == 1");
+        check(get_optimal_draft_node(topo_genoa_1s, 0) == 2, "AMD Genoa 1S NPS4: target 0 selects opposite quadrant 2");
+
+        // 8. Intel Sapphire Rapids / Emerald Rapids Dual-Socket SNC-4 (8 sub-NUMA clusters across 2 sockets)
+        std::vector<node> topo_spr_snc4;
+        for (int i = 0; i < 8; ++i) {
+            topo_spr_snc4.push_back({ i, i < 4 ? 0 : 1, {i*4, i*4+1}, {i*4, i*4+1}, 2, 64ULL<<30, 60ULL<<30 });
+        }
+        check(socket_count(topo_spr_snc4) == 2, "Intel Sapphire Rapids SNC-4: socket_count == 2");
+        check(get_optimal_draft_node(topo_spr_snc4, 0) == 4, "Intel Sapphire Rapids SNC-4: target 0 selects draft node 4 on Socket 1");
+        check(get_optimal_draft_node(topo_spr_snc4, 5) == 0, "Intel Sapphire Rapids SNC-4: target 5 selects draft node 0 on Socket 0");
+    }
+
+    printf("storage numa node resolution\n");
+    {
+        const fs::path root = fs::temp_directory_path() / "ggml-numa-storage-test";
+        fs::remove_all(root);
+
+        // 1. Direct NVMe device: /sys/dev/block/259:0 -> /sys/devices/pci0000:c0/0000:c0:01.1/nvme/nvme0/nvme0n1
+        fs::path pci_nvme_dir = root / "devices/pci0000:c0/0000:c0:01.1";
+        fs::path nvme_dev_dir = pci_nvme_dir / "nvme/nvme0/nvme0n1";
+        fs::create_directories(nvme_dev_dir);
+        write_file(pci_nvme_dir / "numa_node", "2\n");
+
+        fs::path dev_block_dir = root / "dev/block";
+        fs::create_directories(dev_block_dir);
+        fs::create_directory_symlink(nvme_dev_dir, dev_block_dir / "259:0");
+
+#if defined(__gnu_linux__) || defined(__linux__)
+        int direct_node = detect_dev_numa_node(makedev(259, 0), root.string());
+        check(direct_node == 2, "direct NVMe resolves parent PCI numa_node 2");
+#endif
+
+        // 2. MD RAID0 device: /sys/dev/block/9:0 -> /sys/devices/virtual/block/md0
+        // with member slave pointing to nvme0n1
+        fs::path md0_dir = root / "devices/virtual/block/md0";
+        fs::path slaves_dir = md0_dir / "slaves";
+        fs::create_directories(slaves_dir);
+        fs::create_directory_symlink(nvme_dev_dir, slaves_dir / "nvme0n1");
+        fs::create_directory_symlink(md0_dir, dev_block_dir / "9:0");
+
+#if defined(__gnu_linux__) || defined(__linux__)
+        int raid_node = detect_dev_numa_node(makedev(9, 0), root.string());
+        check(raid_node == 2, "MD RAID0 resolves member slave NVMe numa_node 2");
+
+        // 3. Live host environment storage resolution check
+        int host_storage_auto = detect_path_numa_node(nullptr);
+        check(host_storage_auto >= 0, "host storage auto-discovery detects valid storage NUMA node");
+
+        // Dynamic storage path resolution on current working directory
+        int cwd_node = detect_path_numa_node(".");
+        check(cwd_node >= 0, "storage path auto-discovery resolves current working directory to valid NUMA node");
+#endif
+
+        fs::remove_all(root);
+    }
+
+    printf("wait-free spsc ring buffer multi-threaded stress test\n");
+    {
+        common_spsc_ring_buffer<int, 1024> ring;
+        check(ring.capacity() == 1024, "ring buffer capacity is 1024");
+        check(ring.empty(), "ring buffer is initially empty");
+
+        const int n_items = 50000;
+        std::atomic<bool> producer_done{false};
+        std::vector<int> consumed;
+        consumed.reserve(n_items);
+
+        std::thread consumer([&]() {
+            int val = 0;
+            while (consumed.size() < (size_t)n_items) {
+                if (ring.pop(val)) {
+                    consumed.push_back(val);
+                } else if (producer_done.load(std::memory_order_acquire) && ring.empty()) {
+                    break;
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+
+        std::thread producer([&]() {
+            for (int i = 0; i < n_items; ++i) {
+                while (!ring.push(i)) {
+                    std::this_thread::yield();
+                }
+            }
+            producer_done.store(true, std::memory_order_release);
+        });
+
+        producer.join();
+        consumer.join();
+
+        check(consumed.size() == (size_t)n_items, "all 50,000 items consumed");
+        bool strictly_ordered = true;
+        for (int i = 0; i < n_items; ++i) {
+            if (consumed[i] != i) {
+                strictly_ordered = false;
+                break;
+            }
+        }
+        check(strictly_ordered, "items consumed in strictly sequential FIFO order with zero loss");
+
+        // Batch operations and underflow/overflow check
+        std::vector<int> batch_in = {10, 20, 30, 40, 50};
+        size_t pushed = ring.push_batch(batch_in.data(), batch_in.size());
+        check(pushed == 5, "batch push 5 items succeeded");
+        check(ring.size() == 5, "ring size reports 5");
+
+        std::vector<int> batch_out(5, 0);
+        size_t popped = ring.pop_batch(batch_out.data(), batch_out.size());
+        check(popped == 5, "batch pop 5 items succeeded");
+        check(batch_in == batch_out, "batch pop data matches batch push data");
+        check(ring.empty(), "ring buffer is empty after popping batch");
+
+        // Underflow guard check
+        int dummy = -1;
+        check(!ring.pop(dummy), "pop on empty ring returns false");
+        check(ring.pop_batch(&dummy, 1) == 0, "pop_batch on empty ring returns 0");
+
+        ring.clear();
+        check(ring.empty(), "ring buffer clear succeeds");
+    }
+
+    printf("thread pinning and SMT / physical core binding tests\n");
+    {
+        // 1. Verify GPU node resolution
+        int gpu_node = llama_numa_get_gpu_node(0);
+#ifdef GGML_USE_CUDA
+        check(gpu_node >= 0, "GPU 0 resolves to valid NUMA node");
+#else
+        check(gpu_node == -1, "GPU 0 returns -1 without CUDA");
+#endif
+
+        // 2. Verify binding to physical core vs SMT sibling
+        const auto & nodes = topology();
+        if (!nodes.empty()) {
+            const auto & n0 = nodes[0];
+            // Test node-wide binding (thread_idx = -1)
+            check(llama_numa_bind_current_thread(n0.id, -1), "bind_current_thread to node-wide succeeds");
+
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+                bool has_all_cpus = true;
+                for (int cpu : n0.cpus) {
+                    if (!CPU_ISSET(cpu, &set)) {
+                        has_all_cpus = false;
+                        break;
+                    }
+                }
+                check(has_all_cpus, "node-wide binding covers all logical CPUs on the node");
+            }
+
+            // Test physical core primary binding (thread_idx = 0)
+            if (!n0.cores.empty()) {
+                check(llama_numa_bind_current_thread(n0.id, 0), "bind_current_thread to primary core 0 succeeds");
+                CPU_ZERO(&set);
+                if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+                    check(CPU_ISSET(n0.cores[0], &set), "thread 0 is pinned to physical core 0");
+                }
+            }
+
+            // Test SMT sibling binding if SMT is active (thread_idx = n_cores)
+            if (n0.cpus.size() > (size_t) n0.n_cores && n0.n_cores > 0) {
+                check(llama_numa_bind_current_thread(n0.id, n0.n_cores), "bind_current_thread to SMT sibling succeeds");
+                CPU_ZERO(&set);
+                if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+                    // Verify it is NOT pinned to physical core 0 primary, but to an SMT sibling
+                    check(!CPU_ISSET(n0.cores[0], &set), "SMT thread is not mapped to physical core 0 primary");
+                }
+            }
         }
     }
 

@@ -45,7 +45,7 @@ struct llama_sampler_dry {
 
     std::unordered_multimap<llama_token, std::vector<llama_token>> dry_processed_breakers;
     std::vector<int> dry_repeat_count;
-    std::unordered_map<llama_token, int> dry_max_token_repeat;
+    std::vector<std::pair<llama_token, int>> dry_max_token_repeat;
     ring_buffer<llama_token> last_tokens;
 };
 

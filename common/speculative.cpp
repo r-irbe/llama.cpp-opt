@@ -1109,7 +1109,33 @@ struct common_speculative {
     bool last_step_target_only = false;
     float draft_temperature = 0.0f;
     uint32_t draft_seed = LLAMA_DEFAULT_SEED;
+    common_spsc_ring_buffer<llama_token, 1024> token_ring;
 };
+
+bool common_speculative_ring_push(common_speculative * spec, llama_token token) {
+    return spec ? spec->token_ring.push(token) : false;
+}
+
+bool common_speculative_ring_pop(common_speculative * spec, llama_token * out_token) {
+    if (!spec || !out_token) return false;
+    return spec->token_ring.pop(*out_token);
+}
+
+size_t common_speculative_ring_push_batch(common_speculative * spec, const llama_token * tokens, size_t n) {
+    return spec ? spec->token_ring.push_batch(tokens, n) : 0;
+}
+
+size_t common_speculative_ring_pop_batch(common_speculative * spec, llama_token * tokens, size_t max_n) {
+    return spec ? spec->token_ring.pop_batch(tokens, max_n) : 0;
+}
+
+size_t common_speculative_ring_size(const common_speculative * spec) {
+    return spec ? spec->token_ring.size() : 0;
+}
+
+void common_speculative_ring_clear(common_speculative * spec) {
+    if (spec) spec->token_ring.clear();
+}
 
 static bool common_speculative_stage_chain_matches(
         const std::vector<common_speculative_stage_params> & stages,
@@ -1557,16 +1583,24 @@ common_speculative * common_speculative_init(
     common_speculative_prepare_request(result, params);
 
     // initialize autotune if requested
-    if (params.autotune && params.has_composite_stage_chain()) {
-        LOG_WRN("Autotune disabled — explicit speculative stage chains are not supported yet\n");
-    } else if (params.autotune && !result->impls.empty()) {
-        auto actual_type = result->impls[0]->type;
+    if (params.autotune && !result->impls.empty()) {
+        size_t tune_stage_idx = 0;
+        if (params.has_composite_stage_chain()) {
+            // In a composite chain, prefer tuning the primary neural fallback stage (e.g. DFlash, MTP, or Draft)
+            for (size_t i = 0; i < result->impls.size(); ++i) {
+                if (!common_speculative_type_is_self_spec(result->impls[i]->type)) {
+                    tune_stage_idx = i;
+                    break;
+                }
+            }
+        }
+        auto actual_type = result->impls[tune_stage_idx]->type;
         if (actual_type != COMMON_SPECULATIVE_TYPE_NONE &&
             actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3 &&
             actual_type != COMMON_SPECULATIVE_TYPE_DSPARK) {
             result->tuner = std::make_unique<spec_tuner>();
-            result->tuner->init(actual_type, result->configs[0].params, llama_get_model(ctx_tgt));
-            LOG_DBG("Autotune initialized for %s, tuning %zu parameters\n",
+            result->tuner->init(actual_type, result->configs[tune_stage_idx].params, llama_get_model(ctx_tgt));
+            LOG_INF("Autotune initialized for %s stage in speculative chain (tuning %zu parameters)\n",
                     common_speculative_type_to_str(actual_type).c_str(),
                     result->tuner->coords.size());
         } else {
@@ -1617,12 +1651,24 @@ llama_tokens common_speculative_draft(
     }
 
     // Socket-asymmetric NUMA affinity binding for speculative drafting:
-    // If numa_node is set (or automatically on multi-NUMA topologies where node count >= 4),
-    // bind draft execution to Socket 1 (Node >= 4) so draft model forward passes never compete
-    // with the target model or RTX 4090 PCIe bus on Socket 0.
+    // If numa_node is set, use it explicitly.
+    // Otherwise, if draft execution is offloaded to GPU (e.g. DFlash or -ngld > 0),
+    // bind draft orchestration to the GPU's local NUMA node (e.g. Node 1 on Socket 0)
+    // to avoid crossing the inter-socket xGMI interconnect for PCIe MMIO and kernel dispatch.
+    // If the draft model runs strictly on CPU, bind to Socket 1 (Node >= 4) so draft model
+    // compute never competes with target model threads or the GPU driver on Socket 0.
     int target_draft_node = params.numa_node;
-    if (target_draft_node < 0 && llama_numa_node_count() >= 4) {
-        target_draft_node = llama_numa_node_count() / 2;
+    if (target_draft_node < 0) {
+        bool draft_on_gpu = (params.n_gpu_layers != 0) || params.has_dflash_family_stage();
+        if (draft_on_gpu) {
+            int gpu_node = llama_numa_get_gpu_node(0);
+            if (gpu_node >= 0) {
+                target_draft_node = gpu_node;
+            }
+        }
+        if (target_draft_node < 0) {
+            target_draft_node = llama_numa_get_optimal_draft_node(-1);
+        }
     }
 
 #if defined(__linux__)
@@ -1660,8 +1706,13 @@ llama_tokens common_speculative_draft(
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
         impl_params.draft_temperature = spec->draft_temperature;
         impl_params.draft_seed = spec->draft_seed;
-        if (spec->tuner && spec->tuner->enabled && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (spec->tuner && spec->tuner->enabled && impl->type == spec->tuner->spec_type) {
             impl_params.n_max = params.n_max;
+            impl_params.p_min = params.p_min;
+            impl_params.n_min = params.n_min;
+            if (impl->type == COMMON_SPECULATIVE_TYPE_SUFFIX) {
+                impl_params.suffix_min_match_len = params.suffix_min_match_len;
+            }
         }
         result.clear();
 
@@ -1705,6 +1756,12 @@ llama_tokens common_speculative_draft(
         break; // We have a draft, so break out of the loop and return it.
     }
 
+    // Stream draft tokens into wait-free SPSC ring buffer for inter-socket token consumption:
+    spec->token_ring.clear();
+    if (!result.empty()) {
+        spec->token_ring.push_batch(result.data(), result.size());
+    }
+
     // store draft count for tuner feedback
     if (spec->tuner && spec->tuner->enabled) {
         spec->last_n_drafted = (int)result.size();
@@ -1715,11 +1772,15 @@ llama_tokens common_speculative_draft(
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
     if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
-        int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
-        double step_tps = (step_time_us > 100)
-            ? (n_accepted + 1.0) * 1e6 / (double)step_time_us
-            : 0.0;
-        spec->tuner->accept_feedback(n_accepted, spec->last_n_drafted, step_tps);
+        const bool is_tuned_impl = (spec->curr_impl && spec->curr_impl->type == spec->tuner->spec_type) ||
+                                   spec->last_step_target_only;
+        if (is_tuned_impl) {
+            int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
+            double step_tps = (step_time_us > 100)
+                ? (n_accepted + 1.0) * 1e6 / (double)step_time_us
+                : 0.0;
+            spec->tuner->accept_feedback(n_accepted, spec->last_n_drafted, step_tps);
+        }
         spec->t_step_start_us = 0;
     }
 
@@ -1851,24 +1912,30 @@ static bool common_speculative_feature_view_copy_batch_rows(
         return false;
     }
 
-    std::unordered_map<llama_pos, const float *> rows_by_pos;
+    std::vector<std::pair<llama_pos, const float *>> rows_by_pos;
     rows_by_pos.reserve(view.rows.size());
     for (const auto & row : view.rows) {
         if (row.seq_id == seq_id && row.data != nullptr) {
-            rows_by_pos[row.pos] = row.data;
+            rows_by_pos.emplace_back(row.pos, row.data);
         }
     }
 
     hidden_rows->clear();
     hidden_rows->reserve((size_t) batch.n_tokens * view.width);
     for (int i = 0; i < batch.n_tokens; ++i) {
-        auto it = rows_by_pos.find(batch.pos[i]);
-        if (it == rows_by_pos.end()) {
+        const float * row_data = nullptr;
+        for (const auto & p : rows_by_pos) {
+            if (p.first == batch.pos[i]) {
+                row_data = p.second;
+                break;
+            }
+        }
+        if (row_data == nullptr) {
             hidden_rows->clear();
             return false;
         }
 
-        hidden_rows->insert(hidden_rows->end(), it->second, it->second + view.width);
+        hidden_rows->insert(hidden_rows->end(), row_data, row_data + view.width);
     }
 
     return hidden_rows->size() == (size_t) batch.n_tokens * view.width;
@@ -2101,7 +2168,11 @@ bool common_speculative_load_draft_model(
     }
 
     params.model_dft = loaded_model;
+    params.cuda_params = params_dft.cuda_params.empty() ? params_base.cuda_params : params_dft.cuda_params;
     params.cparams_dft = common_context_params_to_llama(params_dft);
+    if (!params.cuda_params.empty()) {
+        params.cparams_dft.cuda_params = (void *)params.cuda_params.c_str();
+    }
     return true;
 }
 
@@ -2142,7 +2213,11 @@ bool common_speculative_prepare_mtp_runtime(
     if (!has_external_mtp) {
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        params.cuda_params = params_base.cuda_params;
         params.cparams_dft = common_context_params_to_llama(params_mtp);
+        if (!params.cuda_params.empty()) {
+            params.cparams_dft.cuda_params = (void *)params.cuda_params.c_str();
+        }
     }
 
     params.cparams_dft.mtp         = true;

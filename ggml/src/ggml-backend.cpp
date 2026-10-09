@@ -779,7 +779,9 @@ static const char * ggml_backend_cpu_numa_buffer_get_name(ggml_backend_buffer_t 
 
 static void ggml_backend_cpu_numa_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = (struct ggml_backend_cpu_numa_buffer_context *) buffer->context;
-    ggml::cpu::numa::free_onnode(ctx->data, ctx->size);
+    if (ctx->data && ctx->size > 0) {
+        ggml::cpu::numa::free_onnode(ctx->data, ctx->size);
+    }
     delete ctx;
 }
 
@@ -814,7 +816,9 @@ static bool ggml_backend_cpu_numa_buffer_cpy_tensor(ggml_backend_buffer_t buffer
 
 static void ggml_backend_cpu_numa_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * ctx = (struct ggml_backend_cpu_numa_buffer_context *) buffer->context;
-    memset(ctx->data, value, buffer->size);
+    if (ctx->data && buffer->size > 0) {
+        memset(ctx->data, value, buffer->size);
+    }
 }
 
 static struct ggml_backend_buffer_i cpu_numa_backend_buffer_i = {
@@ -842,6 +846,10 @@ static const char * ggml_backend_cpu_numa_buffer_type_get_name(ggml_backend_buff
 
 static ggml_backend_buffer_t ggml_backend_cpu_numa_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto * ctx = (struct ggml_backend_cpu_numa_buft_context *) buft->context;
+    if (size == 0) {
+        auto * buf_ctx = new ggml_backend_cpu_numa_buffer_context{ nullptr, 0, ctx->node_id };
+        return ggml_backend_buffer_init(buft, cpu_numa_backend_buffer_i, buf_ctx, 0);
+    }
     std::string err;
     void * data = ggml::cpu::numa::alloc_onnode(size, ctx->node_id, err);
     if (!data) {

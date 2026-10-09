@@ -2,16 +2,47 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+>[!WARNING]
+>**Experimental Pre-Alpha Architecture Warning**:
+>The NUMA split mode (`--numa split`), dynamic multi-socket scheduling, recursive storage NUMA locality discovery, and wait-free speculative streaming ring buffers implemented in this fork are currently **experimental and pre-alpha**. While backed by extensive unit and stress tests ([tests/test-numa.cpp](tests/test-numa.cpp)), they are under active development and not yet production-stable. APIs, CLI flags, and internal sysfs heuristics may change without notice. Please test thoroughly on non-production systems and report any unexpected behavior.
+
 >[!NOTE]
->**NUMA Split Mode**:
->Extends `ik_llama.cpp` with `--numa split` mode and CPU scheduling changes based on work by **Mike Chambers** ([@mikechambers84](https://github.com/mikechambers84)) in [`llama.cpp-ng`](https://github.com/mikechambers84/llama.cpp-ng).
+>**NUMA Split Mode & Low-Latency Architecture**:
+>Extends `ik_llama.cpp` with `--numa split` mode, dynamic multi-socket scheduling, storage NUMA locality, wait-free streaming, and permanent CUDA graphs, building upon foundation work by **Mike Chambers** ([@mikechambers84](https://github.com/mikechambers84)) in [`llama.cpp-ng`](https://github.com/mikechambers84/llama.cpp-ng).
 >
->Changes in this fork:
->- Ported node-local `mbind` allocation and pinned worker dispatch to the monolithic GGML backend.
->- Fixed device indexing to support GPU offload alongside NUMA nodes (GPUs at `0..N-1`, NUMA nodes `CPU0`..`CPUn` at `N..`).
->- Registered NUMA nodes in the backend registry so `-ot` tensor overrides can target specific nodes (e.g. routing MoE expert layers).
->- Added `tests/test-numa.cpp` to verify sysfs topology parsing and page locality (`move_pages`).
->- Added wide-row column slicing (`get_rows`), 64B destination cache-line snapping (`mul_mat`), and `GGML_CPU_PROFILE=1`.
+>### Core Concepts & Intuitive Explanations
+>- **What is NUMA (Non-Uniform Memory Access)?** In modern multi-socket servers and chiplet CPUs, RAM is physically partitioned into local pools ("NUMA nodes") wired directly to specific CPU cores. Accessing memory on your local node is ultra-fast with high bandwidth. Accessing memory wired to another socket or quadrant requires crossing an interconnect bridge (AMD Infinity Fabric/xGMI or Intel UPI), adding memory latency and congesting the inter-socket bus.
+>- **Why Memory Locality Matters for Mixture of Experts (MoE)**: MoE models (such as DeepSeek-V3/R1 or Qwen-MoE) contain hundreds of billions of parameters, but only activate a sparse subset of expert layers per token. When running MoE inference with experts on CPU, execution speed is strictly bounded by DRAM bandwidth. If CPU threads on Socket 0 have to fetch expert weights residing in Socket 1's memory channels, memory throughput drops precipitously and the interconnect becomes saturated. Distributing experts across NUMA nodes (`--numa split` with `-ot`) and pinning worker threads ensures each core reads almost exclusively from its local memory channels.
+>- **What is an SPSC Ring Buffer and Why Does 128-Byte Padding Matter?** Speculative decoding uses a smaller "draft" model to propose candidate tokens that a larger "target" model verifies. Streaming these draft tokens between CPU sockets usually requires OS synchronization (like `pthread_mutex` or `sys_futex`), which can stall CPU execution for tens of microseconds. A Single-Producer Single-Consumer (SPSC) ring buffer allows one thread to push and another to pop without locks. However, modern processors fetch memory in 64-byte cache lines and feature spatial hardware prefetchers that fetch *pairs* of lines (128 bytes). If the producer's write pointer and the consumer's read pointer are within the same 128-byte chunk, CPU cores continuously invalidate each other's L1/L2 caches ("false sharing"). Enforcing strict 128-byte cache-line alignment (`alignas(128)`) isolates producer and consumer states, achieving zero-jitter token streaming across sockets.
+>- **How CUDA Graphs Eliminate Kernel Launch Latency**: GPUs process tasks asynchronously, but launching each individual kernel from the CPU incurs driver and OS overhead (5–10 µs per launch). During autoregressive decoding, hundreds of tiny operations (attention heads, layer norms, tensor reshapes) occur for every single token, making CPU launch overhead dominate the actual GPU run time. CUDA Graphs record the entire sequence of GPU operations once into an execution graph, allowing the CPU to launch the entire sequence in a single single-digit microsecond trigger. Our enhancement eliminates the 4-update invalidation tripwire in `ggml-cuda.cu`, ensuring permanent graph reuse across arbitrary context windows.
+>- **What is Multi-Tenant Cohort Prompt Prefix Sharing (PPS)?** When multiple concurrent users or autonomous subagents query the server with identical system prompts or reference documents, traditional engines evaluate the prompt independently for every slot, wasting compute and multiplying KV-cache memory usage. Cohort Prefix Sharing (`--cohort-prefix-sharing`) subdivides available slots into isolated cohorts, shares precomputed KV cache sequences across slots via zero-copy reference copying (`llama_kv_cache_seq_cp`), and enforces strict cryptographic/tenant isolation boundaries. This achieves up to **90,934 tok/s prompt serving** and **84.8%–93.9% active KV cache compression**.
+>
+>### Key Architectural Enhancements
+>- **Multi-Tenant Cohort Prompt Prefix Sharing (PPS)**: Integrated into `llama-server`, featuring dynamic HTTP header parsing (`X-Cohort-ID`, `X-Prompt-Cache-Key`) and JSON payload extraction (`cohort_id`, `prompt_cache_key`). Enables warm cohort slot affinity, zero-copy sequence replication via `llama_kv_cache_seq_cp`, dynamic sampler cloning, and strict multi-tenant security isolation (see [`docs/cohort-prefix-sharing.md`](docs/cohort-prefix-sharing.md)).
+>- **Dynamic Microarchitectural Topology Probing**: Auto-discovers physical package topology (`physical_package_id`) and optimal inter-socket draft affinity across **NPS0 (UMA)**, **NPS1**, **NPS2**, **NPS4**, **AMD Naples/Genoa/Turin**, and **Intel Xeon SNC-2/4 Quad-Socket** systems (see [`docs/numa-topology-matrix.md`](docs/numa-topology-matrix.md)).
+>- **Storage NUMA Locality Discovery**: Recursive sysfs probing resolves direct NVMe SSDs, Linux Software MD RAID arrays (`/slaves/` traversal), and multi-device ZFS storage pools to physical PCIe root complexes, dynamically pinning MoE prefetch worker threads to local memory channels (see [`docs/storage-and-io-architecture.md`](docs/storage-and-io-architecture.md)).
+>- **Wait-Free Inter-Socket SPSC Ring Buffer**: `alignas(128)` padded ring buffer matching modern dual-line spatial prefetchers (AMD Zen 3/4/5) for lock-free, zero-jitter token ID streaming across CPU sockets without `sys_futex` latency.
+>- **Permanent CUDA Graph Execution**: Normalized view/no-op ops and masked dynamic copy destination pointers in `ggml-cuda.cu`, eliminating the autoregressive decode invalidation tripwire and enabling permanent graph reuse across arbitrary context lengths.
+>- **Monolithic GGML Backend Integration**: Ported node-local `mbind` allocation and pinned worker dispatch to the monolithic GGML backend, with device indexing supporting GPU offloading alongside per-node NUMA backends (`CPU0`..`CPUn`).
+>- **MoE Tensor Routing**: Registered NUMA nodes in the backend registry so `-ot` tensor overrides target specific nodes (e.g. routing MoE expert layers across DDR channels).
+>- **Microarchitectural Kernels & Profiling**: Added wide-row column slicing (`get_rows`), 64-byte destination cache-line snapping (`mul_mat`), transparent huge page (THP) alignment, and `GGML_CPU_PROFILE=1`.
+>- **Simulation & Stress Test Suite**: Added [`tests/test-cohort-prefix-sharing.cpp`](tests/test-cohort-prefix-sharing.cpp) and [`tests/test-numa.cpp`](tests/test-numa.cpp) covering multi-architecture topology simulation, virtual storage device resolution, 50,000-token concurrent ring buffer stress testing, and physical 64 MiB page verification across all host NUMA nodes.
+>- **Hardware Inspection & GGUF Scoring Utilities**: Provided [`scripts/inspect-hardware.sh`](scripts/inspect-hardware.sh) / [`scripts/inspect-hardware.py`](scripts/inspect-hardware.py) for system synthesis and [`scripts/gguf-lint.py`](scripts/gguf-lint.py) for mathematical GGUF hardware alignment scoring (see [`docs/gguf-hardware-linting.md`](docs/gguf-hardware-linting.md)).
+>- **HPC Systems Roadmap**: Prioritized 5-phase engineering roadmap spanning near-term hardening, speculative engine evolution, superchips (AMD MI300A, NVIDIA Grace Hopper/Blackwell), and next-generation precalculated containers (see [`docs/roadmap.md`](docs/roadmap.md)).
+>
+>### Systems Documentation Suite
+>| Document | Topic & Focus Area |
+>| :--- | :--- |
+>| [`docs/cohort-prefix-sharing.md`](docs/cohort-prefix-sharing.md) | Multi-Tenant Cohort Prompt Prefix Sharing, HTTP API, slot subdivision, and security invariants |
+>| [`docs/numa-topology-matrix.md`](docs/numa-topology-matrix.md) | Multi-socket NUMA matrix, dynamic hardware probing, CCX pipelining, and `-ub` dynamics |
+>| [`docs/storage-and-io-architecture.md`](docs/storage-and-io-architecture.md) | Asynchronous `io_uring` + `O_DIRECT`, cuFile, CXL 3.0, and recursive storage locality |
+>| [`docs/superchips-and-unified-memory.md`](docs/superchips-and-unified-memory.md) | AMD MI300A unified HBM3 APU, NVIDIA Grace Hopper/Blackwell, and Apple Silicon MLX |
+>| [`docs/nextgen-container-format.md`](docs/nextgen-container-format.md) | GGUF-X / NPMC specification: Roaring Bitmaps, ZDDs, Milner Bigraphs, and streaming decompression |
+>| [`docs/gguf-hardware-linting.md`](docs/gguf-hardware-linting.md) | Mathematical GGUF scoring framework, lint rule catalog (LINT001-LINT009), and `scripts/gguf-lint.py` |
+>| [`docs/benchmarking-and-testing-plan.md`](docs/benchmarking-and-testing-plan.md) | Comprehensive 19-model architecture benchmarking plan, Dual-Track methodology, NUMA/Apple Silicon profiles, and verification suite |
+>| [`docs/benchmarking-execution-matrix.md`](docs/benchmarking-execution-matrix.md) | Concrete per-model parameter matrix, GPU/NUMA memory allocations, and execution commands |
+>| [`docs/combinatorial-optimization-knuth-dlx-gray-coding.md`](docs/combinatorial-optimization-knuth-dlx-gray-coding.md) | Knuthian combinatorial optimization, Exact Cover (DLX), Stanford Pre-Fascicles (7A, 8A, 9B), and Gray coding |
+>| [`docs/roadmap.md`](docs/roadmap.md) | Phased microarchitectural HPC systems roadmap (Phases 1 through 5) |
 
 ## TL;DR
 
@@ -107,6 +138,25 @@ docker pull ghcr.io/ikawrakow/ik-llama-cpp:cu12-full
 Check [Step by step guide](./docker/README.md) for image customization and other details.
 
 ### [Common parameters and options](./docs/parameters.md)
+
+### High-Performance Serving & NUMA Split Parameters
+
+| Option | Argument | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `--cohort-prefix-sharing` | - | Enables cohort-aware slot reservation and zero-copy cross-slot prefix cache replication (`llama_kv_cache_seq_cp`). | Enabled |
+| `--no-cohort-prefix-sharing` | - | Disables cohort prefix sharing, reverting to legacy independent slot prefilling. | - |
+| `--cohort-min-prefix` | `<int>` | Minimum shared token prefix required to trigger cross-slot sequence replication. | `64` |
+| `--numa` | `split` | Enables per-NUMA-node backend registration (`CPU0`..`CPUn`) with node-local `mbind` allocation and strict OpenMP thread affinity. | `none` |
+| `-sm`, `--split-mode` | `graph` | Enables split mode graph for heterogeneous CUDA + multi-node CPU MoE layer distribution. | `layer` |
+| `-ot`, `--override-tensor` | `<pattern>=<target>` | Explicitly routes tensors matching regex to a target backend (e.g. `blk\.[0-9]+\.ffn_.*_exps=CPU%d`). | - |
+| `-nkvo`, `--no-kv-offload` | - | Prevents offloading the attention KV cache to GPU VRAM, keeping it entirely in host NUMA RAM. | False |
+| `-ub`, `--ubatch-size` | `<int>` | Physical micro-batch size for compute kernel launches (`128`–`256` recommended for NPS4; `512`–`1024` for NPS1). | `512` |
+| `-thp`, `--transparent-huge-pages` | `<0|1>` | Backs weights with 2MB HugeTLB pages loaded via zero-copy `io_uring` + `O_DIRECT` DMA streaming. | `0` |
+| `--speculative` | `<model.gguf>` | Path to draft model for speculative decoding across sockets using wait-free SPSC ring buffers. | - |
+
+---
+
+
 
 ## Latest News
 

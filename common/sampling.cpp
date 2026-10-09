@@ -219,6 +219,7 @@ static void llama_grammar_reset(common_sampler * ctx) {
 void common_sampler_reset(common_sampler * ctx) {
     // llama_grammar_reset(ctx);
     ctx->prev.clear();
+    ctx->original_logits.clear();
     llama_sampler_dry_reset(ctx->smpl);
 
     llama_free_adaptive_p(ctx->adapt_p_ctx);
@@ -250,6 +251,7 @@ void common_sampler_clone(common_sampler * src, common_sampler * dst) {
     dst->speculative_seed = src->speculative_seed;
     dst->speculative_rng = src->speculative_rng;
     dst->server_biases = src->server_biases;
+    dst->original_logits = src->original_logits;
 
     if (dst->grammar) {
         llama_grammar_free(dst->grammar);
@@ -518,7 +520,7 @@ static llama_token llama_sampling_sample_impl(
     const float   mirostat_eta    = params.mirostat_eta;
     const float   adaptive_target = params.adaptive_target;
 
-    std::vector<float> original_logits;
+    std::vector<float> & original_logits = ctx_sampling->original_logits;
     llama_sampling_prepare(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits);
     llama_token_data_array & cur_p = ctx_sampling->cur_p;
     if (ctx_sampling->grammar != NULL && !grammar_first) {
@@ -626,8 +628,8 @@ static llama_token_data_array llama_sampling_prepare_impl(
 
     if (ctx_sampling->grammar != NULL && !grammar_first) {
         GGML_ASSERT(original_logits != NULL);
-        // Only make a copy of the original logits if we are not applying grammar checks, not sure if I actually have to do this.
-        *original_logits = {logits, logits + n_vocab};
+        // Zero-allocation: reuse persistent capacity without heap reallocation
+        original_logits->assign(logits, logits + n_vocab);
     }
 
     // apply params.logit_bias map
@@ -846,14 +848,32 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const auto & q = dists[i];
         GGML_ASSERT(q.ids.size() == q.probs.size());
 
-        std::unordered_map<llama_token, float> q_probs;
+        struct token_prob {
+            llama_token id;
+            float prob;
+        };
+        std::vector<token_prob> q_probs;
         q_probs.reserve(q.ids.size());
         for (size_t j = 0; j < q.ids.size(); ++j) {
-            q_probs[q.ids[j]] += q.probs[j];
+            bool found = false;
+            for (auto & qp : q_probs) {
+                if (qp.id == q.ids[j]) {
+                    qp.prob += q.probs[j];
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                q_probs.push_back({q.ids[j], q.probs[j]});
+            }
         }
-        const auto q_prob = [&q_probs](llama_token id) {
-            const auto it = q_probs.find(id);
-            return it == q_probs.end() ? 0.0f : it->second;
+        const auto q_prob = [&q_probs](llama_token id) -> float {
+            for (const auto & qp : q_probs) {
+                if (qp.id == id) {
+                    return qp.prob;
+                }
+            }
+            return 0.0f;
         };
 
         const auto * p = common_sampler_get_candidates(gsmpl, false);

@@ -607,6 +607,9 @@ extern "C" {
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
     LLAMA_API bool llama_numa_bind_current_thread(int node_id, int thread_idx);
     LLAMA_API int  llama_numa_node_count(void);
+    LLAMA_API int  llama_numa_get_optimal_draft_node(int target_node);
+    LLAMA_API int  llama_numa_get_gpu_node(int device);
+    LLAMA_API int  llama_numa_get_storage_numa_node(void);
 
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);

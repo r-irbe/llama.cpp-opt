@@ -30,6 +30,7 @@
 #include "iqk_gemm_1bit.h"
 #include "iqk_gemm_legacy_quants.h"
 #include "iqk_utils.h"
+#include "iqk_cpu_ops.h"
 
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
@@ -238,9 +239,14 @@ struct MulMat {
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
 #ifdef __AVX2__
-#ifdef HAVE_FANCY_SIMD
+#if defined(GGML_USE_IQK_AVX512)
+        const bool has_fancy = iqk_cpu_has_avx512_vnni();
+        auto q8_k_type = has_fancy ? GGML_TYPE_Q8_K_R16 : GGML_TYPE_Q8_K_R8;
+#elif defined(HAVE_FANCY_SIMD)
+        const bool has_fancy = true;
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
 #else
+        const bool has_fancy = false;
         auto q8_k_type = GGML_TYPE_Q8_K_R8;
 #endif
         switch (type) {
@@ -286,10 +292,8 @@ struct MulMat {
             case GGML_TYPE_IQ5_K_R4: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ6_K  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q4_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
-#ifdef HAVE_FANCY_SIMD
-            case GGML_TYPE_Q4_0_R8 : return nrc_y >= 128 ? GGML_TYPE_Q8_0_R8 : type;
-            case GGML_TYPE_MXFP4_R8: return nrc_y >= 128 ? GGML_TYPE_Q8_0_R8 : type;
-#endif
+            case GGML_TYPE_Q4_0_R8 : return has_fancy && nrc_y >= 128 ? GGML_TYPE_Q8_0_R8 : type;
+            case GGML_TYPE_MXFP4_R8: return has_fancy && nrc_y >= 128 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_IQ4_NL_R4: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_Q5_0_R4: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_Q6_0_R4: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
@@ -350,83 +354,90 @@ struct MulMat {
         return type;
     }
     static inline int num_rows([[maybe_unused]] ggml_type type) {
-#ifdef HAVE_FANCY_SIMD
-        switch (type) {
-            case GGML_TYPE_Q2_K_R4:
-            case GGML_TYPE_Q3_K_R4:
-            case GGML_TYPE_Q6_K_R4:
-            case GGML_TYPE_IQ2_K_R4:
-            case GGML_TYPE_IQ3_K_R4:
-            case GGML_TYPE_IQ4_K_R4:
-            case GGML_TYPE_IQ5_K_R4:
-            case GGML_TYPE_IQ4_KS_R4:
-            case GGML_TYPE_IQ5_KS_R4:
-            case GGML_TYPE_IQ2_XXS_R4:
-            case GGML_TYPE_IQ2_XS_R4:
-            case GGML_TYPE_IQ2_S_R4:
-            case GGML_TYPE_IQ3_XXS_R4:
-            case GGML_TYPE_IQ1_S_R4:
-            case GGML_TYPE_IQ1_M_R4:
-            case GGML_TYPE_IQ3_S_R4: return 4;
-            case GGML_TYPE_IQ4_NL_R4:
-            case GGML_TYPE_Q5_0_R4:
-            case GGML_TYPE_Q6_0_R4:
-            case GGML_TYPE_IQ2_BN_R4:
-            case GGML_TYPE_IQ4_XS_R8:
-            case GGML_TYPE_Q4_K_R4:
-            case GGML_TYPE_Q5_K_R4:
-            case GGML_TYPE_Q8_KV:
-            case GGML_TYPE_Q8_KV_R8:
-            case GGML_TYPE_Q8_K_R8: return 8;
-            case GGML_TYPE_Q1_0_G128_R8: return 8;
-            case GGML_TYPE_Q4_0_R8:
-            case GGML_TYPE_Q8_0_R8:
-            case GGML_TYPE_Q8_1:
-            case GGML_TYPE_Q8_K_R16:
-            case GGML_TYPE_MXFP4_R8:
-            case GGML_TYPE_IQ4_KS_R16:
-            case GGML_TYPE_BF16_R16: return 16;
-            default: return 1;
-        }
+#if defined(GGML_USE_IQK_AVX512)
+        const bool has_fancy = iqk_cpu_has_avx512_vnni();
+#elif defined(HAVE_FANCY_SIMD)
+        const bool has_fancy = true;
 #else
-        switch (type) {
-            case GGML_TYPE_Q2_K_R4:
-            case GGML_TYPE_Q3_K_R4:
-            case GGML_TYPE_Q4_K_R4:
-            case GGML_TYPE_Q5_K_R4:
-            case GGML_TYPE_Q6_K_R4:
-            case GGML_TYPE_Q5_0_R4:
-            case GGML_TYPE_Q6_0_R4:
-            case GGML_TYPE_IQ4_NL_R4:
-            case GGML_TYPE_IQ2_K_R4:
-            case GGML_TYPE_IQ3_K_R4:
-            case GGML_TYPE_IQ4_K_R4:
-            case GGML_TYPE_IQ5_K_R4:
-            case GGML_TYPE_IQ4_KS_R4:
-            case GGML_TYPE_IQ5_KS_R4:
-            case GGML_TYPE_IQ2_XXS_R4:
-            case GGML_TYPE_IQ2_XS_R4:
-            case GGML_TYPE_IQ2_S_R4:
-            case GGML_TYPE_IQ3_XXS_R4:
-            case GGML_TYPE_IQ3_S_R4:
-            case GGML_TYPE_IQ1_S_R4:
-            case GGML_TYPE_IQ1_M_R4:
-            case GGML_TYPE_IQ2_BN_R4: return 4;
-            case GGML_TYPE_IQ4_XS_R8:
-            case GGML_TYPE_Q4_0_R8:
-            case GGML_TYPE_Q8_0_R8:
-            case GGML_TYPE_Q8_KV:
-            case GGML_TYPE_Q8_KV_R8:
-            case GGML_TYPE_Q8_1:
-            case GGML_TYPE_MXFP4_R8:
-            case GGML_TYPE_Q8_K_R8: return 8;
-            case GGML_TYPE_Q1_0_G128_R8: return 8;
-            case GGML_TYPE_Q8_K_R16:
-            case GGML_TYPE_IQ4_KS_R16:
-            case GGML_TYPE_BF16_R16: return 16;
-            default: return 1;
-        }
+        const bool has_fancy = false;
 #endif
+        if (has_fancy) {
+            switch (type) {
+                case GGML_TYPE_Q2_K_R4:
+                case GGML_TYPE_Q3_K_R4:
+                case GGML_TYPE_Q6_K_R4:
+                case GGML_TYPE_IQ2_K_R4:
+                case GGML_TYPE_IQ3_K_R4:
+                case GGML_TYPE_IQ4_K_R4:
+                case GGML_TYPE_IQ5_K_R4:
+                case GGML_TYPE_IQ4_KS_R4:
+                case GGML_TYPE_IQ5_KS_R4:
+                case GGML_TYPE_IQ2_XXS_R4:
+                case GGML_TYPE_IQ2_XS_R4:
+                case GGML_TYPE_IQ2_S_R4:
+                case GGML_TYPE_IQ3_XXS_R4:
+                case GGML_TYPE_IQ1_S_R4:
+                case GGML_TYPE_IQ1_M_R4:
+                case GGML_TYPE_IQ3_S_R4: return 4;
+                case GGML_TYPE_IQ4_NL_R4:
+                case GGML_TYPE_Q5_0_R4:
+                case GGML_TYPE_Q6_0_R4:
+                case GGML_TYPE_IQ2_BN_R4:
+                case GGML_TYPE_IQ4_XS_R8:
+                case GGML_TYPE_Q4_K_R4:
+                case GGML_TYPE_Q5_K_R4:
+                case GGML_TYPE_Q8_KV:
+                case GGML_TYPE_Q8_KV_R8:
+                case GGML_TYPE_Q8_K_R8: return 8;
+                case GGML_TYPE_Q1_0_G128_R8: return 8;
+                case GGML_TYPE_Q4_0_R8:
+                case GGML_TYPE_Q8_0_R8:
+                case GGML_TYPE_Q8_1:
+                case GGML_TYPE_Q8_K_R16:
+                case GGML_TYPE_MXFP4_R8:
+                case GGML_TYPE_IQ4_KS_R16:
+                case GGML_TYPE_BF16_R16: return 16;
+                default: return 1;
+            }
+        } else {
+            switch (type) {
+                case GGML_TYPE_Q2_K_R4:
+                case GGML_TYPE_Q3_K_R4:
+                case GGML_TYPE_Q4_K_R4:
+                case GGML_TYPE_Q5_K_R4:
+                case GGML_TYPE_Q6_K_R4:
+                case GGML_TYPE_Q5_0_R4:
+                case GGML_TYPE_Q6_0_R4:
+                case GGML_TYPE_IQ4_NL_R4:
+                case GGML_TYPE_IQ2_K_R4:
+                case GGML_TYPE_IQ3_K_R4:
+                case GGML_TYPE_IQ4_K_R4:
+                case GGML_TYPE_IQ5_K_R4:
+                case GGML_TYPE_IQ4_KS_R4:
+                case GGML_TYPE_IQ5_KS_R4:
+                case GGML_TYPE_IQ2_XXS_R4:
+                case GGML_TYPE_IQ2_XS_R4:
+                case GGML_TYPE_IQ2_S_R4:
+                case GGML_TYPE_IQ3_XXS_R4:
+                case GGML_TYPE_IQ3_S_R4:
+                case GGML_TYPE_IQ1_S_R4:
+                case GGML_TYPE_IQ1_M_R4:
+                case GGML_TYPE_IQ2_BN_R4: return 4;
+                case GGML_TYPE_IQ4_XS_R8:
+                case GGML_TYPE_Q4_0_R8:
+                case GGML_TYPE_Q8_0_R8:
+                case GGML_TYPE_Q8_KV:
+                case GGML_TYPE_Q8_KV_R8:
+                case GGML_TYPE_Q8_1:
+                case GGML_TYPE_MXFP4_R8:
+                case GGML_TYPE_Q8_K_R8: return 8;
+                case GGML_TYPE_Q1_0_G128_R8: return 8;
+                case GGML_TYPE_Q8_K_R16:
+                case GGML_TYPE_IQ4_KS_R16:
+                case GGML_TYPE_BF16_R16: return 16;
+                default: return 1;
+            }
+        }
     }
 };
 

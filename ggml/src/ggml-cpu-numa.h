@@ -2,6 +2,7 @@
 
 #ifdef __cplusplus
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,7 @@ namespace ggml::cpu::numa {
 
 struct node {
     int id = -1;
+    int socket_id = -1;           // physical package/socket ID from /sys/devices/system/cpu/cpu*/topology/physical_package_id
 
     std::vector<int> cpus;        // usable logical CPUs, after the process affinity mask
     std::vector<int> cores;       // usable physical core primary CPUs (excluding SMT siblings)
@@ -51,6 +53,22 @@ bool bind_current_thread_to_node(int node_id, int thread_idx);
 // whether numa split is enabled
 bool is_numa_split();
 void set_numa_split(bool enable);
+
+// Dynamic topology querying: physical socket count and node-to-socket mapping
+int socket_count();
+int socket_count(const std::vector<node> & nodes);
+int node_socket(int node_id);
+int node_socket(const std::vector<node> & nodes, int node_id);
+std::vector<int> socket_nodes(int socket_id);
+std::vector<int> socket_nodes(const std::vector<node> & nodes, int socket_id);
+int get_optimal_draft_node(int target_node = -1);
+int get_optimal_draft_node(const std::vector<node> & nodes, int target_node = -1);
+
+// NVMe / Storage NUMA node detection
+int  get_storage_numa_node();
+void set_storage_numa_node(int node);
+int  detect_dev_numa_node(uint64_t dev, const std::string & sysfs_root = "/sys");
+int  detect_path_numa_node(const char * path, const std::string & sysfs_root = "/sys");
 
 } // namespace ggml::cpu::numa
 #else

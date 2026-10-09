@@ -19,7 +19,23 @@
 
 struct common_suffix_node {
     int64_t count = 0;
-    std::unordered_map<llama_token, std::unique_ptr<common_suffix_node>> children;
+    std::vector<std::pair<llama_token, std::unique_ptr<common_suffix_node>>> children;
+
+    common_suffix_node * find_child(llama_token tok) const {
+        for (const auto & p : children) {
+            if (p.first == tok) {
+                return p.second.get();
+            }
+        }
+        return nullptr;
+    }
+
+    common_suffix_node * create_child(llama_token tok) {
+        auto child = std::make_unique<common_suffix_node>();
+        auto * ptr = child.get();
+        children.emplace_back(tok, std::move(child));
+        return ptr;
+    }
 };
 
 class common_suffix_tree {

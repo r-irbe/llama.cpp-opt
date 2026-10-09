@@ -22,8 +22,120 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+#include <intrin.h>
+static void run_cpuid_raw(int leaf, int subleaf, int info[4]) {
+    __cpuidex(info, leaf, subleaf);
+}
+static uint64_t run_xgetbv(uint32_t xcr) {
+    return _xgetbv(xcr);
+}
+#else
+#include <cpuid.h>
+#include <immintrin.h>
+static void run_cpuid_raw(int leaf, int subleaf, int info[4]) {
+    __cpuid_count(leaf, subleaf, info[0], info[1], info[2], info[3]);
+}
+static uint64_t run_xgetbv(uint32_t xcr) {
+    uint32_t eax, edx;
+    __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(xcr));
+    return ((uint64_t)edx << 32) | eax;
+}
+#endif
+
+struct iqk_x86_cpu_features {
+    bool has_avx = false;
+    bool has_avx2 = false;
+    bool has_fma = false;
+    bool has_avx512f = false;
+    bool has_avx512dq = false;
+    bool has_avx512bw = false;
+    bool has_avx512vl = false;
+    bool has_avx512vnni = false;
+    bool has_avx_vnni = false;
+    bool has_amx_tile = false;
+    bool has_amx_int8 = false;
+    bool has_amx_bf16 = false;
+
+    iqk_x86_cpu_features() {
+        int info[4] = {0};
+        run_cpuid_raw(0, 0, info);
+        int max_leaf = info[0];
+        if (max_leaf < 1) return;
+
+        run_cpuid_raw(1, 0, info);
+        bool osxsave = (info[2] & (1 << 27)) != 0;
+        bool cpu_avx = (info[2] & (1 << 28)) != 0;
+        has_fma = (info[2] & (1 << 12)) != 0;
+
+        if (!osxsave || !cpu_avx) return;
+
+        uint64_t xcr0 = run_xgetbv(0);
+        bool os_avx_supported = (xcr0 & 0x6) == 0x6;
+        if (!os_avx_supported) return;
+
+        has_avx = true;
+
+        if (max_leaf >= 7) {
+            run_cpuid_raw(7, 0, info);
+            has_avx2 = (info[1] & (1 << 5)) != 0;
+
+            bool os_avx512_supported = (xcr0 & 0xE6) == 0xE6;
+            if (os_avx512_supported) {
+                has_avx512f = (info[1] & (1 << 16)) != 0;
+                has_avx512dq = (info[1] & (1 << 17)) != 0;
+                has_avx512bw = (info[1] & (1 << 30)) != 0;
+                has_avx512vl = (info[1] & (1 << 31)) != 0;
+                has_avx512vnni = (info[2] & (1 << 11)) != 0;
+            }
+
+            has_amx_tile = (info[3] & (1 << 24)) != 0;
+            has_amx_int8 = (info[3] & (1 << 25)) != 0;
+            has_amx_bf16 = (info[3] & (1 << 22)) != 0;
+
+            // Subleaf 1
+            run_cpuid_raw(7, 1, info);
+            has_avx_vnni = (info[0] & (1 << 4)) != 0;
+        }
+    }
+};
+
+static const iqk_x86_cpu_features & get_x86_cpu_features() {
+    static const iqk_x86_cpu_features features;
+    return features;
+}
+#endif
+
 bool iqk_has_fancy_simd(void) {
-#ifdef HAVE_FANCY_SIMD
+    // Compile-time: reports whether the AVX-512 VNNI kernels were built in.
+    // Use iqk_cpu_has_avx512_vnni() for runtime CPU capability.
+#if defined(HAVE_FANCY_SIMD)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool iqk_cpu_has_avx512_vnni(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return get_x86_cpu_features().has_avx512vnni;
+#else
+    return false;
+#endif
+}
+
+bool iqk_cpu_has_amx(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    const auto & f = get_x86_cpu_features();
+    return f.has_amx_tile && f.has_amx_int8;
+#else
+    return false;
+#endif
+}
+
+bool iqk_has_avx512_runtime_dispatch(void) {
+#if defined(GGML_USE_IQK_AVX512)
     return true;
 #else
     return false;

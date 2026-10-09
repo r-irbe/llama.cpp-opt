@@ -305,13 +305,33 @@ struct llama_kv_cache {
     bool per_step_alloc(const llama_model & model, int max_tokens);
     bool per_step_restore(ggml_backend_sched_t sched, int step, uint32_t slot);
 
-    ~llama_kv_cache() {
+    void clear() {
+        ckpt.release();
         for (struct ggml_context * ctx : ctxs) {
             ggml_free(ctx);
         }
+        ctxs.clear();
         for (ggml_backend_buffer_t buf : bufs) {
             ggml_backend_buffer_free(buf);
         }
+        bufs.clear();
+        k_l.clear();
+        v_l.clear();
+        s_l.clear();
+        kr_l.clear();
+        kp_l.clear();
+        split_k_l.clear();
+        split_v_l.clear();
+        split_s_l.clear();
+        row_count.clear();
+        cells.clear();
+        head = 0;
+        size = 0;
+        used = 0;
+    }
+
+    ~llama_kv_cache() {
+        clear();
     }
 };
 

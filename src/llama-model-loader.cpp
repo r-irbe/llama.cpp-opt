@@ -27,6 +27,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstring>
+#include <cinttypes>
 
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
@@ -419,6 +420,33 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     n_tensors = weights.size();
 
     fver = (enum llama_fver) gguf_get_version(meta);
+
+    // Scan GGUF metadata for GGUF-X / NPMC unpadded tensor dimensions (breaking DRAM bank aliasing)
+    {
+        const std::string unpad_prefix = "npmc.unpadded_dim0.";
+        for (int i = 0; i < n_kv; ++i) {
+            const char * key = gguf_get_key(meta, i);
+            if (strncmp(key, unpad_prefix.c_str(), unpad_prefix.size()) == 0) {
+                std::string tensor_name = key + unpad_prefix.size();
+                int64_t val = 0;
+                enum gguf_type type = gguf_get_kv_type(meta, i);
+                if (type == GGUF_TYPE_UINT64) {
+                    val = (int64_t) gguf_get_val_u64(meta, i);
+                } else if (type == GGUF_TYPE_INT64) {
+                    val = gguf_get_val_i64(meta, i);
+                } else if (type == GGUF_TYPE_UINT32) {
+                    val = (int64_t) gguf_get_val_u32(meta, i);
+                } else if (type == GGUF_TYPE_INT32) {
+                    val = (int64_t) gguf_get_val_i32(meta, i);
+                }
+                if (val > 0) {
+                    unpadded_dim0[tensor_name] = val;
+                    LLAMA_LOG_INFO("%s: GGUF-X bank-aliasing padding detected for '%s': unpadded dim0 = %" PRId64 "\n",
+                                   __func__, tensor_name.c_str(), val);
+                }
+            }
+        }
+    }
 
     std::set<std::string> tensor_names;
     for (auto & w : weights) {
@@ -952,6 +980,12 @@ struct ggml_tensor * llama_model_loader::create_tensor_for(struct ggml_context *
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
 
+    auto it_unpad = unpadded_dim0.find(tensor->name);
+    if (it_unpad != unpadded_dim0.end()) {
+        // Restore logical unpadded dimension 0 while preserving the padded row stride in nb[1]
+        tensor->ne[0] = it_unpad->second;
+    }
+
     if (duplicated) {
         size_data += ggml_nbytes(cur);
     } else {
@@ -973,8 +1007,13 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
 
     {
         bool is_ok = true;
+        auto it_unpad = unpadded_dim0.find(name);
         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
-            if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
+            int64_t cur_ne = cur->ne[i];
+            if (i == 0 && it_unpad != unpadded_dim0.end()) {
+                cur_ne = it_unpad->second;
+            }
+            if ((i < ne.size() && ne[i] != cur_ne) || (i >= ne.size() && cur_ne != 1)) {
                 is_ok = false;
                 break;
             }

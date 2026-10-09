@@ -2,6 +2,7 @@
 #include "server-queue.h"
 #include "speculative.h"
 #include "json-schema-to-grammar.h"
+#include "cohort-radix-trie.h"
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
@@ -29,6 +30,10 @@ struct server_slot {
     int id_multi = -1;
 
     struct slot_params params;
+
+    std::string cohort_id;
+    int cohort_primary_slot = -1;
+    int32_t cohort_reuse_count = 0;
 
     bool released = false;
     slot_state state = SLOT_STATE_IDLE;
@@ -282,6 +287,14 @@ struct server_context {
     float slot_prompt_similarity = 0.0f;
     int32_t cache_ram_n_min = 0;
     float cache_ram_similarity = 0.5f;
+
+    // Cross-slot cohort prompt prefix sharing
+    bool cohort_prefix_sharing = true;
+    int32_t cohort_min_prefix_tokens = 16;
+    int32_t cohort_max_idle_sec = 0;
+    cohort_radix_trie cohort_trie;
+
+    void evict_idle_cohort_slots();
 
     ~server_context();
 

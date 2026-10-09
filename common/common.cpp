@@ -328,8 +328,8 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
             return fail("two-stage speculative mode currently requires a self-spec stage first");
         }
 
-        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT) {
-            return fail("two-stage speculative mode currently supports only MTP or draft-model fallback after self-spec");
+        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT && !common_speculative_type_is_dflash_family(second)) {
+            return fail("two-stage speculative mode currently supports only MTP, draft-model, or DFlash fallback after self-spec");
         }
     }
 
@@ -2779,6 +2779,24 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.slot_prompt_similarity = std::stof(argv[i]);
         return true;
     }
+    if (arg == "--cohort-prefix-sharing") {
+        params.cohort_prefix_sharing = true;
+        return true;
+    }
+    if (arg == "--no-cohort-prefix-sharing") {
+        params.cohort_prefix_sharing = false;
+        return true;
+    }
+    if (arg == "--cohort-min-prefix") {
+        CHECK_ARG
+        params.cohort_min_prefix_tokens = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--cohort-max-idle-sec") {
+        CHECK_ARG
+        params.cohort_max_idle_sec = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-pps") {
         params.is_pp_shared = true;
         return true;
@@ -2799,6 +2817,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         CHECK_ARG
         auto p = string_split<int>(argv[i], split_delim);
         params.n_pl.insert(params.n_pl.end(), p.begin(), p.end());
+        return true;
+    }
+    if (arg == "-npps" || arg == "--n-pps") {
+        CHECK_ARG
+        auto p = string_split<int>(argv[i], split_delim);
+        params.n_pps.insert(params.n_pps.end(), p.begin(), p.end());
         return true;
     }
     if (arg == "--context-file") {
@@ -3442,6 +3466,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "bench",       "-npp n0,n1,...",                "number of prompt tokens" });
     options.push_back({ "bench",       "-ntg n0,n1,...",                "number of text generation tokens" });
     options.push_back({ "bench",       "-npl n0,n1,...",                "number of parallel prompts" });
+    options.push_back({ "bench",       "-npps c0,c1,...",               "number of prompt clusters subdividing n_pl (1..n_pl)" });
     options.push_back({ "bench",       "-nrep,  --n-repetitions N",     "number of repetitions (default: %d)", params.nrep });
     if (params.sweep_bench) {
         options.push_back({ "bench",   "        --sweep-stride N",       "measure every Nth sweep row (default: %d)", params.sweep_stride });
@@ -3481,6 +3506,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template" });
     options.push_back({ "server",      "-sps,  --slot-prompt-similarity SIMILARITY",
                                                                         "how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity });
+    options.push_back({ "server",      "       --cohort-prefix-sharing",       "enable cross-slot zero-copy prompt prefix sharing for cohorts (default: %s)", params.cohort_prefix_sharing ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --no-cohort-prefix-sharing",    "disable cross-slot prompt prefix sharing for cohorts" });
+    options.push_back({ "server",      "       --cohort-min-prefix N",         "min shared prompt tokens to trigger cross-slot KV replication (default: %d)", params.cohort_min_prefix_tokens });
+    options.push_back({ "server",      "       --cohort-max-idle-sec SEC",     "max idle seconds before reclaiming private cohort slot (default: %d, 0 = disabled)", params.cohort_max_idle_sec });
     options.push_back({ "server",      "       --lora-init-without-apply",     "load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"});
     options.push_back({ "server",      "       --send-done",                 "send 'done' signal to the client when generation is complete" });
     options.push_back({ "server",      "       --sql-save-file FNAME",       "save chat history to a SQLite database" });

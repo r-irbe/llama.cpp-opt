@@ -1012,11 +1012,77 @@ void server_context::copy_data_to_cached_prompt(const server_tokens & tokens, se
     slot.server_cached_prompt.think_tokens = slot.params.think_tokens;
 }
 
+void server_context::evict_idle_cohort_slots() {
+    if (cohort_max_idle_sec <= 0) return;
+    const int64_t now_us = ggml_time_us();
+    for (server_slot& slot : slots) {
+        if (slot.available() && !slot.cohort_id.empty() && slot.t_last_used > 0) {
+            int64_t idle_sec = (now_us - slot.t_last_used) / 1000000LL;
+            if (idle_sec >= cohort_max_idle_sec) {
+                LOG_VERBOSE("reclaiming idle cohort slot", {
+                    {"id_slot", slot.id},
+                    {"cohort_id", slot.cohort_id},
+                    {"idle_sec", idle_sec}
+                });
+                if (slot.ctx) {
+                    llama_kv_cache_seq_rm(slot.ctx, slot.id, -1, -1);
+                }
+                cohort_trie.remove_slot(slot.id);
+                slot.cache_tokens.clear();
+                slot.cohort_id.clear();
+                slot.cohort_primary_slot = -1;
+                slot.cohort_reuse_count = 0;
+                slot.n_past = 0;
+                slot.n_past_prompt = 0;
+            }
+        }
+    }
+}
+
 server_slot* server_context::get_available_slot(const server_task& task) {
     server_slot* ret = nullptr;
     bool update_cache = false;
 
-    // find the slot that has at least n% prompt similarity
+    // 0. Reclaim any private cohort slots exceeding idle timeout
+    evict_idle_cohort_slots();
+
+    // 1. Prioritize an available slot that already has warm cache for this cohort
+    const std::string task_cohort = json_value(task.data, "cohort_id", task.params.cohort_id);
+    if (!task_cohort.empty()) {
+        for (server_slot& slot : slots) {
+            if (slot.available() && slot.cohort_id == task_cohort && !slot.cache_tokens.empty()) {
+                LOG_VERBOSE("selected slot by warm cohort affinity", {
+                    {"id_slot", slot.id},
+                    {"cohort_id", task_cohort},
+                    {"cache_tokens", slot.cache_tokens.size()}
+                });
+                ret = &slot;
+                break;
+            }
+        }
+    }
+
+    // 2. Prefix Radix Trie Fast Lookup in O(L) time
+    if (ret == nullptr && cohort_prefix_sharing && !task.tokens.empty()) {
+        const auto& text_tokens = task.tokens.get_text_tokens();
+        auto match = cohort_trie.find_best_match(
+            text_tokens, task_cohort, cohort_min_prefix_tokens,
+            [this](int id) -> const server_slot* {
+                if (id >= 0 && id < (int)slots.size()) return &slots[id];
+                return nullptr;
+            }
+        );
+        if (match.slot_id >= 0 && match.slot_id < (int)slots.size() && slots[match.slot_id].available()) {
+            ret = &slots[match.slot_id];
+            LOG_VERBOSE("selected slot by radix trie prefix match", {
+                {"id_slot", ret->id},
+                {"matched_tokens", match.matched_tokens},
+                {"cohort_reuse_count", match.cohort_reuse_count}
+            });
+        }
+    }
+
+    // 3. Find the slot that has at least n% prompt similarity
     if (ret == nullptr && slot_prompt_similarity != 0.0f) {
         int max_lcp_len = 0;
         float sim_best = 0;
@@ -1024,6 +1090,10 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         for (server_slot& slot : slots) {
             // skip the slot if it is not available
             if (!slot.available()) {
+                continue;
+            }
+            // SECURITY: Never reuse a private cohort's cache for a different cohort or an untagged request
+            if (!slot.cohort_id.empty() && slot.cohort_id != task_cohort) {
                 continue;
             }
             auto& cache_tokens = slot.cache_tokens;
@@ -1059,27 +1129,65 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         }
     }
 
-    // find the slot that has been least recently used
+    // 4. Find the slot to evict/reassign using LRU/LFU hierarchy:
+    // Tier 0: Completely cold slot with no cached tokens (best to reuse without losing cache)
+    // Tier 1: Slot with 0 reuses (cohort_reuse_count == 0)
+    // Tier 2: Low-reuse slot (cohort_reuse_count == 1)
+    // Tier 3: High-reuse slot (cohort_reuse_count >= 2) - strongly protected from eviction
+    // Within the same tier, pick the least-recently used slot (oldest t_last_used).
     if (ret == nullptr) {
-        int64_t t_last = ggml_time_us();
+        int best_tier = 999;
+        int64_t t_best_used = INT64_MAX;
+
         for (server_slot& slot : slots) {
-            // skip the slot if it is not available
             if (!slot.available()) {
                 continue;
             }
-            // select the current slot if the criteria match
-            if (slot.t_last_used < t_last) {
-                t_last = slot.t_last_used;
+
+            int tier = 3;
+            if (slot.cache_tokens.empty()) {
+                tier = 0;
+            } else if (slot.cohort_reuse_count == 0) {
+                tier = 1;
+            } else if (slot.cohort_reuse_count == 1) {
+                tier = 2;
+            } else {
+                tier = 3;
+            }
+
+            if (tier < best_tier || (tier == best_tier && slot.t_last_used < t_best_used)) {
+                best_tier = tier;
+                t_best_used = slot.t_last_used;
                 ret = &slot;
             }
         }
 
         if (ret != nullptr) {
-            LOG_VERBOSE("selected slot by lru", {
+            LOG_VERBOSE("selected slot by lru/lfu hierarchy", {
                 {"id_slot", ret->id},
-                {"t_last", t_last},
+                {"tier", best_tier},
+                {"t_last", t_best_used},
                 });
         }
+    }
+
+    // 5. Mandatory multi-tenant cleansing if reassigning to a different cohort
+    if (ret != nullptr && !ret->cohort_id.empty() && ret->cohort_id != task_cohort) {
+        LOG_VERBOSE("cleansing slot for new cohort", {
+            {"id_slot", ret->id},
+            {"old_cohort", ret->cohort_id},
+            {"new_cohort", task_cohort}
+        });
+        if (ret->ctx) {
+            llama_kv_cache_seq_rm(ret->ctx, ret->id, -1, -1);
+        }
+        cohort_trie.remove_slot(ret->id);
+        ret->cache_tokens.clear();
+        ret->cohort_id = task_cohort;
+        ret->cohort_primary_slot = -1;
+        ret->cohort_reuse_count = 0;
+        ret->n_past = 0;
+        ret->n_past_prompt = 0;
     }
     if (ret) {
         auto& tokens = ret->cache_tokens;
@@ -1183,6 +1291,9 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     auto stream_opt = json_value(data, "stream_options", json::object());
     slot.params.include_usage = json_value(stream_opt, "include_usage", false);
     slot.params.cache_prompt = json_value(data, "cache_prompt", true);
+    slot.params.cohort_id = json_value(data, "cohort_id", task.params.cohort_id);
+    slot.cohort_id = slot.params.cohort_id;
+    slot.cohort_primary_slot = -1;
     slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", json_value(data, "max_completion_tokens", defaults.n_predict)));
     slot.saturate_predict = json_value(data, "saturate_predict", false);
     slot.sparams.top_k = json_value(data, "top_k", default_sparams.top_k);
@@ -4160,6 +4271,88 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                             // reuse any previously computed tokens that are common with the new prompt
                             common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
+
+                            // cross-slot cohort prompt prefix sharing: replicate KV cache from another slot sharing the cohort
+                            if (cohort_prefix_sharing && (prefix.first == 0 || slot.cache_tokens.empty()) &&
+                                !llama_model_is_deepseek4(model) &&
+                                !llama_model_is_openpangu(model) &&
+                                !llama_model_has_recurrent(model)) {
+                                int best_src_slot = -1;
+                                int max_cohort_prefix = 0;
+                                int primary_prefill_slot = -1;
+
+                                for (const auto& other_slot : slots) {
+                                    if (other_slot.id == slot.id) continue;
+
+                                    // SECURITY: If slot has a cohort_id, it can ONLY share with the EXACT same cohort_id.
+                                    // If slot is untagged (empty cohort_id), it can ONLY share with other untagged slots.
+                                    // Never leak a private cohort's cache to a different cohort or an untagged request!
+                                    bool is_cohort_authorized = false;
+                                    if (!slot.cohort_id.empty()) {
+                                        is_cohort_authorized = (slot.cohort_id == other_slot.cohort_id);
+                                    } else {
+                                        is_cohort_authorized = other_slot.cohort_id.empty();
+                                    }
+
+                                    if (!is_cohort_authorized) {
+                                        continue;
+                                    }
+
+                                    bool cohort_match = !slot.cohort_id.empty();
+
+                                    // First: check if any slot already has cached tokens we can replicate from
+                                    if (!other_slot.cache_tokens.empty()) {
+                                        common_prefix other_prefix = other_slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
+                                        if (cohort_match || other_prefix.first >= cohort_min_prefix_tokens) {
+                                            if (other_prefix.first > max_cohort_prefix) {
+                                                max_cohort_prefix = other_prefix.first;
+                                                best_src_slot = other_slot.id;
+                                            }
+                                        }
+                                    }
+
+                                    // Second: identify if an earlier slot is the elected primary prefilling this cohort
+                                    if (cohort_match && other_slot.command == SLOT_COMMAND_LOAD_PROMPT && other_slot.n_prompt_tokens_processed == 0) {
+                                        if (other_slot.id < slot.id) {
+                                            if (primary_prefill_slot == -1 || other_slot.id < primary_prefill_slot) {
+                                                primary_prefill_slot = other_slot.id;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // If no slot has completed the cache yet, but an elected primary is prefilling it, defer to the primary
+                                if (max_cohort_prefix == 0 && primary_prefill_slot != -1) {
+                                    slot.n_prompt_tokens = 0; // ensure slot re-evaluates in next iteration
+                                    LOG_VERBOSE("cohort slot deferring to primary prefill slot", {
+                                        {"id_slot", slot.id},
+                                        {"primary_slot", primary_prefill_slot},
+                                        {"cohort_id", slot.cohort_id}
+                                    });
+                                    continue;
+                                }
+
+                                if (best_src_slot != -1 && max_cohort_prefix > (int)prefix.first) {
+                                    auto& src_slot = slots[best_src_slot];
+                                    llama_kv_cache_seq_rm(ctx, slot.id, 0, -1);
+                                    llama_kv_cache_seq_cp(ctx, src_slot.id, slot.id, 0, max_cohort_prefix);
+
+                                    server_tokens cloned = src_slot.cache_tokens.clone();
+                                    cloned.keep_first(max_cohort_prefix);
+                                    slot.cache_tokens = std::move(cloned);
+
+                                    prefix.first = max_cohort_prefix;
+                                    prefix.second = max_cohort_prefix;
+
+                                    src_slot.cohort_reuse_count++;
+                                    slot.cohort_reuse_count = 1;
+                                    cohort_trie.insert_slot(slot.id, slot.cache_tokens.get_text_tokens());
+                                    cohort_trie.insert_slot(src_slot.id, src_slot.cache_tokens.get_text_tokens());
+
+                                    LLAMA_LOG_INFO("%s: [COHORT-PREFIX-SHARE] slot %d replicated %d prompt tokens from slot %d (cohort '%s', reuse_count: %d)\n",
+                                        __func__, slot.id, max_cohort_prefix, src_slot.id, slot.cohort_id.c_str(), src_slot.cohort_reuse_count);
+                                }
+                            }
                             LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
                             int32_t size_threshold = 20;
                             slot.n_past = prefix.first;

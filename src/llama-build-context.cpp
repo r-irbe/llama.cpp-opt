@@ -3614,6 +3614,6 @@ int32_t llama_model_n_nextn_layer(const llama_model * model) {
 }
 
 ggml_cgraph * llm_build_context::new_graph_custom() {
-    int max_nodes = lctx.max_nodes(n_tokens, n_kv);
+    int max_nodes = std::max<int>(lctx.max_nodes(n_tokens, n_kv), 65536);
     return ggml_new_graph_custom(ctx0, max_nodes, false);
 }

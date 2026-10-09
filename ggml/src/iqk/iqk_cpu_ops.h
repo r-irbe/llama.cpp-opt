@@ -16,6 +16,9 @@ extern "C" {
 struct ggml_tensor;
 
 bool iqk_has_fancy_simd(void);
+bool iqk_cpu_has_avx512_vnni(void);
+bool iqk_cpu_has_amx(void);
+bool iqk_has_avx512_runtime_dispatch(void);
 
 void iqk_sumrows_div(struct ggml_tensor * div, int ith, int nth);
 

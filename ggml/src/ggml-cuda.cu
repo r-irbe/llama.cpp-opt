@@ -4483,7 +4483,25 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 #ifdef USE_CUDA_GRAPH
 
 static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    if (!cgraph || cgraph->n_nodes == 0) {
+        return nullptr;
+    }
+    // Multi-context key combining root node, topology size, and dynamic execution batching
+    uint64_t h = (uint64_t)(uintptr_t)cgraph->nodes[0];
+    uint64_t n_nodes = (uint64_t)cgraph->n_nodes;
+    uint64_t n_leafs = (uint64_t)cgraph->n_leafs;
+    uint64_t n_batch = (uint64_t)(cgraph->n_batch > 0 ? cgraph->n_batch : 1);
+    uint64_t ne0     = (uint64_t)(cgraph->nodes[0] ? cgraph->nodes[0]->ne[0] : 1);
+    uint64_t ne1     = (uint64_t)(cgraph->nodes[0] ? cgraph->nodes[0]->ne[1] : 1);
+
+    // High-performance 64-bit mixer (SplitMix64 / Wang hash)
+    h ^= (n_nodes + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
+    h ^= (n_leafs + 0xbf58476d1ce4e5b9ULL + (h << 6) + (h >> 2));
+    h ^= (n_batch + 0x94d049bb133111ebULL + (h << 6) + (h >> 2));
+    h ^= (ne0     + 0x517cc1b727220a95ULL + (h << 6) + (h >> 2));
+    h ^= (ne1     + 0x3185a377bcb887fULL  + (h << 6) + (h >> 2));
+
+    return (const void *)(uintptr_t)h;
 }
 
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
@@ -4591,17 +4609,34 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 }
 
 static void set_ggml_graph_node_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
-    graph_node_properties->node_address = node->data;
+    if (ggml_is_noop(node)) {
+        // No-op nodes (VIEW, RESHAPE, TRANSPOSE, PERMUTE, NONE) do not execute kernels in the CUDA graph.
+        // Normalizing their properties prevents spurious updates caused by changing view offsets/addresses
+        // during KV cache appends in autoregressive decode.
+        memset(graph_node_properties, 0, sizeof(*graph_node_properties));
+        graph_node_properties->node_op = node->op;
+        return;
+    }
+
+    // For GGML_OP_CPY:
+    // ggml_cuda_cpy_dest_ptrs_copy updates destination pointers on GPU before each launch.
+    // Masking destination addresses allows permanent graph reuse across decode steps.
+    const bool is_cpy = (node->op == GGML_OP_CPY);
+    graph_node_properties->node_address = is_cpy ? nullptr : node->data;
     graph_node_properties->node_op = node->op;
     graph_node_properties->type = node->type;
     graph_node_properties->view_src = node->view_src;
-    graph_node_properties->view_offs = node->view_offs;
+    graph_node_properties->view_offs = is_cpy ? 0 : node->view_offs;
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         graph_node_properties->ne[i] = node->ne[i];
         graph_node_properties->nb[i] = node->nb[i];
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        graph_node_properties->src_address[i] = node->src[i] ? node->src[i]->data : nullptr;
+        if (is_cpy && i == 1) {
+            graph_node_properties->src_address[i] = nullptr;
+        } else {
+            graph_node_properties->src_address[i] = node->src[i] ? node->src[i]->data : nullptr;
+        }
     }
     memcpy(graph_node_properties->op_params, node->op_params, GGML_MAX_OP_PARAMS);
 }
@@ -4778,22 +4813,15 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
         use_cuda_graph = check_node_graph_compatibility_and_refresh_copy_ops(graph, cgraph, use_cuda_graph, cuda_ctx->stream());
 
-        // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
+        // CUDA Graph Permanence Patch:
+        // Track consecutive updates for telemetry, but do NOT permanently disable CUDA graphs.
+        // Graphs update robustly via update_cuda_graph_executable (cudaGraphExecUpdate) and remain active.
         if (use_cuda_graph) {
             if (cuda_graph_update_required) {
                 graph->number_consecutive_updates++;
             } else {
                 graph->number_consecutive_updates = 0;
             }
-        }
-
-        if (graph->number_consecutive_updates >= 4) {
-            graph->disable_due_to_too_many_updates = true;
-            use_cuda_graph = false;
-            cuda_ctx->cur_graph = nullptr;
-#ifndef NDEBUG
-            GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to too many consecutive updates\n", __func__);
-#endif
         }
     }
 

@@ -446,7 +446,7 @@ auto res_err = [](httplib::Response& res, json error_data) {
 };
 
 auto res_ok = [](httplib::Response& res, const json& data) {
-    res.set_content(data.dump(), "application/json; charset=utf-8");
+    res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     res.status = 200;
 };
 
@@ -603,6 +603,9 @@ int main(int argc, char ** argv) {
     ctx_server.slot_prompt_similarity = params.slot_prompt_similarity;
     ctx_server.cache_ram_n_min = params.cache_ram_n_min;
     ctx_server.cache_ram_similarity = params.cache_ram_similarity;
+    ctx_server.cohort_prefix_sharing = params.cohort_prefix_sharing;
+    ctx_server.cohort_min_prefix_tokens = params.cohort_min_prefix_tokens;
+    ctx_server.cohort_max_idle_sec = params.cohort_max_idle_sec;
 #ifdef SQLITE3_MODERN_CPP_SUPPORT
     auto db_handle = std::make_shared<DatabaseHandle>(params.sql_save_file);
     bool sqlite_extension_loaded = false;
@@ -798,7 +801,7 @@ int main(int argc, char ** argv) {
                         }
                     }
 
-                    res.set_content(health.dump(), "application/json");
+                    res.set_content(safe_json_to_str(health), "application/json");
 
                     const char * hotswap_env = std::getenv("LLAMA_HOTSWAP_ENABLED");
                     if (hotswap_env) {
@@ -851,7 +854,7 @@ int main(int argc, char ** argv) {
         server_task_result result = ctx_server.queue_results.recv(task.id);
         ctx_server.queue_results.remove_waiting_task_id(task.id);
 
-        res.set_content(result.data.at("slots").dump(), "application/json");
+        res.set_content(safe_json_to_str(result.data.at("slots")), "application/json");
         res.status = 200; // HTTP OK
     };
 
@@ -982,7 +985,7 @@ int main(int argc, char ** argv) {
         if (result.error) {
             res_err(res, result.data);
         } else {
-            res.set_content(result.data.dump(), "application/json");
+            res.set_content(safe_json_to_str(result.data), "application/json");
         }
     };
 
@@ -1012,7 +1015,7 @@ int main(int argc, char ** argv) {
         if (result.error) {
             res_err(res, result.data);
         } else {
-            res.set_content(result.data.dump(), "application/json");
+            res.set_content(safe_json_to_str(result.data), "application/json");
         }
     };
 
@@ -1032,7 +1035,7 @@ int main(int argc, char ** argv) {
         if (result.error) {
             res_err(res, result.data);
         } else {
-            res.set_content(result.data.dump(), "application/json");
+            res.set_content(safe_json_to_str(result.data), "application/json");
         }
     };
 
@@ -1098,7 +1101,7 @@ int main(int argc, char ** argv) {
                 data["chat_template_tool_use"] = tmpl_tools;
             }
         }
-        res.set_content(data.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
     const auto handle_props_simple = [&ctx_server](const httplib::Request& req, httplib::Response& res) {
@@ -1120,7 +1123,7 @@ int main(int argc, char ** argv) {
             } },
              { "n_ctx",                       ctx_server.n_ctx }
         };
-        res.set_content(data.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
 
@@ -1302,9 +1305,31 @@ int main(int argc, char ** argv) {
             }
     };
 
-    const auto handle_completions = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto extract_cohort_id = [](const httplib::Request& req, const json& body) -> std::string {
+        if (req.has_header("X-Cohort-ID")) {
+            return req.get_header_value("X-Cohort-ID");
+        }
+        if (req.has_header("X-Prompt-Cache-Key")) {
+            return req.get_header_value("X-Prompt-Cache-Key");
+        }
+        if (body.is_object()) {
+            if (body.contains("cohort_id") && body["cohort_id"].is_string()) {
+                return body["cohort_id"].get<std::string>();
+            }
+            if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string()) {
+                return body["prompt_cache_key"].get<std::string>();
+            }
+        }
+        return "";
+    };
+
+    const auto handle_completions = [&ctx_server, &handle_completions_impl, &extract_cohort_id](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto data = json::parse(req.body);
+        const std::string cohort_id = extract_cohort_id(req, data);
+        if (!cohort_id.empty()) {
+            data["cohort_id"] = cohort_id;
+        }
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1315,10 +1340,14 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE);
     };
 
-    const auto handle_completions_oai = [&ctx_server, &handle_completions_impl](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_completions_oai = [&ctx_server, &handle_completions_impl, &extract_cohort_id](const httplib::Request& req, httplib::Response& res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(body);
+        const std::string cohort_id = extract_cohort_id(req, body);
+        if (!cohort_id.empty()) {
+            data["cohort_id"] = cohort_id;
+        }
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1387,16 +1416,20 @@ int main(int argc, char ** argv) {
             {"models", json::array({codex_model})},
         };
 
-        res.set_content(models.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(models), "application/json; charset=utf-8");
     };
 
 
 
-    const auto handle_chat_completions = [&ctx_server, &params, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_completions = [&ctx_server, &params, &handle_completions_impl, &extract_cohort_id](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        const std::string cohort_id = extract_cohort_id(req, body);
+        if (!cohort_id.empty()) {
+            data["cohort_id"] = cohort_id;
+        }
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -1406,12 +1439,16 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_CHAT);
     };
 
-    const auto handle_responses = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_responses = [&ctx_server, &handle_completions_impl, &extract_cohort_id](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json body_parsed = server_chat_convert_responses_to_chatcmpl(body);
         json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files);
+        const std::string cohort_id = extract_cohort_id(req, body);
+        if (!cohort_id.empty()) {
+            data["cohort_id"] = cohort_id;
+        }
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -1421,16 +1458,21 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_RESP);
     };
 
-    const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl, &extract_cohort_id](const httplib::Request & req, httplib::Response & res) {
         std::vector<raw_buffer> files;
         log_prompt(ctx_server.params_base, json::parse(req.body));
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        auto body_raw = json::parse(req.body);
+        const std::string cohort_id = extract_cohort_id(req, body_raw);
+        json body = server_chat_convert_anthropic_to_oai(body_raw);
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             ctx_server.chat_params,
             files);
+        if (!cohort_id.empty()) {
+            body_parsed["cohort_id"] = cohort_id;
+        }
         return handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
@@ -1465,14 +1507,13 @@ int main(int argc, char ** argv) {
         res_ok(res, { { "prompt", std::move(data.at("prompt")) } });
     };
 
-    const auto handle_infill = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_infill = [&ctx_server, &handle_completions_impl, &extract_cohort_id](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         json data = json::parse(req.body);
-        //avoid double submits
-        //const int id_task = ctx_server.queue_tasks.get_new_id();
-        //server_tokens token; // dummy tokens
-        //ctx_server.queue_results.add_waiting_task_id(id_task);
-        //ctx_server.request_completion(id_task, -1, data, true, false, token);
+        const std::string cohort_id = extract_cohort_id(req, data);
+        if (!cohort_id.empty()) {
+            data["cohort_id"] = cohort_id;
+        }
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_INFILL,
@@ -1492,7 +1533,7 @@ int main(int argc, char ** argv) {
             tokens = ctx_server.tokenize(body.at("content"), add_special);
         }
         const json data = format_tokenizer_response(tokens);
-        return res.set_content(data.dump(), "application/json; charset=utf-8");
+        return res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
     const auto handle_detokenize = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
@@ -1505,7 +1546,7 @@ int main(int argc, char ** argv) {
         }
 
         const json data = format_detokenized_response(content);
-        return res.set_content(data.dump(), "application/json; charset=utf-8");
+        return res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
     const auto handle_embeddings_impl = [&ctx_server](const httplib::Request& req, httplib::Response& res, oaicompat_type oaicompat) {
@@ -1633,7 +1674,7 @@ int main(int argc, char ** argv) {
                 {"scale", la.scale},
             });
         }
-        res.set_content(result.dump(), "application/json");
+        res.set_content(safe_json_to_str(result), "application/json");
         res.status = 200; // HTTP OK
     };
 
@@ -1667,7 +1708,7 @@ int main(int argc, char ** argv) {
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
 
-        res.set_content(result.data.dump(), "application/json");
+        res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = 200; // HTTP OK
     };
 
@@ -1685,7 +1726,7 @@ int main(int argc, char ** argv) {
                 {"applied", cv.applied},
             });
         }
-        res.set_content(result.dump(), "application/json");
+        res.set_content(safe_json_to_str(result), "application/json");
         res.status = 200; // HTTP OK
     };
 
@@ -1702,7 +1743,7 @@ int main(int argc, char ** argv) {
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
 
-        res.set_content(result.data.dump(), "application/json");
+        res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = result.error ? 400 : 200;
     };
 
@@ -1719,7 +1760,7 @@ int main(int argc, char ** argv) {
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
 
-        res.set_content(result.data.dump(), "application/json");
+        res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = result.error ? 400 : 200;
     };
 
@@ -1762,7 +1803,7 @@ int main(int argc, char ** argv) {
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
 
-        res.set_content(result.data.dump(), "application/json");
+        res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = result.error ? 400 : 200;
     };
 
@@ -1822,7 +1863,7 @@ int main(int argc, char ** argv) {
             res.status = 500;
             response = {{"error", e.what()}};
         }
-        res.set_content(response.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
     };
 
     const auto list_slot_prompts = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res) {
@@ -1834,7 +1875,7 @@ int main(int argc, char ** argv) {
                 {"prompt", slot.cache_tokens.detokenize(ctx_server.ctx, true) }
             });
         }
-        res.set_content(response.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
     };
 
 
@@ -1850,7 +1891,7 @@ int main(int argc, char ** argv) {
             if (filename_str.find("..") != std::string::npos || filename_str.find('/') != std::string::npos || filename_str.find('\\') != std::string::npos) {
                 res.status = 400;
                 response = {{"error", "Invalid filename format."}};
-                res.set_content(response.dump(), "application/json; charset=utf-8");
+                res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
                 return;
             }
 
@@ -1859,7 +1900,7 @@ int main(int argc, char ** argv) {
             if (!fs::exists(file_to_delete) || !fs::is_regular_file(file_to_delete)) {
                 res.status = 404;
                 response = {{"error", "File not found."}};
-                res.set_content(response.dump(), "application/json; charset=utf-8");
+                res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
                 return;
             }
 
@@ -1882,7 +1923,7 @@ int main(int argc, char ** argv) {
             res.status = 500;
             response = {{"error", e.what()}};
         }
-        res.set_content(response.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
     };
 
     const auto rename_saved_prompt = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res)-> void {
@@ -1898,7 +1939,7 @@ int main(int argc, char ** argv) {
                 new_filename_str.find("..") != std::string::npos || new_filename_str.find_first_of("/\\") != std::string::npos) {
                 res.status = 400;
                 response = {{"error", "Invalid filename format."}};
-                res.set_content(response.dump(), "application/json; charset=utf-8");
+                res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
                 return;
             }
 
@@ -1908,14 +1949,14 @@ int main(int argc, char ** argv) {
             if (!fs::exists(old_path) || !fs::is_regular_file(old_path)) {
                 res.status = 404;
                 response = {{"error", "Source file not found."}};
-                res.set_content(response.dump(), "application/json; charset=utf-8");
+                res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
                 return;
             }
 
             if (fs::exists(new_path)) {
                 res.status = 409;
                 response = {{"error", "Destination filename already exists."}};
-                res.set_content(response.dump(), "application/json; charset=utf-8");
+                res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
                 return;
             }
 
@@ -1944,7 +1985,7 @@ int main(int argc, char ** argv) {
             response = {{"error", e.what()}};
         }
 
-        res.set_content(response.dump(), "application/json; charset=utf-8");
+        res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
     };
 
     auto handle_static_file = [](unsigned char * content, size_t len, const char * mime_type) {
@@ -2030,7 +2071,7 @@ int main(int argc, char ** argv) {
         } else {
             json response{{"ok", true}};
 	    response["result"] = (store == "names") ? json(data) : json::parse(data);
-            res.set_content(response.dump(), "application/json");
+            res.set_content(safe_json_to_str(response), "application/json");
         }
     });
 
@@ -2095,7 +2136,7 @@ int main(int argc, char ** argv) {
         }
         json response{{"ok", true}};
         response["result"] = json::parse(data);
-        res.set_content(response.dump(), "application/json");
+        res.set_content(safe_json_to_str(response), "application/json");
     });
 
     const auto handle_zstd_enable = db_handler([](auto& db, const json& body, auto&, auto& res) {

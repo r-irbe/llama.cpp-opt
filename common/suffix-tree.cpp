@@ -60,17 +60,14 @@ void common_suffix_tree::_insert_suffix(int start_pos) {
 
     for (int i = 0; i < len; ++i) {
         const llama_token tok = _tokens[start_pos + i];
-        auto it = node->children.find(tok);
-        if (it == node->children.end()) {
-            auto child = std::make_unique<common_suffix_node>();
-            auto * child_ptr = child.get();
-            child_ptr->count = 1;
-            node->children[tok] = std::move(child);
-            node = child_ptr;
+        auto * child = node->find_child(tok);
+        if (child == nullptr) {
+            child = node->create_child(tok);
+            child->count = 1;
         } else {
-            node = it->second.get();
-            node->count++;
+            child->count++;
         }
+        node = child;
     }
 }
 
@@ -79,26 +76,22 @@ void common_suffix_tree::_extend_suffix(int start_pos, int old_len, int new_len)
 
     for (int i = 0; i < old_len; ++i) {
         const llama_token tok = _tokens[start_pos + i];
-        auto it = node->children.find(tok);
-        if (it == node->children.end()) {
+        node = node->find_child(tok);
+        if (node == nullptr) {
             return;
         }
-        node = it->second.get();
     }
 
     for (int i = old_len; i < new_len; ++i) {
         const llama_token tok = _tokens[start_pos + i];
-        auto it = node->children.find(tok);
-        if (it == node->children.end()) {
-            auto child = std::make_unique<common_suffix_node>();
-            auto * child_ptr = child.get();
-            child_ptr->count = 1;
-            node->children[tok] = std::move(child);
-            node = child_ptr;
+        auto * child = node->find_child(tok);
+        if (child == nullptr) {
+            child = node->create_child(tok);
+            child->count = 1;
         } else {
-            node = it->second.get();
-            node->count++;
+            child->count++;
         }
+        node = child;
     }
 }
 
@@ -126,12 +119,11 @@ std::vector<llama_token> common_suffix_tree::speculate(
         const common_suffix_node * node = _root.get();
         bool matched = true;
         for (int i = 0; i < match_len; ++i) {
-            auto it = node->children.find(ctx[i]);
-            if (it == node->children.end()) {
+            node = node->find_child(ctx[i]);
+            if (node == nullptr) {
                 matched = false;
                 break;
             }
-            node = it->second.get();
         }
 
         if (!matched) break;
@@ -150,21 +142,23 @@ std::vector<llama_token> common_suffix_tree::speculate(
         for (int i = 0; i < draft_limit; ++i) {
             if (cur->children.empty()) break;
 
+            const common_suffix_node * best_child = nullptr;
             llama_token best_tok   = -1;
             int64_t     best_count = 0;
             for (const auto & [token, child] : cur->children) {
                 if (child->count > best_count) {
                     best_count = child->count;
                     best_tok   = token;
+                    best_child = child.get();
                 }
             }
 
             prob *= (float)best_count / (float)cur->count;
-            if (prob < min_token_prob) break;
+            if (prob < min_token_prob || !best_child) break;
 
             score += prob;
             draft.push_back(best_tok);
-            cur = cur->children.at(best_tok).get();
+            cur = best_child;
         }
 
         if (score > best_score && !draft.empty()) {

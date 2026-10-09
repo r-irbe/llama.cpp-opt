@@ -179,26 +179,77 @@ set (GGML_HEADERS_IQK iqk/iqk_config.h iqk/iqk_cpu_ops.h)
 if (GGML_IQK_MUL_MAT)
     message(STATUS "Using optimized iqk matrix multiplications")
     add_compile_definitions(GGML_USE_IQK_MULMAT)
-    set(GGML_SOURCES_IQK_MM iqk/iqk_mul_mat.cpp
-                            iqk/iqk_kda.cpp
-                            iqk/iqk_flash_attn.cpp
-                            iqk/fa/iqk_fa_576_512.cpp
-                            iqk/fa/iqk_fa_512_512.cpp
-                            iqk/fa/iqk_fa_320_256.cpp
-                            iqk/fa/iqk_fa_192_128.cpp
-                            iqk/fa/iqk_fa_192_192.cpp
-                            iqk/fa/iqk_fa_256_256.cpp
-                            iqk/fa/iqk_fa_128_128.cpp
-                            iqk/fa/iqk_fa_96_96.cpp
-                            iqk/fa/iqk_fa_64_64.cpp
-                            iqk/iqk_gemm_floats.cpp
-                            iqk/iqk_gemm_kquants.cpp
-                            iqk/iqk_gemm_ktquants.cpp
-                            iqk/iqk_gemm_iquants.cpp
-                            iqk/iqk_gemm_iqk_quants.cpp
-                            iqk/iqk_gemm_1bit.cpp
-                            iqk/iqk_gemm_legacy_quants.cpp)
+    if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "(x86_64|AMD64)" AND NOT GGML_AVX512 AND NOT MSVC)
+        option(GGML_AVX512_RUNTIME_DISPATCH "ggml: build dual AVX2 / AVX-512 kernels with runtime CPUID dispatch" ON)
+    else()
+        option(GGML_AVX512_RUNTIME_DISPATCH "ggml: build dual AVX2 / AVX-512 kernels with runtime CPUID dispatch" OFF)
+    endif()
+
+    if (GGML_AVX512_RUNTIME_DISPATCH)
+        message(STATUS "Enabling Dual AVX2 / AVX-512 runtime kernel dispatch")
+        add_compile_definitions(GGML_USE_IQK_AVX512)
+
+        set(GGML_SOURCES_IQK_GEMM
+            iqk/iqk_gemm_floats.cpp
+            iqk/iqk_gemm_kquants.cpp
+            iqk/iqk_gemm_ktquants.cpp
+            iqk/iqk_gemm_iquants.cpp
+            iqk/iqk_gemm_iqk_quants.cpp
+            iqk/iqk_gemm_1bit.cpp
+            iqk/iqk_gemm_legacy_quants.cpp)
+
+        add_library(ggml-iqk-avx2 OBJECT ${GGML_SOURCES_IQK_GEMM})
+        target_compile_definitions(ggml-iqk-avx2 PRIVATE IQK_AVX2_VARIANT GGML_USE_IQK_MULMAT GGML_USE_IQK_AVX512)
+        target_include_directories(ggml-iqk-avx2 PRIVATE . iqk ../include ${GGML_EXTRA_INCLUDES})
+        set_target_properties(ggml-iqk-avx2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+        add_library(ggml-iqk-avx512 OBJECT ${GGML_SOURCES_IQK_GEMM})
+        target_compile_definitions(ggml-iqk-avx512 PRIVATE IQK_AVX512_VARIANT GGML_USE_IQK_MULMAT GGML_USE_IQK_AVX512)
+        target_compile_options(ggml-iqk-avx512 PRIVATE
+            -mavx512f -mavx512vnni -mavx512vl -mavx512bw -mavx512dq
+        )
+        target_include_directories(ggml-iqk-avx512 PRIVATE . iqk ../include ${GGML_EXTRA_INCLUDES})
+        set_target_properties(ggml-iqk-avx512 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+        set(GGML_SOURCES_IQK_MM iqk/iqk_mul_mat.cpp
+                                iqk/iqk_gemm_dispatcher.cpp
+                                iqk/iqk_kda.cpp
+                                iqk/iqk_flash_attn.cpp
+                                iqk/fa/iqk_fa_576_512.cpp
+                                iqk/fa/iqk_fa_512_512.cpp
+                                iqk/fa/iqk_fa_320_256.cpp
+                                iqk/fa/iqk_fa_192_128.cpp
+                                iqk/fa/iqk_fa_192_192.cpp
+                                iqk/fa/iqk_fa_256_256.cpp
+                                iqk/fa/iqk_fa_128_128.cpp
+                                iqk/fa/iqk_fa_96_96.cpp
+                                iqk/fa/iqk_fa_64_64.cpp
+                                $<TARGET_OBJECTS:ggml-iqk-avx2>
+                                $<TARGET_OBJECTS:ggml-iqk-avx512>)
+    else()
+        set(GGML_SOURCES_IQK_MM iqk/iqk_mul_mat.cpp
+                                iqk/iqk_kda.cpp
+                                iqk/iqk_flash_attn.cpp
+                                iqk/fa/iqk_fa_576_512.cpp
+                                iqk/fa/iqk_fa_512_512.cpp
+                                iqk/fa/iqk_fa_320_256.cpp
+                                iqk/fa/iqk_fa_192_128.cpp
+                                iqk/fa/iqk_fa_192_192.cpp
+                                iqk/fa/iqk_fa_256_256.cpp
+                                iqk/fa/iqk_fa_128_128.cpp
+                                iqk/fa/iqk_fa_96_96.cpp
+                                iqk/fa/iqk_fa_64_64.cpp
+                                iqk/iqk_gemm_floats.cpp
+                                iqk/iqk_gemm_kquants.cpp
+                                iqk/iqk_gemm_ktquants.cpp
+                                iqk/iqk_gemm_iquants.cpp
+                                iqk/iqk_gemm_iqk_quants.cpp
+                                iqk/iqk_gemm_1bit.cpp
+                                iqk/iqk_gemm_legacy_quants.cpp)
+    endif()
+
     set(GGML_HEADERS_IQK_MM iqk/iqk_mul_mat.h
+                            iqk/iqk_gemm_symbols.h
                             iqk/iqk_flash_impl.h
                             iqk/fa/iqk_fa_templates.h
                             iqk/iqk_gemm_floats.h

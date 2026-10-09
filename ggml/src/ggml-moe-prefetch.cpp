@@ -109,10 +109,12 @@ struct prefetch_pool {
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([this, i] {
                 if (ggml::cpu::numa::is_numa_split()) {
-                    // Node 2 hosts the 4x Lexar NM790 NVMe RAID0 PCIe carrier card.
-                    // Binding prefetch threads to Node 2 ensures madvise(MADV_POPULATE_READ)
-                    // page faults allocate memory on local DDR4 channels, avoiding xGMI hops.
-                    ggml::cpu::numa::bind_current_thread_to_node(2, i);
+                    // Dynamically discover and bind prefetch threads to the NVMe storage NUMA node
+                    // (e.g. Node 2 on PCIe NVMe carrier, Node 0 on NPS1/UMA, or PCIe parent bus).
+                    int storage_node = ggml::cpu::numa::get_storage_numa_node();
+                    if (storage_node >= 0) {
+                        ggml::cpu::numa::bind_current_thread_to_node(storage_node, i);
+                    }
                 }
                 run();
             });

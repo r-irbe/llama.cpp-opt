@@ -227,6 +227,7 @@ struct common_sampler {
     // TODO: replace with ring-buffer
     std::vector<llama_token>      prev;
     std::vector<llama_token_data> cur;
+    std::vector<float>            original_logits; // Persistent zero-allocation scratch buffer for grammar/resampling
     llama_sampler_dry* smpl;
 
     llama_sampler_adaptive_p * adapt_p_ctx;    // adaptive p sampler
