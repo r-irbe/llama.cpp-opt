@@ -62,7 +62,63 @@ GGML_TYPE_NAMES = {
     30: ("BF16", 2.0),
     41: ("Q1_0", 0.1484375),
     66: ("Q1_0", 0.1484375),
+    133: ("Q6_0", 0.8125),
+    137: ("IQ2_K", 0.296875),
+    138: ("IQ3_K", 0.4296875),
+    139: ("IQ4_K", 0.5625),
+    144: ("IQ4_KS", 0.53125),
+    146: ("IQ4_KSS", 0.5),
 }
+
+# GGML Quantization Sizes: (block_size, type_size_bytes)
+GGML_QUANT_SIZES = {
+    0: (1, 4),        # F32
+    1: (1, 2),        # F16
+    2: (32, 18),      # Q4_0
+    3: (32, 20),      # Q4_1
+    6: (32, 22),      # Q5_0
+    7: (32, 24),      # Q5_1
+    8: (32, 34),      # Q8_0
+    9: (32, 36),      # Q8_1
+    10: (256, 84),    # Q2_K
+    11: (256, 110),   # Q3_K
+    12: (256, 144),   # Q4_K
+    13: (256, 176),   # Q5_K
+    14: (256, 210),   # Q6_K
+    15: (256, 292),   # Q8_K
+    16: (256, 66),    # IQ2_XXS
+    17: (256, 74),    # IQ2_XS
+    18: (256, 98),    # IQ3_XXS
+    19: (256, 50),    # IQ1_S
+    20: (32, 18),     # IQ4_NL
+    21: (256, 110),   # IQ3_S
+    22: (256, 82),    # IQ2_S
+    23: (256, 136),   # IQ4_XS
+    24: (1, 1),       # I8
+    25: (1, 2),       # I16
+    26: (1, 4),       # I32
+    27: (1, 8),       # I64
+    28: (1, 8),       # F64
+    29: (256, 56),    # IQ1_M
+    30: (1, 2),       # BF16
+    41: (128, 18),    # Q1_0_G128
+    66: (128, 18),    # Q1_0
+    133: (32, 26),    # Q6_0
+    137: (256, 76),   # IQ2_K
+    138: (256, 110),  # IQ3_K
+    139: (256, 144),  # IQ4_K
+    144: (256, 136),  # IQ4_KS
+    146: (256, 128),  # IQ4_KSS
+}
+
+def get_tensor_row_bytes(type_id: int, ne0: int, bpe: float = 2.0) -> int:
+    """Computes exact row byte size for a tensor type using integer block arithmetic."""
+    if type_id in GGML_QUANT_SIZES:
+        blk_size, type_size = GGML_QUANT_SIZES[type_id]
+        n_blocks = (ne0 + blk_size - 1) // blk_size
+        return n_blocks * type_size
+    return int(ne0 * bpe)
+
 
 def read_str(f):
     len_bytes = f.read(8)
@@ -150,7 +206,14 @@ def parse_gguf_metadata(filepath):
             num_elements = 1
             for d in dims:
                 num_elements *= d
-            approx_bytes = int(num_elements * bpe)
+            if len(dims) > 0 and ttype in GGML_QUANT_SIZES:
+                row_bytes = get_tensor_row_bytes(ttype, dims[0], bpe)
+                num_rows = 1
+                for d in dims[1:]:
+                    num_rows *= d
+                approx_bytes = row_bytes * num_rows
+            else:
+                approx_bytes = int(num_elements * bpe)
 
             tensors.append({
                 "name": name,
@@ -377,7 +440,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
     for t in tensors:
         name = t["name"]
         sz = t["approx_bytes"]
-        if re.search(r"\.ffn_.*_exps\.", name) or re.search(r"expert", name, re.IGNORECASE):
+        if re.search(r"\.ffn_.*_exps\.", name) or re.search(r"blk\.\d+\.ffn_(gate|up|down)\.\d+", name) or re.search(r"expert", name, re.IGNORECASE):
             moe_expert_tensors.append(t)
             moe_bytes += sz
         elif any(k in name for k in ["attn_", "attention", "router", "ffn_shared", "embed", "output"]):
@@ -501,7 +564,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
         dims = t["dims"]
         if len(dims) >= 2:
             bpe = GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1]
-            row_stride = int(dims[0] * bpe)
+            row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
             if row_stride % 128 != 0:
                 misaligned_128_strides += 1
 
@@ -558,7 +621,9 @@ def analyze_and_lint_gguf(gguf_info, hw):
         abs_off = data_start + t["offset"]
         dims = t["dims"]
         bpe = GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1]
-        row_stride = int(dims[0] * bpe) if len(dims) >= 2 else int(t["elements"] * bpe)
+        row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe) if len(dims) >= 2 else (
+            get_tensor_row_bytes(t["type_id"], t["elements"], bpe) if "elements" in t else int(dims[0] * bpe)
+        )
         if abs_off % 64 != 0 or row_stride % 64 != 0:
             simd_unaligned_crit += 1
 
@@ -590,7 +655,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
         dims = t["dims"]
         if len(dims) >= 2 and dims[1] >= 16:
             bpe = GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1]
-            row_stride = int(dims[0] * bpe)
+            row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
             # Power of two >= 65536 bytes (64 KB)
             if row_stride >= 65536 and (row_stride & (row_stride - 1)) == 0:
                 bank_aliasing_tensors.append((t["name"], row_stride))
