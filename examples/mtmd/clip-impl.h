@@ -169,6 +169,7 @@ enum projector_type {
     PROJECTOR_TYPE_GLM_EDGE,
     PROJECTOR_TYPE_QWEN2VL,
     PROJECTOR_TYPE_QWEN3VL,
+    PROJECTOR_TYPE_LING3VL,
     PROJECTOR_TYPE_GEMMA3,
     PROJECTOR_TYPE_GEMMA4V,
     PROJECTOR_TYPE_GEMMA4A,
@@ -189,6 +190,7 @@ enum projector_type {
     PROJECTOR_TYPE_JANUS_PRO,
     PROJECTOR_TYPE_MINIMAX_M3_VL,
     PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41,
     PROJECTOR_TYPE_UNKNOWN,
 
 };
@@ -202,6 +204,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_QWEN2VL,   "qwen2vl_merger"},
     { PROJECTOR_TYPE_QWEN25VL,  "qwen2.5vl_merger"},
     { PROJECTOR_TYPE_QWEN3VL,   "qwen3vl_merger"},
+    { PROJECTOR_TYPE_LING3VL,   "ling3vl"},
     { PROJECTOR_TYPE_GEMMA3,    "gemma3"},
     { PROJECTOR_TYPE_GEMMA4V,   "gemma4v"},
     { PROJECTOR_TYPE_GEMMA4A,   "gemma4a"},
@@ -221,6 +224,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_JANUS_PRO, "janus_pro"},
     { PROJECTOR_TYPE_MINIMAX_M3_VL, "minimax_m3_vl"},
     { PROJECTOR_TYPE_DEEPSEEK4V, "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41, "deepseek41"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

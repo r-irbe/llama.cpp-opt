@@ -440,8 +440,9 @@ extern "C" {
         GGML_TYPE_IQ4_K   = 139,
         GGML_TYPE_IQ5_K   = 140,
         GGML_TYPE_IQ6_K   = 141,
-        // depricated: GGML_TYPE_IQ2_TN  = 142,
-        // depricated: GGML_TYPE_IQ1_TN  = 143,
+        // Prism ternary (ids match PrismML-Eng/llama.cpp)
+        GGML_TYPE_PQ2_0   = 142,
+        GGML_TYPE_PTQ1_0  = 143,
         GGML_TYPE_IQ4_KS  = 144,
         GGML_TYPE_IQ2_KS  = 145,
         GGML_TYPE_IQ4_KSS = 146,
@@ -459,38 +460,41 @@ extern "C" {
         GGML_TYPE_IQ1_KT  = 158,
 
         GGML_TYPE_Q1_0_G128_R8 = 159, // 8-row repacked Q1_0_G128 (Bonsai), vec_dot_type = Q8_K128
+        GGML_TYPE_PQ2_0_R8   = 160, // 8-row repacked PQ2_0 (Prism ternary)
+        GGML_TYPE_PTQ1_0_R8  = 161, // 8-row repacked PTQ1_0 (Prism ternary, base-3)
 
-        GGML_TYPE_Q4_0_R8   = 202,
-        GGML_TYPE_Q5_0_R4   = 206,
-        GGML_TYPE_Q8_0_R8   = 208,
-        GGML_TYPE_Q2_K_R4   = 210,
-        GGML_TYPE_Q3_K_R4   = 211,
-        GGML_TYPE_Q4_K_R4   = 212,
-        GGML_TYPE_Q5_K_R4   = 213,
-        GGML_TYPE_Q6_K_R4   = 214,
-        GGML_TYPE_IQ2_XXS_R4= 216,
-        GGML_TYPE_IQ2_XS_R4 = 217,
-        GGML_TYPE_IQ3_XXS_R4= 218,
-        GGML_TYPE_IQ1_S_R4  = 219,
-        GGML_TYPE_IQ4_NL_R4 = 220,
-        GGML_TYPE_IQ3_S_R4  = 221,
-        GGML_TYPE_IQ2_S_R4  = 222,
-        GGML_TYPE_IQ4_XS_R8 = 223,
-        GGML_TYPE_IQ1_M_R4  = 229,
-        GGML_TYPE_BF16_R16  = 230,
-        GGML_TYPE_Q6_0_R4   = 233,
-        GGML_TYPE_IQ2_BN_R4 = 335,
-        GGML_TYPE_IQ2_K_R4  = 337,
-        GGML_TYPE_IQ3_K_R4  = 338,
-        GGML_TYPE_IQ4_K_R4  = 339,
-        GGML_TYPE_IQ5_K_R4  = 340,
-        GGML_TYPE_IQ4_KS_R4 = 344,
-        GGML_TYPE_IQ4_KS_R16= 345,
-        GGML_TYPE_IQ5_KS_R4 = 352,
-        GGML_TYPE_MXFP4_R8  = 353,
-        GGML_TYPE_Q8_K_R16  = 397,
-        GGML_TYPE_Q8_KV_R8  = 398,
-        GGML_TYPE_Q8_K_R8   = 399,
+        GGML_TYPE_Q4_0_R8    = 202,
+        GGML_TYPE_Q5_0_R4    = 206,
+        GGML_TYPE_Q8_0_R8    = 208,
+        GGML_TYPE_Q2_K_R4    = 210,
+        GGML_TYPE_Q3_K_R4    = 211,
+        GGML_TYPE_Q4_K_R4    = 212,
+        GGML_TYPE_Q5_K_R4    = 213,
+        GGML_TYPE_Q6_K_R4    = 214,
+        GGML_TYPE_IQ2_XXS_R4 = 216,
+        GGML_TYPE_IQ2_XS_R4  = 217,
+        GGML_TYPE_IQ3_XXS_R4 = 218,
+        GGML_TYPE_IQ1_S_R4   = 219,
+        GGML_TYPE_IQ4_NL_R4  = 220,
+        GGML_TYPE_IQ3_S_R4   = 221,
+        GGML_TYPE_IQ2_S_R4   = 222,
+        GGML_TYPE_IQ4_XS_R8  = 223,
+        GGML_TYPE_IQ1_M_R4   = 229,
+        GGML_TYPE_BF16_R16   = 230,
+        GGML_TYPE_Q6_0_R4    = 233,
+        GGML_TYPE_IQ2_BN_R4  = 335,
+        GGML_TYPE_IQ2_K_R4   = 337,
+        GGML_TYPE_IQ3_K_R4   = 338,
+        GGML_TYPE_IQ4_K_R4   = 339,
+        GGML_TYPE_IQ5_K_R4   = 340,
+        GGML_TYPE_IQ4_KS_R4  = 344,
+        GGML_TYPE_IQ4_KS_R16 = 345,
+        GGML_TYPE_IQ3_KS_R16 = 346,
+        GGML_TYPE_IQ5_KS_R4  = 352,
+        GGML_TYPE_MXFP4_R8   = 353,
+        GGML_TYPE_Q8_K_R16   = 397,
+        GGML_TYPE_Q8_KV_R8   = 398,
+        GGML_TYPE_Q8_K_R8    = 399,
         GGML_TYPE_COUNT,
     };
 
@@ -559,6 +563,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ3_KS  = 145, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ2_KL  = 146, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_KT  = 147, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0   = 148, // except 1d tensors (Prism ternary)
+        GGML_FTYPE_MOSTLY_PTQ1_0  = 149, // except 1d tensors (Prism ternary)
                                          //
         GGML_FTYPE_MOSTLY_Q4_0_R8   = 202, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_0_R8   = 207, // except 1d tensors
@@ -586,6 +592,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ5_K_R4  = 333, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ4_KS_R4 = 337, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ4_KS_R16= 338, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ3_KS_R16= 339, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ5_KS_R4 = 341, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4_R8  = 342, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_K_R16  = 397, // except 1d tensors
@@ -836,6 +843,9 @@ extern "C" {
 
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggerganov/ggml/issues/287
+    // maximum number of logical CPU ids that can be pinned via ggml_cplan.cpu_affinity
+    #define GGML_MAX_CPU_AFFINITY 1024
+
     struct ggml_cplan {
         size_t    work_size; // size of work buffer, calculated by `ggml_graph_plan()`
         uint8_t * work_data; // work buffer, to be allocated by caller before calling to `ggml_graph_compute()`
@@ -848,9 +858,12 @@ extern "C" {
 
         // read-ahead selected MoE expert weights in the CPU matmul-id kernels
         bool moe_expert_prefetch;
-
         // target NUMA node for thread affinity (-1 = unset / default)
         int numa_node;
+
+        // optional CPU affinity: pin worker ith to cpu_affinity[ith % n_cpu_affinity]
+        const int32_t * cpu_affinity;
+        int32_t         n_cpu_affinity;
     };
 
     enum ggml_cgraph_eval_order {

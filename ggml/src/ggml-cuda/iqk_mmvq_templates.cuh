@@ -12,12 +12,26 @@
 typedef void (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, float *);
 typedef void (*vec_dot_q_tail_cuda_t)(const void * __restrict__ vbq, const void * __restrict__ bq8_1, const int & kbx, const int & iqs, const int & nt, float *);
 
+// Whether a tail kernel was given, decided by specialization and not by comparing the pointer to nullptr:
+// nvcc with MSVC as host compiler rejects that comparison in a constant expression when it names a function.
+template <vec_dot_q_tail_cuda_t tail> struct iqk_mmvq_has_tail { static constexpr bool value = true; };
+template <> struct iqk_mmvq_has_tail<nullptr> { static constexpr bool value = false; };
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ1_M_R4> {
     static constexpr int qk = 32;
     static constexpr int qr = 2;
     static constexpr int qi = 4;
 };
+
+template <ggml_type type>
+constexpr int __device__ ggml_cuda_actual_row0(int row0) {
+    if constexpr (type == GGML_TYPE_IQ4_KS_R16 || type == GGML_TYPE_IQ3_KS_R16) {
+        return 16*(row0/16);
+    } else {
+        return row0;
+    }
+}
 
 template <ggml_type type, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_y, int n_interleaved = 1, vec_dot_q_tail_cuda_t vec_dot_tail = nullptr>
 static __device__ void iqk_mul_mat_vec_q_kernel(
@@ -38,6 +52,7 @@ static __device__ void iqk_mul_mat_vec_q_kernel(
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int actual_row0 = ggml_cuda_actual_row0<type>(row0);
     const     int blocks_per_row_x = ncols_x / qk;
     const     int blocks_per_col_y = nrows_y / QK8_1;
     constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
@@ -63,12 +78,12 @@ static __device__ void iqk_mul_mat_vec_q_kernel(
                             &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp[j][i]);
                 }
             } else {
-                vec_dot_q_cuda((const void *)((const char *)vx + row0*row_size),
+                vec_dot_q_cuda((const void *)((const char *)vx + actual_row0*row_size),
                     &y[j*blocks_per_col_y + kby], kbx, kqs, tmp[j]);
             }
         }
     }
-    if constexpr (vec_dot_tail != nullptr) {
+    if constexpr (iqk_mmvq_has_tail<vec_dot_tail>::value) {
         const int nt = (ncols_x % qk)/32;
         if (nt > 0 && kbx == blocks_per_row_x) {
             const int kby = kbx * (qk/QK8_1);
@@ -82,7 +97,7 @@ static __device__ void iqk_mul_mat_vec_q_kernel(
                                 &y[j*blocks_per_col_y + kby], kbx, kqs, nt, &tmp[j][i]);
                     }
                 } else {
-                    vec_dot_tail((const void *)((const char *)vx + row0*row_size),
+                    vec_dot_tail((const void *)((const char *)vx + actual_row0*row_size),
                         &y[j*blocks_per_col_y + kby], kbx, kqs, nt, tmp[j]);
                 }
             }
@@ -142,6 +157,7 @@ static __device__ void iqk_fused_mul_mat_vec_q_kernel(
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int actual_row0 = ggml_cuda_actual_row0<type>(row0);
     const     int blocks_per_row_x = ncols_x / qk;
     const     int blocks_per_col_y = nrows_y / QK8_1;
     constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
@@ -170,14 +186,14 @@ static __device__ void iqk_fused_mul_mat_vec_q_kernel(
                             &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp_g[j][i]);
                 }
             } else {
-                vec_dot_q_cuda((const void *)((const char *)vup + row0*row_size),
+                vec_dot_q_cuda((const void *)((const char *)vup + actual_row0*row_size),
                     &y[j*blocks_per_col_y + kby], kbx, kqs, tmp_u[j]);
-                vec_dot_q_cuda((const void *)((const char *)vgate + row0*row_size),
+                vec_dot_q_cuda((const void *)((const char *)vgate + actual_row0*row_size),
                     &y[j*blocks_per_col_y + kby], kbx, kqs, tmp_g[j]);
             }
         }
     }
-    if constexpr (vec_dot_tail != nullptr) {
+    if constexpr (iqk_mmvq_has_tail<vec_dot_tail>::value) {
         const int nt = (ncols_x % qk)/32;
         if (nt > 0 && kbx == blocks_per_row_x) {
             const int kby = kbx * (qk/QK8_1);
@@ -193,9 +209,9 @@ static __device__ void iqk_fused_mul_mat_vec_q_kernel(
                                 &y[j*blocks_per_col_y + kby], kbx, kqs, nt, &tmp_g[j][i]);
                     }
                 } else {
-                    vec_dot_tail((const void *)((const char *)vup + row0*row_size),
+                    vec_dot_tail((const void *)((const char *)vup + actual_row0*row_size),
                         &y[j*blocks_per_col_y + kby], kbx, kqs, nt, tmp_u[j]);
-                    vec_dot_tail((const void *)((const char *)vgate + row0*row_size),
+                    vec_dot_tail((const void *)((const char *)vgate + actual_row0*row_size),
                         &y[j*blocks_per_col_y + kby], kbx, kqs, nt, tmp_g[j]);
                 }
             }
@@ -322,7 +338,7 @@ static __global__ void iqk_fused_mul_mat_vec_q(
 template <ggml_type type, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, int n_interleaved = 1, vec_dot_q_tail_cuda_t vec_dot_tail = nullptr>
 static void iqk_mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
 
-    if constexpr (vec_dot_tail != nullptr) {
+    if constexpr (iqk_mmvq_has_tail<vec_dot_tail>::value) {
         GGML_ASSERT(args.ncols_x % 32 == 0);
     } else {
         GGML_ASSERT(args.ncols_x % ggml_blck_size(type) == 0);
@@ -611,3 +627,5 @@ extern void mul_mat_vec_iq5_ks_r4_q8_1_cuda(const mmvq_args & args, cudaStream_t
 extern void mul_mat_vec_iq1_bn_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq2_bn_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq4_kss_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_iq3ks_r16_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_iq4_ks_r16_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);

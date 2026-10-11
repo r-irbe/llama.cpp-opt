@@ -80,6 +80,21 @@ struct llama_control_vector_load_info;
 int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 
+// P-cores, one thread per physical core (no E-cores, no SMT siblings)
+std::vector<int32_t> cpu_get_math_cpus();
+
+// E-cores, one per physical core (Intel hybrid)
+std::vector<int32_t> cpu_get_efficiency_cpus();
+
+// explicit affinity, else auto-detected math CPUs
+std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect);
+
+// explicit affinity, else auto-detected E-cores
+std::vector<int32_t> cpu_affinity_resolve_draft(const std::vector<int32_t> & cpus, bool auto_detect);
+
+bool cpu_affinity_parse_mask (const std::string & value, std::vector<int32_t> & cpus);
+bool cpu_affinity_parse_range(const std::string & value, std::vector<int32_t> & cpus);
+
 enum llama_example {
     LLAMA_EXAMPLE_COMMON,
     LLAMA_EXAMPLE_SPECULATIVE,
@@ -253,6 +268,10 @@ struct common_params_speculative {
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
 
+    // draft affinity from --draft-params; empty = inherit the target
+    std::vector<int32_t> cpu_affinity;
+    bool cpu_affinity_configured = false; // a draft affinity was requested
+
     int32_t n_ctx = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
@@ -267,8 +286,8 @@ struct common_params_speculative {
     int32_t numa_node = -1; // NUMA node affinity for draft model (-1: auto/socket-asymmetric, >=0: explicit node)
 
     bool has_dft() const {
-        return !model.empty() || !params.empty();
-        //return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
+        // external draft model present only when -md is set
+        return !model.empty();
     }
 
     std::vector<common_speculative_stage_params> get_resolved_stages() const;
@@ -295,6 +314,9 @@ struct gpt_params {
 
     int32_t n_threads             = cpu_get_num_math();
     int32_t n_threads_batch       =      -1; // number of threads to use for batch processing (-1 = use n_threads)
+    std::vector<int32_t> cpu_affinity;       // logical CPU ids to pin worker threads to (empty = no explicit pinning)
+    bool    cpu_affinity_auto     = false;   // pin to hybrid P-cores when cpu_affinity is empty (--cpu-affinity)
+    bool    cpu_affinity_configured = false; // a CPU affinity option was given
     int32_t n_predict             =      -1; // new tokens to predict
     int32_t n_ctx                 =       0; // context size
     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
@@ -435,6 +457,7 @@ struct gpt_params {
     bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
     bool fused_idx_topk    = true;  // enable the fused indexer topk op (on by default; -no-fidx or --no-fused-indexer-topk turns it off)
     bool swa_compress      = false;
+    bool dsv4_legacy_state = false; // if true, write DeepSeek-V4 state in the legacy full-slice layout (no MAGIC), byte-identical to main
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
@@ -459,7 +482,7 @@ struct gpt_params {
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
-    bool defer_ple         = false; // if true, keep the per-layer token embedding on the file (Linux only)
+    bool defer_ple         = false; // if true, keep the per-layer token embedding on the file (Linux and Windows only)
     bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
     int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
@@ -701,6 +724,8 @@ std::string string_unescape(const std::string& str);
 std::vector<std::string> string_extract(const std::string& str, const char c, std::vector<size_t>& posi);
 
 bool string_is_found(const std::string& window, const std::string& str, size_t& pos);
+
+void string_assign_append(std::string& dst, const std::string_view& sv, const std::string& str, const int32_t pos);
 
 //
 // Filesystem utils

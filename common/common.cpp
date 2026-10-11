@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "json-schema-to-grammar.h"
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -315,7 +316,7 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
         }
 
         if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || common_speculative_type_is_dflash_family(stage.type)) && !params.has_dft()) {
-            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
+            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model (-md/--model-draft)");
         }
 
     }
@@ -391,19 +392,28 @@ get_env(std::string name, T & target) {
 // CPU utils
 //
 
+#ifdef __linux__
+static std::string cpu_physical_core_key(int cpu) {
+    std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
+        + std::to_string(cpu) + "/topology/thread_siblings_list");
+    std::string line;
+    if (!std::getline(thread_siblings, line)) {
+        return {};
+    }
+    return line;
+}
+#endif
+
 int32_t cpu_get_num_physical_cores() {
 #ifdef __linux__
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
-    for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
-            + std::to_string(cpu) + "/topology/thread_siblings");
-        if (!thread_siblings.is_open()) {
-            break; // no more cpus
-        }
-        std::string line;
-        if (std::getline(thread_siblings, line)) {
-            siblings.insert(line);
+    const long n_cpu_conf = sysconf(_SC_NPROCESSORS_CONF);
+    const int  n_cpu      = n_cpu_conf > 0 ? (int) std::min((long) CPU_SETSIZE, n_cpu_conf) : (int) CPU_SETSIZE;
+    for (int cpu = 0; cpu < n_cpu; ++cpu) {
+        const std::string key = cpu_physical_core_key(cpu);
+        if (!key.empty()) { // skip cpus with no topology (offline / holes)
+            siblings.insert(key);
         }
     }
     if (!siblings.empty()) {
@@ -460,21 +470,114 @@ static bool is_running_on_efficiency_core(void) {
     return core_type == intel_atom;
 }
 
-static int cpu_count_math_cpus(int n_cpu) {
-    int result = 0;
+struct cpu_affinity_restore {
+    cpu_set_t prev;
+    bool      active = false;
+
+    ~cpu_affinity_restore() {
+        if (active) {
+            pthread_setaffinity_np(pthread_self(), sizeof(prev), &prev);
+        }
+    }
+};
+
+// cores of one class (P/E): primaries, then SMT siblings
+static std::vector<int32_t> cpu_detect_cores(bool with_siblings, bool efficiency) {
+    std::vector<int32_t> primaries;
+    std::vector<int32_t> extra;
+
+    int n_cpu = sysconf(_SC_NPROCESSORS_CONF); // covers holes from offline cpus
+    if (n_cpu < 1 || !is_hybrid_cpu()) {
+        return primaries;
+    }
+    n_cpu = std::min(n_cpu, (int) CPU_SETSIZE);
+
+    cpu_affinity_restore restore;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(restore.prev), &restore.prev)) {
+        return primaries;
+    }
+    restore.active = true;
+
+    const cpu_set_t & affinity = restore.prev;
+
+    std::unordered_set<std::string> seen;
     for (int cpu = 0; cpu < n_cpu; ++cpu) {
+        if (!CPU_ISSET(cpu, &affinity)) { // stay within the affinity we were started with
+            continue;
+        }
         if (pin_cpu(cpu)) {
-            return -1;
+            primaries.clear();
+            extra.clear();
+            break;
         }
-        if (is_running_on_efficiency_core()) {
-            continue; // efficiency cores harm lockstep threading
+        if (is_running_on_efficiency_core() != efficiency) {
+            // E-cores harm lockstep threading
+            continue;
         }
-        ++cpu; // hyperthreading isn't useful for linear algebra
-        ++result;
+
+        const std::string key = cpu_physical_core_key(cpu);
+        if (key.empty()) {
+            continue; // cannot tell siblings apart, better skip than double count
+        }
+        if (seen.insert(key).second) {
+            primaries.push_back(cpu);
+        } else if (with_siblings) {
+            extra.push_back(cpu);
+        }
+    }
+
+    primaries.insert(primaries.end(), extra.begin(), extra.end());
+    return primaries;
+}
+
+std::vector<int32_t> cpu_get_math_cpus() {
+    static const std::vector<int32_t> cpus = cpu_detect_cores(false, false);
+    return cpus;
+}
+
+std::vector<int32_t> cpu_get_efficiency_cpus() {
+    static const std::vector<int32_t> cpus = cpu_detect_cores(false, true);
+    return cpus;
+}
+
+static std::vector<int32_t> cpu_affinity_auto_cpus() {
+    static const std::vector<int32_t> cpus = cpu_detect_cores(true, false);
+    return cpus;
+}
+
+static std::vector<int32_t> cpu_affinity_auto_cpus_draft() {
+    static const std::vector<int32_t> cpus = cpu_detect_cores(true, true);
+    return cpus;
+}
+
+// drop CPUs outside the process affinity (taskset/cgroup)
+static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpus) {
+    if (cpus.empty()) {
+        return cpus;
+    }
+
+    cpu_set_t affinity;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
+        return cpus;
+    }
+
+    std::vector<int32_t> result;
+    for (const int32_t cpu : cpus) {
+        if (cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &affinity)) {
+            result.push_back(cpu);
+        } else {
+            fprintf(stderr, "warning: CPU %d is outside the process affinity, ignored\n", cpu);
+        }
     }
     return result;
 }
 
+#else
+std::vector<int32_t> cpu_get_math_cpus()       { return {}; }
+std::vector<int32_t> cpu_get_efficiency_cpus() { return {}; }
+static std::vector<int32_t> cpu_affinity_auto_cpus()       { return {}; }
+static std::vector<int32_t> cpu_affinity_auto_cpus_draft() { return {}; }
+static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpus) { return cpus; }
 #endif // __x86_64__ && __linux__
 
 /**
@@ -482,22 +585,107 @@ static int cpu_count_math_cpus(int n_cpu) {
  */
 int32_t cpu_get_num_math() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
-    int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_cpu < 1) {
-        return cpu_get_num_physical_cores();
-    }
-    if (is_hybrid_cpu()) {
-        cpu_set_t affinity;
-        if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
-            int result = cpu_count_math_cpus(n_cpu);
-            pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
-            if (result > 0) {
-                return result;
-            }
-        }
+    const std::vector<int32_t> cpus = cpu_get_math_cpus();
+    if (!cpus.empty()) {
+        return (int32_t) cpus.size();
     }
 #endif
     return cpu_get_num_physical_cores();
+}
+
+static std::vector<int32_t> cpu_affinity_resolve_impl(
+        const std::vector<int32_t> & cpus, bool auto_detect, const std::vector<int32_t> & auto_cpus) {
+    const std::vector<int32_t> resolved = (!cpus.empty() || !auto_detect) ? cpus : auto_cpus;
+    return cpu_affinity_filter(resolved);
+}
+
+std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect) {
+    return cpu_affinity_resolve_impl(cpus, auto_detect, cpu_affinity_auto_cpus());
+}
+
+std::vector<int32_t> cpu_affinity_resolve_draft(const std::vector<int32_t> & cpus, bool auto_detect) {
+    return cpu_affinity_resolve_impl(cpus, auto_detect, cpu_affinity_auto_cpus_draft());
+}
+
+// Parse a CPU bitmask ("0x55", "85") into a list of logical CPU ids.
+bool cpu_affinity_parse_mask(const std::string & value, std::vector<int32_t> & cpus) {
+    if (value.find('-') != std::string::npos) {
+        return false; // strtoull would wrap a negative value to ULLONG_MAX
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long mask = strtoull(value.c_str(), &end, 0);
+    if (errno == ERANGE || end == value.c_str() || *end != '\0') {
+        return false; // malformed or does not fit 64 CPUs
+    }
+
+    cpus.clear();
+    for (int i = 0; i < 64; ++i) {
+        if (mask & (1ull << i)) {
+            cpus.push_back(i);
+        }
+    }
+    return !cpus.empty();
+}
+
+// parse a non-negative decimal CPU id, without throwing
+static bool cpu_affinity_parse_id(const std::string & str, int & cpu) {
+    if (str.empty()) {
+        return false;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const long value = strtol(str.c_str(), &end, 10);
+    if (errno != 0 || end == str.c_str() || *end != '\0' || value < 0 || value > INT_MAX) {
+        return false;
+    }
+
+    cpu = (int) value;
+    return true;
+}
+
+// Parse a CPU list ("0-3,8,10-11") into a list of logical CPU ids.
+bool cpu_affinity_parse_range(const std::string & value, std::vector<int32_t> & cpus) {
+    // bound to what the backend supports (also avoids absurd ranges)
+    const int max_cpu = GGML_MAX_CPU_AFFINITY;
+
+    std::vector<int32_t> result;
+    std::stringstream ss(value);
+    std::string item;
+
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) {
+            return false;
+        }
+
+        const size_t dash = item.find('-');
+        if (dash == std::string::npos) {
+            int cpu;
+            if (!cpu_affinity_parse_id(item, cpu) || cpu >= max_cpu) {
+                return false;
+            }
+            result.push_back(cpu);
+        } else {
+            int lo, hi;
+            if (!cpu_affinity_parse_id(item.substr(0, dash), lo) ||
+                !cpu_affinity_parse_id(item.substr(dash + 1), hi) ||
+                hi < lo || hi >= max_cpu) {
+                return false;
+            }
+            for (int cpu = lo; cpu <= hi; ++cpu) {
+                result.push_back(cpu);
+            }
+        }
+    }
+
+    if (result.empty()) {
+        return false;
+    }
+
+    cpus = std::move(result);
+    return true;
 }
 
 //
@@ -835,6 +1023,9 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
         params = params_org;
         return false;
     }
+
+    // resolve the CPU affinity once, so the list stays alive until the context is created
+    params.cpu_affinity = cpu_affinity_resolve(params.cpu_affinity, params.cpu_affinity_auto);
 
     return true;
 }
@@ -1243,6 +1434,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--top-k") {
         CHECK_ARG
         sparams.top_k = std::stoi(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_TOP_K;
         return true;
     }
     if (arg == "-c" || arg == "--ctx-size") {
@@ -1360,27 +1552,32 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         CHECK_ARG
         const auto sampler_names = string_split(argv[i], ";");
         sparams.samplers_sequence = llama_sampling_types_from_names(sampler_names, true);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS;
         return true;
     }
     if (arg == "--sampling-seq") {
         CHECK_ARG
         sparams.samplers_sequence = llama_sampling_types_from_chars(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS;
         return true;
     }
     if (arg == "--top-p") {
         CHECK_ARG
         sparams.top_p = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_TOP_P;
         return true;
     }
     if (arg == "--min-p") {
         CHECK_ARG
         sparams.min_p = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
         return true;
     }
     if (arg == "--temp") {
         CHECK_ARG
         sparams.temp = std::stof(argv[i]);
         sparams.temp = std::max(sparams.temp, 0.0f);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_TEMP;
         return true;
     }
     if (arg == "--tfs") {
@@ -1397,11 +1594,13 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         CHECK_ARG
         sparams.penalty_last_n = std::stoi(argv[i]);
         sparams.n_prev = std::max(sparams.n_prev, sparams.penalty_last_n);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N;
         return true;
     }
     if (arg == "--repeat-penalty") {
         CHECK_ARG
         sparams.penalty_repeat = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT;
         return true;
     }
     if (arg == "--frequency-penalty") {
@@ -1427,26 +1626,31 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--mirostat") {
         CHECK_ARG
         sparams.mirostat = std::stoi(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT;
         return true;
     }
     if (arg == "--mirostat-lr") {
         CHECK_ARG
         sparams.mirostat_eta = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA;
         return true;
     }
     if (arg == "--mirostat-ent") {
         CHECK_ARG
         sparams.mirostat_tau = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU;
         return true;
     }
     if (arg == "--xtc-probability") {
         CHECK_ARG
         sparams.xtc_probability = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY;
         return true;
     }
     if (arg == "--xtc-threshold") {
         CHECK_ARG
         sparams.xtc_threshold = std::stof(argv[i]);
+        sparams.user_sampling_config |= COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD;
         return true;
     }
     if (arg == "--top-n-sigma") {
@@ -1947,6 +2151,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.swa_compress = true;
         return true;
     }
+    if (arg == "-dsv4ls" || arg == "--dsv4-legacy-state") {
+        params.dsv4_legacy_state = true;
+        return true;
+    }
     if (arg == "-dsatk" || arg == "--dsa-top-k") {
         CHECK_ARG
         params.dsa_top_k = std::stoi(argv[i]);
@@ -2179,20 +2387,48 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.fit = true;
         return true;
     }
-    if (arg == "--defer-experts") {
+    if (arg == "-dexp" || arg == "--defer-experts") {
         params.defer_experts = true;
         params.warmup = false;
         return true;
     }
-    if (arg == "--defer-ple") {
+    if (arg == "-dple" || arg == "--defer-ple") {
         params.defer_ple = true;
         return true;
     }
-    if (arg == "--prefetch-experts") {
+    if (arg == "--cpu-mask" || arg == "-cm") {
+        CHECK_ARG;
+        if (!cpu_affinity_parse_mask(argv[i], params.cpu_affinity)) {
+            fprintf(stderr, "error: invalid CPU mask '%s' for %s\n", argv[i], arg.c_str());
+            invalid_param = true;
+            return true;
+        }
+        params.cpu_affinity_auto = false;
+        params.cpu_affinity_configured = true;
+        return true;
+    }
+    if (arg == "--cpu-range" || arg == "-cr") {
+        CHECK_ARG;
+        if (!cpu_affinity_parse_range(argv[i], params.cpu_affinity)) {
+            fprintf(stderr, "error: invalid CPU range '%s' for %s\n", argv[i], arg.c_str());
+            invalid_param = true;
+            return true;
+        }
+        params.cpu_affinity_auto = false;
+        params.cpu_affinity_configured = true;
+        return true;
+    }
+    if (arg == "--cpu-affinity") {
+        params.cpu_affinity.clear();
+        params.cpu_affinity_auto = true;
+        params.cpu_affinity_configured = true;
+        return true;
+    }
+    if (arg == "-prexp" || arg == "--prefetch-experts") {
         params.prefetch_experts = true;
         return true;
     }
-    if (arg == "--prefetch-experts-threads") {
+    if (arg == "-prexp-t" || arg == "--prefetch-experts-threads") {
         CHECK_ARG;
         params.prefetch_experts_threads = std::stoi(argv[i]);
         return true;
@@ -2213,7 +2449,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.worst_graph_tokens = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--no-mmap") {
+    if (arg == "-nmm" || arg == "--no-mmap") {
         params.use_mmap = false;
         return true;
     }
@@ -3129,6 +3365,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fidx, --no-fused-indexer-topk", "disable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-dsv4ls, --dsv4-legacy-state",   "write DeepSeek-V4 state in the legacy full-slice layout, byte-identical to main (default: %d)", params.dsv4_legacy_state });
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -3345,22 +3582,25 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "backend" });
     options.push_back({ "*",           "       --rpc SERVERS",          "comma separated list of RPC servers" });
     options.push_back({ "*",           "-cuda, --cuda-params",          "comma separate list of cuda parameters" });
-    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters" });
+    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters (--cpu-affinity pins the draft to E-cores on Intel hybrid CPUs, -cr LIST picks CPUs)" });
     if (llama_supports_mlock()) {
         options.push_back({ "*",           "       --mlock",                "force system to keep model in RAM rather than swapping or compressing" });
     }
     if (llama_supports_mmap()) {
-        options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
+        options.push_back({ "*",       "-nmm,   --no-mmap",               "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
     }
     options.push_back({ "*",           "-rtr,   --run-time-repack",      "repack tensors if interleaved variant is available"});
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
-    options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
-    options.push_back({ "*",           "       --defer-ple",            "keep the per-layer token embedding on the file instead of resident in memory (Linux)"});
-    options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
-    options.push_back({ "*",           "       --prefetch-experts-threads N",
+    options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
+    options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});
+    options.push_back({ "*",           "-prexp, --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
+    options.push_back({ "*",           "-prexp-t, --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
+    options.push_back({ "*",           "       --cpu-affinity",          "pin CPU workers to the physical P-cores (hybrid CPUs only)"});
+    options.push_back({ "*",           "-cm,   --cpu-mask MASK",         "pin CPU workers to the logical CPUs set in MASK (hex or decimal bitmask, e.g. 0x55; 64 CPUs max, use --cpu-range for more)"});
+    options.push_back({ "*",           "-cr,   --cpu-range LIST",        "pin CPU workers to the given logical CPUs (e.g. 0-3,8,10-11)"});
     options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
     options.push_back({ "*",           "-gfm,  --gpu-fit-margin N",     "per-layer GPU fit margin as layer_id,margin pairs, comma-separated" });
     options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
@@ -3881,6 +4121,15 @@ bool string_is_found(const std::string& window, const std::string& str, size_t& 
     return pos != std::string::npos;
 }
 
+void string_assign_append(std::string& dst, const std::string_view& sv, const std::string& str, const int32_t pos) {
+    const int32_t margin = SSIZE(sv) - pos;
+    if (margin > 0) {
+        dst.assign(sv, pos).append(str);
+    } else {
+        dst.assign(str, -margin);
+    }
+}
+
 //
 // Filesystem utils
 //
@@ -4098,6 +4347,62 @@ std::string fs_get_cache_file(const std::string & filename) {
 }
 
 
+// apply "general.sampling.*" GGUF metadata as defaults for sampling params the
+// user did not explicitly set on the command line (same behavior as mainline)
+static void llama_init_sampler_from_model(const llama_model * model, common_params_sampling & sparams) {
+    const uint64_t config = sparams.user_sampling_config;
+
+    auto get_int32 = [&](const char * key, int32_t & dst, uint64_t user_config) {
+        if (config & user_config) {
+            return;
+        }
+        char buf[64] = {0};
+        if (llama_model_meta_val_str(model, key, buf, sizeof(buf)) > 0) {
+            char * end = nullptr;
+            int32_t v = strtol(buf, &end, 10);
+            if (end && end != buf) {
+                dst = v;
+            }
+        }
+    };
+
+    auto get_float = [&](const char * key, float & dst, uint64_t user_config) {
+        if (config & user_config) {
+            return;
+        }
+        char buf[128] = {0};
+        if (llama_model_meta_val_str(model, key, buf, sizeof(buf)) > 0) {
+            char * end = nullptr;
+            float v = strtof(buf, &end);
+            if (end && end != buf) {
+                dst = v;
+            }
+        }
+    };
+
+    if (!(config & COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS)) {
+        char buf[512] = {0};
+        if (llama_model_meta_val_str(model, "general.sampling.sequence", buf, sizeof(buf)) > 0) {
+            const auto sampler_names = string_split(std::string(buf), ";");
+            if (!sampler_names.empty()) {
+                sparams.samplers_sequence = llama_sampling_types_from_names(sampler_names, true);
+            }
+        }
+    }
+
+    get_int32("general.sampling.top_k",            sparams.top_k,           COMMON_PARAMS_SAMPLING_CONFIG_TOP_K);
+    get_float("general.sampling.top_p",            sparams.top_p,           COMMON_PARAMS_SAMPLING_CONFIG_TOP_P);
+    get_float("general.sampling.min_p",            sparams.min_p,           COMMON_PARAMS_SAMPLING_CONFIG_MIN_P);
+    get_float("general.sampling.xtc_probability",  sparams.xtc_probability, COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY);
+    get_float("general.sampling.xtc_threshold",    sparams.xtc_threshold,   COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD);
+    get_float("general.sampling.temp",             sparams.temp,            COMMON_PARAMS_SAMPLING_CONFIG_TEMP);
+    get_int32("general.sampling.penalty_last_n",   sparams.penalty_last_n,  COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N);
+    get_float("general.sampling.penalty_repeat",   sparams.penalty_repeat,  COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT);
+    get_int32("general.sampling.mirostat",         sparams.mirostat,        COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
+    get_float("general.sampling.mirostat_tau",     sparams.mirostat_tau,    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
+    get_float("general.sampling.mirostat_eta",     sparams.mirostat_eta,    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 
@@ -4118,6 +4423,8 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         return iparams;
     }
 
+    llama_init_sampler_from_model(model, params.sparams);
+
     // a predictor-only MTP GGUF has no main blocks, so it cannot be the target model
     if (llama_model_mtp_package(model) == LLAMA_MTP_PACKAGE_COMPANION) {
         fprintf(stderr, "%s: error: '%s' is an MTP companion, pass it with -md instead\n",
@@ -4133,6 +4440,15 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, params.model.c_str());
         llama_free_model(model);
         return iparams;
+    }
+
+    // the affinity itself is applied at context creation
+    if (!params.cpu_affinity.empty()) {
+        std::string cpus;
+        for (size_t i = 0; i < params.cpu_affinity.size(); ++i) {
+            cpus += (i == 0 ? "" : ",") + std::to_string(params.cpu_affinity[i]);
+        }
+        LOG_INF("%s: pinning CPU worker threads to logical CPUs: %s\n", __func__, cpus.c_str());
     }
 
     for (auto [op, on_off] : params.offload_policy) {
@@ -4394,6 +4710,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;
     cparams.n_threads_batch   = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
+    cparams.cpu_affinity      = params.cpu_affinity.empty() ? nullptr : params.cpu_affinity.data();
+    cparams.n_cpu_affinity    = (int32_t) params.cpu_affinity.size();
     cparams.seed              = params.seed;
     cparams.logits_all        = params.logits_all;
     cparams.embeddings        = params.embedding;
@@ -4424,6 +4742,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.dsa               = params.dsa;
     cparams.fused_idx_topk    = params.fused_idx_topk;
     cparams.swa_compress      = params.swa_compress;
+    cparams.dsv4_legacy_state = params.dsv4_legacy_state;
     cparams.dsa_top_k         = params.dsa_top_k;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;
@@ -5596,7 +5915,7 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
             static const std::vector<std::string> names = { X_COMMON_PARAMS_SAMPLING };
 
             std::vector<float> addsubs(names.size(), 0.0f);
-            bool is_sb = false;
+            bool is_epb = false;
 
             // (... : SPARAM ...)
             const auto window = line.substr(last_qq_pos + 1);
@@ -5612,7 +5931,7 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
                     auto sub = string_strip(window.substr(pos, next_pos - pos));
                     if (sub[0] == '~') {
                         addsubs[j] += std::stof(sub.substr(1));
-                        is_sb = true;
+                        is_epb = true;
                         LLAMA_LOG_DEBUG("%s: line %zu: bias = %f\n", __func__, i, addsubs[j]);
                     }
                 }
@@ -5620,18 +5939,19 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
 
             auto& phrases = extracts;
             if (phrases.empty()) {
-                if (is_sb) {
+                if (is_epb) {
                     phrases.push_back("");
                 } else {
                     continue;   // next line
                 }
             }
 
+            int32_t max_keyword_len = 0;
             const auto n_phrase = phrases.size();
             std::vector<float> biases;
             bool is_range = false;
 
-            if (!is_sb) {
+            if (!is_epb) {
                 // (... : BIAS ...)
                 const auto cln_rpos = line.rfind(':');
                 auto sub = line.substr(cln_rpos + 1, n_char - cln_rpos - 2);
@@ -5655,20 +5975,19 @@ void argparse_expiring_logit_bias(const std::string& content, common_params_samp
                 if (biases.empty()) {
                     continue;   // next line
                 }
+            } else {
+                for (const auto& keyword: phrases) {
+                    LLAMA_LOG_DEBUG("%s: line %zu: keyword = \"%s\"\n", __func__, i, keyword.c_str());
+                    max_keyword_len = std::max(SSIZE(keyword), max_keyword_len);
+                }
+                LLAMA_LOG_DEBUG("%s: line %zu: max_keyword_len = %d\n", __func__, i, max_keyword_len);
             }
-
-            size_t max_phrase_len = 0;
-            for (const auto& phrase: phrases) {
-                LLAMA_LOG_DEBUG("%s: line %zu: phrase = \"%s\"\n", __func__, i, phrase.c_str());
-                max_phrase_len = std::max(phrase.length(), max_phrase_len);
-            }
-            LLAMA_LOG_DEBUG("%s: line %zu: max_phrase_len = %zu\n", __func__, i, max_phrase_len);
 
             common_params_sampling::elb_param::elb_entry entry = {
-                std::vector<size_t>(n_phrase, 0),
+                max_keyword_len,
+                std::vector<int32_t>(n_phrase, 0),
                 std::move(addsubs),
                 std::vector<bool>(n_phrase, false),
-                max_phrase_len,
                 std::move(phrases),
                 std::move(biases),
                 duration,

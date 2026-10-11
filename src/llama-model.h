@@ -491,17 +491,18 @@ struct llama_layer {
     struct ggml_tensor * mhc_mlp_beta     = nullptr;
     struct ggml_tensor * mhc_mlp_gamma    = nullptr;
 
-    std::unique_ptr<ggml_tensor> computed_wk_b;
-    std::unique_ptr<ggml_tensor> computed_wk_b_pp;
-    std::unique_ptr<ggml_tensor> computed_wv_b;
-    std::unique_ptr<ggml_tensor> computed_wkv_b;
-    std::unique_ptr<ggml_tensor> computed_param_sink_blk;
-    std::unique_ptr<ggml_tensor> computed_param_sink_lat_t;
+    // shared_ptr so a looped model can alias the layers.
+    std::shared_ptr<ggml_tensor> computed_wk_b;
+    std::shared_ptr<ggml_tensor> computed_wk_b_pp;
+    std::shared_ptr<ggml_tensor> computed_wv_b;
+    std::shared_ptr<ggml_tensor> computed_wkv_b;
+    std::shared_ptr<ggml_tensor> computed_param_sink_blk;
+    std::shared_ptr<ggml_tensor> computed_param_sink_lat_t;
 
     // Per-device replicas of computed wk_b/wv_b (-sm graph). Buffers owned via model.bufs.
-    std::vector<std::unique_ptr<ggml_tensor>> computed_wk_b_replicas;
-    std::vector<std::unique_ptr<ggml_tensor>> computed_wk_b_pp_replicas;
-    std::vector<std::unique_ptr<ggml_tensor>> computed_wv_b_replicas;
+    std::vector<std::shared_ptr<ggml_tensor>> computed_wk_b_replicas;
+    std::vector<std::shared_ptr<ggml_tensor>> computed_wk_b_pp_replicas;
+    std::vector<std::shared_ptr<ggml_tensor>> computed_wv_b_replicas;
 };
 
 struct llama_lora_adapter;
@@ -513,6 +514,15 @@ struct rpc_device {
 
 struct llama_cparams;
 
+// Prism ternary activation-side Hadamard transform
+struct llama_hadamard_transform {
+    struct ggml_tensor * signs = nullptr; // [ne0]
+    int64_t block_size = 0;               // Hadamard block size, applied with ggml_hadamard
+    int64_t perm_hd  = 1;                 // GDN v-grouped reshape (head dim)
+    int64_t perm_nk  = 1;                 // GDN v-grouped reshape (n groups)
+    int64_t perm_rep = 1;                 // GDN v-grouped reshape (repeat count)
+};
+
 struct llama_model {
     e_model     type  = MODEL_UNKNOWN;
     llm_arch    arch  = LLM_ARCH_UNKNOWN;
@@ -522,6 +532,10 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // Prism ternary Hadamard rotations, keyed by GGUF weight name (empty for other models)
+    std::unordered_map<std::string, llama_hadamard_transform> hadamard_map;
+    const llama_hadamard_transform * hadamard_rotation(const struct ggml_tensor * t) const;
 
     struct ggml_tensor * tok_embd;
     struct ggml_tensor * type_embd;
@@ -646,7 +660,7 @@ struct llama_model {
 
     bool tensor_overrides;
 
-    // Set by llm_apply_khad_pretransform once H is folded into wv_b/wk_b_pp.
+    // Set by llm_apply_khad_pretransform once H is folded into wv_b/kv_b_pp.
     bool khad_pretransformed = false;
 
     ~llama_model();
@@ -670,7 +684,7 @@ struct llama_model {
     }
 
     float swiglu_limit(uint32_t il, bool shared) const {
-        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && !llm_arch_is_dsv4(arch) && arch != LLM_ARCH_GLM5NEXT) {
+        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && !llm_arch_is_dsv4(arch) && arch != LLM_ARCH_GLM5NEXT && !hparams.dflash_dsv4) {
             return 0.0f;
         }
         return shared ? hparams.swiglu_limits_shared[il] : hparams.swiglu_limits[il];

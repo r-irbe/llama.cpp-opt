@@ -8,9 +8,14 @@
 
 #include "iqk/iqk_quantize.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <thread>
 #include <regex>
 #include <mutex>
+#include <numeric>
 #include <fstream>
 #include <filesystem>
 
@@ -112,9 +117,12 @@ std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
         { GGML_TYPE_IQ5_KS_R4,   { GGML_TYPE_IQ5_KS, 4} },
         { GGML_TYPE_IQ5_K_R4,    { GGML_TYPE_IQ5_K, 4} },
         { GGML_TYPE_MXFP4_R8,    { GGML_TYPE_MXFP4, 8} },
+        { GGML_TYPE_PQ2_0_R8,    { GGML_TYPE_PQ2_0, 8} },
+        { GGML_TYPE_PTQ1_0_R8,   { GGML_TYPE_PTQ1_0, 8} },
         { GGML_TYPE_Q8_KV_R8,    { GGML_TYPE_Q8_KV, 8} },
         { GGML_TYPE_Q8_K_R8,     { GGML_TYPE_Q8_0, 8} },
         { GGML_TYPE_BF16_R16,    { GGML_TYPE_BF16, 16} },
+        { GGML_TYPE_IQ3_KS_R16,   { GGML_TYPE_IQ3_KT, 16} },
     };
     if (auto it = k_map.find(type); it != k_map.end()) return it->second;
     return {type, 1};
@@ -237,7 +245,8 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
         new_type == GGML_TYPE_IQ2_S_R4|| new_type == GGML_TYPE_IQ3_S_R4|| new_type == GGML_TYPE_IQ3_KS ||
         new_type == GGML_TYPE_IQ2_KT  || new_type == GGML_TYPE_IQ3_KT  || new_type == GGML_TYPE_IQ4_KT ||
         new_type == GGML_TYPE_IQ5_KS || new_type == GGML_TYPE_IQ5_KS_R4|| new_type == GGML_TYPE_IQ2_KL ||
-        new_type == GGML_TYPE_IQ1_KT) {
+        new_type == GGML_TYPE_IQ1_KT  || new_type == GGML_TYPE_IQ4_KS_R16 || new_type == GGML_TYPE_IQ1_S_R4 ||
+        new_type == GGML_TYPE_IQ1_M_R4) {
         const int blck = ggml_row_blck_size(new_type);
         if (nx % blck != 0) {
             LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, blck, ggml_type_name(new_type));
@@ -246,6 +255,12 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
     }
     if (new_type == GGML_TYPE_IQ1_BN || new_type == GGML_TYPE_IQ2_BN || new_type == GGML_TYPE_IQ2_BN_R4) {
         if (nx % QK_IQ1BN != 0) {
+            convert_incompatible_tensor = true;
+        }
+    }
+    if (new_type == GGML_TYPE_IQ3_KS_R16) {
+        if (nx % 32 != 0 || ny % 16 != 0) {
+            LLAMA_LOG_WARN("\n\n%s : tensor %d x %d is not compatible with %s (needs cols %% 32 == 0 and rows %% 16 == 0)", __func__, nx, ny, ggml_type_name(new_type));
             convert_incompatible_tensor = true;
         }
     }
@@ -261,7 +276,9 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_XXS_R4:
             case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_S_R4:
             case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ1_M_R4:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q2_K_R4:
             case GGML_TYPE_IQ2_K:
@@ -275,16 +292,16 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_Q3_K_R4:
             case GGML_TYPE_IQ3_KS:
             case GGML_TYPE_IQ3_K:
+            case GGML_TYPE_IQ3_KS_R16:
             case GGML_TYPE_IQ3_K_R4: new_type = GGML_TYPE_IQ4_KT; break;
             case GGML_TYPE_IQ4_KSS:
             case GGML_TYPE_IQ4_KS:
             case GGML_TYPE_IQ4_KS_R4:
+            case GGML_TYPE_IQ4_KS_R16:
             case GGML_TYPE_IQ4_XS_R8:
             case GGML_TYPE_IQ3_KT:
             case GGML_TYPE_IQ4_KT:
-            // Disable GGML_TYPE_IQ4_KS_R16 until we have CUDA implementation for it
-            //case GGML_TYPE_IQ4_XS: new_type = ny % 16 == 0 ? GGML_TYPE_IQ4_KS_R16 : GGML_TYPE_IQ4_NL; break;
-            case GGML_TYPE_IQ4_XS: new_type = GGML_TYPE_IQ4_NL; break;
+            case GGML_TYPE_IQ4_XS: new_type = ny % 16 == 0 ? GGML_TYPE_IQ4_KS_R16 : GGML_TYPE_IQ4_NL; break;
             case GGML_TYPE_IQ4_K:
             case GGML_TYPE_IQ4_K_R4:
             case GGML_TYPE_Q4_K_R4:
@@ -307,6 +324,22 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
         LLAMA_LOG_WARN(" - using fallback quantization %s\n", ggml_type_name(new_type));
     }
     return new_type;
+}
+
+static bool is_repack_forbidden(const std::string& name) {
+    static const std::vector<std::string> k_exact_matches = { {"token_embd.weight"}, {"per_layer_token_embd.weight"} };
+    static const std::vector<std::string> k_patterns = { {"engram_k.weight"}, {"engram_q.weight"}, {"engram_embd.weight"} };
+    for (auto & match : k_exact_matches) {
+        if (name == match) return true;
+    }
+    for (auto & match : k_patterns) {
+        if (auto pos = name.find(match); pos != std::string::npos) return true;
+    }
+    return false;
+}
+static bool is_repack_forbidden(const char * tensor_name) {
+    std::string name{tensor_name};
+    return is_repack_forbidden(name);
 }
 
 static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
@@ -847,28 +880,25 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         LLAMA_LOG_INFO("Using custom type %s for tensor %s\n", ggml_type_name(new_type), name.c_str());
     }
 
+    auto tentative_new_type = new_type;
+
     auto working_type = change_type_if_necessary(new_type, tensor->ne[0], tensor->ne[1]);
     if (working_type != new_type) {
-        ++qs.n_fallback;
         new_type = working_type;
     }
 
-    if (name == "token_embd.weight") {
+    if (is_repack_forbidden(name)) {
         auto working_type = interleaved_properties(new_type).first;
         if (working_type != new_type) {
-            printf("\n============ Token embeddings cannot be quantized with row-interleaved quants\n");
-            printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(working_type));
-            new_type = working_type;
+            auto next_new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+            printf("\n============ %s tensors cannot be quantized with row-interleaved quants\n", name.c_str());
+            printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(next_new_type));
+            new_type = next_new_type;
         }
     }
 
-    if (name == "per_layer_token_embd.weight") {
-        auto working_type = interleaved_properties(new_type).first;
-        if (working_type != new_type) {
-            printf("\n============ Per-layer Token embeddings cannot be quantized with row-interleaved quants\n");
-            printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(working_type));
-            new_type = working_type;
-        }
+    if (new_type != tentative_new_type) {
+        ++qs.n_fallback;
     }
 
     return new_type;
@@ -970,6 +1000,17 @@ static llama_ftype repacked_ftype(llama_ftype ftype) {
 static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_type, const float * f32_data, char * new_data,
         const float * imatrix, std::vector<std::thread> & workers, size_t & new_size, int chunk_size_multiplier,
         const llama_model_quantize_params * params) {
+#ifdef GGML_USE_CUDA
+    if (params->cuda_quantize) {
+        new_size = ggml_cuda_quantize(0, new_type, f32_data, new_data, tensor->ne[1], tensor->ne[0], tensor->ne[2], imatrix);
+        if (new_size > 0) {
+            if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+                throw std::runtime_error("quantized data validation failed");
+            }
+            return;
+        }
+    }
+#endif
     if (nthread > 1 && (tensor->ne[2] % nthread == 0 || tensor->ne[2] >= 2*nthread)) {
         std::mutex mutex;
         int counter = 0;
@@ -1033,6 +1074,58 @@ static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_t
     }
 }
 
+static void do_quantize_slabbed(int nthread, const ggml_tensor * tensor, ggml_type new_type,
+        std::vector<no_init<float>> & f32_buf, std::vector<no_init<uint8_t>> & work, std::ostream & fout,
+        const float * imatrix, std::vector<std::thread> & workers, size_t & new_size, int chunk_size_multiplier,
+        const llama_model_quantize_params * params) {
+    const int64_t n_per_row = tensor->ne[0];
+    const int64_t max_slab_elements = params->slab_size / sizeof(float);
+    const int64_t nslices = tensor->ne[2]*tensor->ne[3];
+    ggml_tensor slab = *tensor;
+    new_size = 0;
+    auto quantize_slab = [&](int64_t nelements, const float * slab_imatrix) {
+        const float * f32_data = (const float *)slab.data;
+        if (tensor->type != GGML_TYPE_F32) {
+            llama_tensor_dequantize_internal(&slab, f32_buf, workers, nelements, nthread);
+            f32_data = (const float *)f32_buf.data();
+        }
+        size_t slab_size = 0;
+        do_quantize(nthread, &slab, new_type, f32_data, (char *)work.data(),
+                slab_imatrix, workers, slab_size, chunk_size_multiplier, params);
+        fout.write((const char *)work.data(), slab_size);
+        new_size += slab_size;
+    };
+    if (nslices > 1) {
+        // whole slices: do_quantize indexes the imatrix per slice
+        const int64_t slice_elements  = n_per_row*tensor->ne[1];
+        const size_t  slice_out_bytes = ggml_row_size(new_type, n_per_row)*tensor->ne[1];
+        const int64_t slices_per_slab = std::max<int64_t>(1, max_slab_elements/slice_elements);
+        if (work.size() < slices_per_slab*slice_out_bytes) work.resize(slices_per_slab*slice_out_bytes);
+        for (int64_t first = 0; first < nslices; first += slices_per_slab) {
+            const int64_t n = std::min(slices_per_slab, nslices - first);
+            slab.ne[2] = n;
+            slab.ne[3] = 1;
+            slab.data  = (char *)tensor->data + first*tensor->nb[2];
+            quantize_slab(n*slice_elements, imatrix ? imatrix + first*n_per_row : nullptr);
+        }
+    } else {
+        const int64_t nrows         = ggml_nrows(tensor);
+        const size_t  row_out_bytes = ggml_row_size(new_type, n_per_row);
+        const int64_t group = std::lcm<int64_t>(interleaved_properties(tensor->type).second, chunk_size_multiplier);
+        int64_t rows_per_slab = std::max<int64_t>(group, max_slab_elements/n_per_row);
+        rows_per_slab -= rows_per_slab % group;
+        if (work.size() < rows_per_slab*row_out_bytes) work.resize(rows_per_slab*row_out_bytes);
+        for (int64_t first = 0; first < nrows; first += rows_per_slab) {
+            const int64_t n = std::min(rows_per_slab, nrows - first);
+            slab.ne[1] = n;
+            slab.ne[2] = 1;
+            slab.ne[3] = 1;
+            slab.data  = (char *)tensor->data + first*tensor->nb[1];
+            quantize_slab(n*n_per_row, imatrix);
+        }
+    }
+}
+
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
@@ -1075,6 +1168,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ2_XS_R4:default_type = GGML_TYPE_IQ2_XS_R4;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_KS:  default_type = GGML_TYPE_IQ2_KS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ1_KT:  default_type = GGML_TYPE_IQ1_KT;  break;
+        case LLAMA_FTYPE_MOSTLY_PQ2_0:   default_type = GGML_TYPE_PQ2_0;   break;
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0:  default_type = GGML_TYPE_PTQ1_0;  break;
+        case LLAMA_FTYPE_MOSTLY_PQ2_0_R8: default_type = GGML_TYPE_PQ2_0_R8;   break;
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0_R8:default_type = GGML_TYPE_PTQ1_0_R8;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_KT:  default_type = GGML_TYPE_IQ2_KT;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   default_type = GGML_TYPE_IQ2_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_M:   default_type = GGML_TYPE_IQ2_S;   break;
@@ -1105,6 +1202,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ4_KS:  default_type = GGML_TYPE_IQ4_KS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ4_KS_R4:default_type = GGML_TYPE_IQ4_KS_R4;break;
         case LLAMA_FTYPE_MOSTLY_IQ5_KS_R4:default_type = GGML_TYPE_IQ5_KS_R4;break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_KS_R16:default_type = GGML_TYPE_IQ3_KS_R16; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_KS_R16:default_type = GGML_TYPE_IQ4_KS_R16;break;
         case LLAMA_FTYPE_MOSTLY_IQ4_KSS: default_type = GGML_TYPE_IQ4_KSS; break;
         case LLAMA_FTYPE_MOSTLY_IQ5_KS:  default_type = GGML_TYPE_IQ5_KS;  break;
@@ -1134,6 +1232,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         LLAMA_LOG_WARN("%s: ignoring --custom-q rules because default type %s is not quantized\n",
                 __func__, ggml_type_name(default_type));
     }
+
+#ifndef GGML_USE_CUDA
+    if (params->cuda_quantize) {
+        LLAMA_LOG_WARN("%s: ignoring --cuda-quantize because this build has no CUDA backend\n", __func__);
+    }
+#endif
 
     int nthread = params->nthread;
 
@@ -1470,6 +1574,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         bool quantize = tensor->type != GGML_TYPE_I32 &&
                         tensor->type != GGML_TYPE_I64 &&
                         tensor->type != GGML_TYPE_I16 &&
+                        tensor->type != GGML_TYPE_BF16_R16 &&
                         tensor->type != GGML_TYPE_I8; // i.e., do not quantize tensors holding int values
 
         // This used to be a regex, but <regex> has an extreme cost to compile times.
@@ -1513,6 +1618,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         enum ggml_type new_type;
         void * new_data = nullptr;
         size_t new_size = 0;
+        bool written = false;
 
         if (params->only_repack) {
             ggml_type repacked_type = (ggml_type)iqk_repacked_type(tensor);
@@ -1614,13 +1720,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 new_type = params->ffn_up_type;
             }
 
-            if (strcmp(tensor->name, "token_embd.weight") == 0) {
-                // token embeddings cannot be quantized with row-interleaved quants
+            if (is_repack_forbidden(tensor->name)) {
+                // token embeddings and engram tensors cannot be quantized with row-interleaved quants
                 auto working_type = interleaved_properties(new_type).first;
                 if (working_type != new_type) {
-                    printf("\n============ Token embeddings cannot be quantized with row-interleaved quants\n");
-                    printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(working_type));
-                    new_type = working_type;
+                    printf("\n============ %s tensors cannot be quantized with row-interleaved quants\n", tensor->name);
+                    auto next_new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+                    printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(next_new_type));
+                    if (next_new_type != working_type) ++qs.n_fallback;
+                    new_type = next_new_type;
                 }
             }
 
@@ -1722,7 +1830,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             int chunk_size_multiplier = 1;
             auto [working_type, num_rows] = interleaved_properties(new_type);
             if (tensor->ne[1] % num_rows != 0) {
-                new_type = working_type;
+                new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+                if (new_type != working_type) ++qs.n_fallback;
             } else {
                 chunk_size_multiplier = num_rows;
             }
@@ -1733,26 +1842,35 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             if (params->dry_run) {
                 new_size = tensor->ne[2] * tensor->ne[1] * ggml_row_size(new_type, tensor->ne[0]);
             } else {
-                float * f32_data;
+                float * f32_data = nullptr;
+
+                const bool is_extra_output = params->extra_output_type != GGML_TYPE_COUNT && tensor == output_tensor;
+                const bool use_slabs = params->slab_size > 0 && !is_extra_output && tensor->type != GGML_TYPE_I2_S &&
+                    new_type != GGML_TYPE_Q8_K_R16 && (size_t)nelements*sizeof(float) > params->slab_size;
 
                 if (tensor->type == GGML_TYPE_F32) {
                     f32_data = (float *) tensor->data;
                 } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
-                } else {
+                } else if (!use_slabs) {
                     llama_tensor_dequantize_internal(tensor, f32_conv_buf, workers, nelements, nthread);
                     f32_data = (float *) f32_conv_buf.data();
                 }
 
                 auto expected_size = ggml_row_size(new_type, tensor->ne[0])*tensor->ne[1]*tensor->ne[2]*tensor->ne[3];
 
-                if (work.size() < expected_size) { //(size_t)nelements * 4) {
+                if (!use_slabs && work.size() < expected_size) { //(size_t)nelements * 4) {
                     //work.resize(nelements * 4); // upper bound on size
                     work.resize(expected_size); // upper bound on size
                 }
                 new_data = work.data();
 
-                if (params->extra_output_type != GGML_TYPE_COUNT && tensor == output_tensor) {
+                if (use_slabs) {
+                    do_quantize_slabbed(nthread, tensor, new_type, f32_conv_buf, work, fout, imatrix, workers,
+                            new_size, chunk_size_multiplier, params);
+                    new_data = work.data();
+                    written = true;
+                } else if (is_extra_output) {
                     auto cur_size = ggml_nbytes(tensor);
                     if (new_type != tensor->type) {
                         do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
@@ -1812,8 +1930,11 @@ QuantizationDone:;
             gguf_set_tensor_data(ctx_outs[cur_split], name.c_str(), new_data, new_size);
 
             // write tensor data + padding
-            fout.write((const char *) new_data, new_size);
+            if (!written) fout.write((const char *) new_data, new_size);
             zeros(fout, GGML_PAD(new_size, align) - new_size);
+            if (ml.use_mmap) {
+                ml.mappings.at(weight->idx)->unmap_fragment(weight->offs, weight->offs + ggml_nbytes(tensor));
+            }
         }
     }
     close_ofstream();

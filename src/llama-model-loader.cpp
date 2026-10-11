@@ -4,7 +4,8 @@
 #include "llama-model.h"
 #include "ggml.h"
 #include <memory>
-//#include "ggml-backend.h"
+#include "ggml-backend.h"
+#include "iqk/iqk_quantize.h"
 
 #ifdef GGML_USE_CUDA
 #  include "ggml-cuda.h"
@@ -522,6 +523,10 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
             case GGML_TYPE_IQ3_XXS_R4: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS_R4; break;
             case GGML_TYPE_IQ1_KT:  ftype = LLAMA_FTYPE_MOSTLY_IQ1_KT;  break;
+            case GGML_TYPE_PQ2_0:
+            case GGML_TYPE_PQ2_0_R8: ftype = LLAMA_FTYPE_MOSTLY_PQ2_0; break;
+            case GGML_TYPE_PTQ1_0:
+            case GGML_TYPE_PTQ1_0_R8:ftype = LLAMA_FTYPE_MOSTLY_PTQ1_0;break;
             case GGML_TYPE_IQ2_KT:  ftype = LLAMA_FTYPE_MOSTLY_IQ2_KT;  break;
             case GGML_TYPE_IQ3_KT:  ftype = LLAMA_FTYPE_MOSTLY_IQ3_KT;  break;
             case GGML_TYPE_IQ4_KT:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_KT;  break;
@@ -544,6 +549,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             case GGML_TYPE_IQ4_KS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_KS;  break;
             case GGML_TYPE_IQ4_KS_R4:ftype = LLAMA_FTYPE_MOSTLY_IQ4_KS_R4;  break;
             case GGML_TYPE_IQ5_KS_R4:ftype = LLAMA_FTYPE_MOSTLY_IQ5_KS_R4;  break;
+            case GGML_TYPE_IQ3_KS_R16:ftype = LLAMA_FTYPE_MOSTLY_IQ3_KS_R16;break;
             case GGML_TYPE_IQ4_KS_R16:ftype = LLAMA_FTYPE_MOSTLY_IQ4_KS_R16;break;
             case GGML_TYPE_IQ4_KSS: ftype = LLAMA_FTYPE_MOSTLY_IQ4_KSS; break;
             case GGML_TYPE_IQ5_KS:  ftype = LLAMA_FTYPE_MOSTLY_IQ5_KS;  break;
@@ -576,7 +582,10 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         {
             const int kid = gguf_find_key(meta, "general.file_type"); // TODO: use LLM_KV
             if (kid >= 0) {
-                ftype = (llama_ftype) gguf_get_val_u32(meta, kid);
+                const auto ftype_val = (llama_ftype) gguf_get_val_u32(meta, kid);
+                if (llama_model_ftype_name(ftype_val) != "unknown, may not work") {
+                    ftype = ftype_val;
+                }
             }
         }
 
@@ -716,17 +725,34 @@ void llama_model_loader::drop_mmap_expert_pages() const {
 
 void llama_model_loader::build_ple_tensor_index() {
     ple_tensor_index = {};
+    ple_tensor_index.file_ranges.resize(files.size());
+    auto index_range = [&](uint16_t idx, size_t offs, size_t nbytes) {
+        ple_tensor_index.file_ranges.at(idx).push_back({ offs, offs + nbytes });
+        ple_tensor_index.deferred_bytes += nbytes;
+    };
 
     const auto * weight = get_weight(LLM_TN(get_arch())(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").c_str());
-    if (weight == nullptr) {
-        return;
+    if (weight != nullptr) {
+        index_range(weight->idx, weight->offs, ggml_nbytes(weight->tensor));
     }
 
-    const size_t tensor_bytes = ggml_nbytes(weight->tensor);
-
-    ple_tensor_index.file_ranges.resize(files.size());
-    ple_tensor_index.file_ranges.at(weight->idx).push_back({ weight->offs, weight->offs + tensor_bytes });
-    ple_tensor_index.deferred_bytes = tensor_bytes;
+    // Engram tables are hash-indexed sparse lookups like PLE; the dense k/q/wkv stay prefetched.
+    int n_engram = 0;
+    for (int i = 0; i < n_tensors; ++i) {
+        const std::string name = get_tensor_name(i);
+        if (name.find("engram_embd.weight") == std::string::npos) {
+            continue;
+        }
+        const auto * ew = get_weight(name.c_str());
+        if (ew == nullptr) {
+            continue;
+        }
+        index_range(ew->idx, ew->offs, ggml_nbytes(ew->tensor));
+        ++n_engram;
+    }
+    if (n_engram > 0) {
+        LLAMA_LOG_INFO("%s: indexed %d engram tables for deferred loading\n", __func__, n_engram);
+    }
 }
 
 bool llama_model_loader::should_defer_ple_mmaps() const {
@@ -741,6 +767,37 @@ void llama_model_loader::apply_ple_mmap_policy() const {
             mappings[idx]->dontneed_fragment(range.first, range.last);
         }
     }
+}
+
+bool llama_model_loader::file_has_deferred_ple(int idx) const {
+    if (idx < 0 || (size_t) idx >= ple_tensor_index.file_ranges.size()) {
+        return false;
+    }
+    for (const auto & range : ple_tensor_index.file_ranges[(size_t) idx]) {
+        if (!range.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_model_loader::ple_range_overlaps(int idx, size_t first, size_t last) const {
+    return ple_deferred_bytes_in(idx, first, last) > 0;
+}
+
+size_t llama_model_loader::ple_deferred_bytes_in(int idx, size_t first, size_t last) const {
+    if (idx < 0 || (size_t) idx >= ple_tensor_index.file_ranges.size() || first >= last) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const auto & range : ple_tensor_index.file_ranges[(size_t) idx]) {
+        const size_t lo = std::max(first, range.first);
+        const size_t hi = std::min(last, range.last);
+        if (hi > lo) {
+            bytes += hi - lo;
+        }
+    }
+    return bytes;
 }
 
 template<typename T>
@@ -1100,8 +1157,16 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
-            std::unique_ptr<llama_mmap> mapping(new llama_mmap(file.get(), prefetch ? -1 : 0, ggml_is_numa(), use_thp));
+        size_t n_deferred = 0;
+        for (size_t fi = 0; fi < files.size(); ++fi) {
+            const auto & file = files[fi];
+            // Deferred sparse tables (PLE, engram) stay cold; faulting GBs upfront wastes IO.
+            const bool deferred_file = file_has_deferred_ple((int) fi);
+            if (deferred_file) {
+                ++n_deferred;
+            }
+            const size_t file_prefetch = (prefetch && !deferred_file) ? (size_t) -1 : 0;
+            std::unique_ptr<llama_mmap> mapping(new llama_mmap(file.get(), file_prefetch, ggml_is_numa(), use_thp));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1109,6 +1174,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+        }
+        if (n_deferred > 0) {
+            LLAMA_LOG_INFO("%s: %zu of %zu files hold deferred tables and skip bulk prefetch\n",
+                    __func__, n_deferred, files.size());
         }
     }
 
@@ -1247,6 +1316,50 @@ bool llama_model_loader::load_all_data(
         // mmap. Serialized.
         if (use_mmap) {
             std::lock_guard<std::mutex> lock(load_mutex);
+            // Owned buffers streamed from the file: repackables under -rtr, everything
+            // not deferred under explicit --no-mmap; deferred tables stay aliased.
+            if (defer_ple && !ple_tensor_index.empty() && lmlocks == nullptr &&
+                    cur->buffer == nullptr && cur->view_src == nullptr && n_size > 0 &&
+                    !ple_range_overlaps(weight->idx, weight->offs, weight->offs + n_size) &&
+                    (defer_copy_dense || (repack_tensors && (ggml_type) iqk_repacked_type(cur) != cur->type))) {
+                bool has_views = false;
+                for (auto * v = ggml_get_first_tensor(ctx); v != NULL; v = ggml_get_next_tensor(ctx, v)) {
+                    if (v->view_src == cur) {
+                        has_views = true;
+                        break;
+                    }
+                }
+                if (!has_views) {
+                    ggml_backend_buffer_t owned = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), n_size);
+                    if (owned == nullptr) {
+                        throw std::runtime_error(format("unable to allocate repack buffer for tensor '%s'", ggml_get_name(cur)));
+                    }
+                    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(owned);
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(base, n_size);
+                    if (check_tensors && !ggml_validate_row_data(cur->type, base, n_size)) {
+                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    }
+                    ggml_backend_tensor_alloc(owned, cur, base);
+                    ggml_backend_buffer_set_usage(owned, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    model->bufs.push_back(owned);
+                    return n_size;
+                }
+            }
+#if defined(_WIN32)
+            // No per-range discard for READONLY views: stream device tensors from disk.
+            if (cur->buffer != nullptr && !ggml_backend_buffer_is_host(cur->buffer)) {
+                auto & read_buf = read_bufs[thread_idx];
+                read_buf.resize(n_size);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(read_buf.data(), n_size);
+                ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+                return n_size;
+            }
+#endif
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs_mmap.count(weight->idx)) {
@@ -1258,6 +1371,38 @@ bool llama_model_loader::load_all_data(
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                             return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                             }));
+            }
+
+            // Merged views share no file range: malloc the base once if needed,
+            // resolve the view, stream this slice without faulting the mapping on Windows.
+            if (cur->view_src != NULL && cur->buffer == nullptr) {
+                struct ggml_tensor * base = cur->view_src;
+                if (base->buffer == nullptr) {
+                    const size_t base_size = ggml_nbytes(base);
+                    ggml_backend_buffer_t bbuf = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), base_size);
+                    if (bbuf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate merged base for tensor '%s'", ggml_get_name(cur)));
+                    }
+                    ggml_backend_tensor_alloc(bbuf, base, ggml_backend_buffer_get_base(bbuf));
+                    ggml_backend_buffer_set_usage(bbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    model->bufs.push_back(bbuf);
+                    if (lmlocks) {
+                        model->mlock_bufs.emplace_back(new llama_mlock);
+                        auto & mlock_buf = model->mlock_bufs.back();
+                        mlock_buf->init   (ggml_backend_buffer_get_base(bbuf));
+                        mlock_buf->grow_to(ggml_backend_buffer_get_size(bbuf));
+                    }
+                }
+                ggml_backend_view_init(cur);
+#if defined(_WIN32)
+                // File stream, not mapping: slice copies would pin tens of GB
+                // of fused-expert file pages in the working set for no benefit.
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(cur->data, n_size);
+#else
+                ggml_backend_tensor_set(cur, data, 0, n_size);
+#endif
+                return n_size;
             }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
@@ -1509,3 +1654,157 @@ template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::ve
 template bool llama_model_loader::get_arr<uint64_t>(const std::string &, std::vector<uint64_t> &, bool);
 template bool llama_model_loader::get_arr<int32_t, 8>(const std::string &, std::array<int32_t, 8> &, bool);
 template bool llama_model_loader::get_arr<uint32_t, 8>(const std::string &, std::array<uint32_t, 8> &, bool);
+
+// Prism ternary Hadamard rotations (weights are stored pre-rotated in the GGUF)
+void llm_load_hadamard(llama_model_loader & ml, llama_model & model) {
+    if (getenv("IK_HADAMARD_DISABLE")) {
+        LLAMA_LOG_WARN("%s: disabled via IK_HADAMARD_DISABLE\n", __func__);
+        return;
+    }
+    uint32_t version = 0;
+    if (!ml.get_key("prism.hadamard.version", version, false)) {
+        return;
+    }
+    if (version != 1 && version != 2) {
+        LLAMA_LOG_WARN("%s: unsupported prism.hadamard.version %u, ignoring Hadamard rotations\n", __func__, version);
+        return;
+    }
+
+    uint32_t block_size = 0;
+    if (!ml.get_key("prism.hadamard.block_size", block_size, false) || block_size == 0 || (block_size & (block_size - 1)) != 0) {
+        LLAMA_LOG_WARN("%s: invalid prism.hadamard.block_size, ignoring Hadamard rotations\n", __func__);
+        return;
+    }
+
+    const auto get_str_arr = [&](const std::string & key) {
+        std::vector<std::string> out;
+        const int kid = gguf_find_key(ml.meta, key.c_str());
+        if (kid < 0 || gguf_get_kv_type(ml.meta, kid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(ml.meta, kid) != GGUF_TYPE_STRING) {
+            return out;
+        }
+        const size_t n = gguf_get_arr_n(ml.meta, kid);
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            out.emplace_back(gguf_get_arr_str(ml.meta, kid, i));
+        }
+        return out;
+    };
+
+    const std::vector<std::string> weight_names  = get_str_arr("prism.hadamard.weight_names");
+    const std::vector<std::string> inverse_names = get_str_arr("prism.hadamard.inverse_weight_names");
+
+    if (weight_names.empty() && inverse_names.empty()) {
+        return;
+    }
+
+    if (model.n_gpu_layers > 0) {
+        LLAMA_LOG_WARN("%s: Prism ternary Hadamard rotations are CPU-only; the requested GPU "
+                       "offload (n_gpu_layers=%d) is not supported for this model and may crash\n",
+                       __func__, model.n_gpu_layers);
+    }
+
+    std::vector<int32_t> sign_widths;
+    std::vector<int32_t> sign_values;
+    ml.get_arr("prism.hadamard.sign_widths", sign_widths, false);
+    ml.get_arr("prism.hadamard.sign_values", sign_values, false);
+
+    std::map<int64_t, std::vector<float>> signs_by_width;
+    {
+        size_t off = 0;
+        for (const int32_t width : sign_widths) {
+            if (width <= 0 || width % (int64_t) block_size != 0 || off + (size_t) width > sign_values.size()) {
+                LLAMA_LOG_WARN("%s: invalid prism.hadamard sign width %d, ignoring Hadamard rotations\n", __func__, width);
+                return;
+            }
+            std::vector<float> signs(width);
+            for (int64_t j = 0; j < width; ++j) {
+                const int32_t v = sign_values[off + j];
+                if (v != 1 && v != -1) {
+                    LLAMA_LOG_WARN("%s: prism.hadamard sign values must be +/-1, ignoring Hadamard rotations\n", __func__);
+                    return;
+                }
+                signs[j] = (float) v;
+            }
+            signs_by_width[width] = std::move(signs);
+            off += width;
+        }
+    }
+
+    bool gdn_v_grouped = false;
+    ml.get_key("prism.hadamard.gdn_v_grouped", gdn_v_grouped, false);
+
+    std::map<int64_t,  ggml_tensor *> sign_tensors;
+
+    const auto make_signs = [&](int64_t width) -> ggml_tensor * {
+        const auto it = sign_tensors.find(width);
+        if (it != sign_tensors.end()) {
+            return it->second;
+        }
+        const auto sd = signs_by_width.find(width);
+        if (sd == signs_by_width.end()) {
+            return nullptr;
+        }
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(params);
+        if (ctx == nullptr) {
+            return nullptr;
+        }
+        ggml_tensor * signs = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(signs, ("prism.hadamard.signs." + std::to_string(width)).c_str());
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        if (buf == nullptr) {
+            ggml_free(ctx);
+            return nullptr;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_tensor_set(signs, sd->second.data(), 0, sd->second.size() * sizeof(float));
+
+        model.ctxs.push_back(ctx);
+        model.bufs.push_back(buf);
+        sign_tensors[width] = signs;
+        return signs;
+    };
+
+    const auto fill_transform = [&](const std::string & name) {
+        llama_hadamard_transform & t = model.hadamard_map[name];
+        const ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
+        if (meta == nullptr) {
+            LLAMA_LOG_WARN("%s: prism.hadamard weight not found: %s\n", __func__, name.c_str());
+            return;
+        }
+        const int64_t width = meta->ne[0];
+        if (width <= 0 || width % (int64_t) block_size != 0) {
+            LLAMA_LOG_WARN("%s: prism.hadamard weight %s has ne0=%lld, not a multiple of block %u\n",
+                    __func__, name.c_str(), (long long) width, block_size);
+            return;
+        }
+        t.block_size = block_size;
+        if (!signs_by_width.empty()) {
+            t.signs = make_signs(width);
+            if (t.signs == nullptr) {
+                LLAMA_LOG_WARN("%s: prism.hadamard has no sign vector of width %lld for %s\n",
+                        __func__, (long long) width, name.c_str());
+                return;
+            }
+        }
+        if (gdn_v_grouped && name.find(".ssm_out.") != std::string::npos) {
+            const int64_t n_v = (int64_t) model.hparams.ssm_dt_rank;
+            const int64_t n_k = (int64_t) model.hparams.ssm_n_group;
+            if (n_v > 0 && n_k > 0 && width % n_v == 0 && n_v % n_k == 0) {
+                t.perm_hd  = width / n_v;
+                t.perm_nk  = n_k;
+                t.perm_rep = n_v / n_k;
+            }
+        }
+    };
+
+    for (const auto & name : weight_names) {
+        fill_transform(name);
+    }
+    for (const auto & name : inverse_names) {
+        fill_transform(name);
+    }
+
+    LLAMA_LOG_INFO("%s: PrismML Hadamard enabled: %zu rotated weights, %u sign widths, %zu inverse rows, block %u\n",
+            __func__, weight_names.size(), (uint32_t) signs_by_width.size(), inverse_names.size(), block_size);
+}

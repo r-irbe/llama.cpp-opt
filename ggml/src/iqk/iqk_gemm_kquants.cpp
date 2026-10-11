@@ -3019,9 +3019,8 @@ void iqk_convert_iq4_xs_r8_q8_k_r16(int n, const void * vx, size_t bx, void * vy
     const auto dup = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
 
     int16_t  ls[16];
-    float    dnew[k_nr];
     __m256i  xv[8];
-    uint32_t block[8];
+    Q8KRowRepacker<k_nr, 32> rp;
 
     for (int ix = 0; ix < nrc_x; ix += k_nr) {
         for (int g = 0; g < k_nr/8; ++g) {
@@ -3050,17 +3049,9 @@ void iqk_convert_iq4_xs_r8_q8_k_r16(int n, const void * vx, size_t bx, void * vy
                     auto nib = _mm256_blend_epi32(lo, hi, 0xAA);
                     xv[ib]   = _mm256_shuffle_epi8(values, nib);
                 }
-                dnew[k] = d * convert_to_q8_k_r8<k_nr>(k, 1.f/127, xv, ls, block, y[i].qs);
+                rp.row(k, d, 1.f/127, xv, ls, y[i].d, y[i].qs);
             }
-#ifdef HAVE_FANCY_SIMD
-            _mm512_storeu_ps(y[i].d, _mm512_loadu_ps(dnew));
-            for (int l = 0; l < 64; ++l) {
-                auto v = _mm512_xor_si512(_mm512_loadu_si512((const __m512i *)y[i].qs + l), _mm512_set1_epi8(-128));
-                _mm512_storeu_si512((__m512i *)y[i].qs + l, v);
-            }
-#else
-            _mm_storeu_si128((__m128i *)y[i].d, _mm256_cvtps_ph(_mm256_loadu_ps(dnew), _MM_ROUND_NEAREST));
-#endif
+            rp.flush(y[i].d, y[i].qs);
         }
         y += nb;
     }
@@ -3088,9 +3079,8 @@ void iqk_convert_iq4_xs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, in
     auto values = MM256_SET1_M128I(values128);
 
     int16_t  ls[16];
-    float    dnew[k_nr];
-    uint32_t block[8];
     __m256i  xv[8];
+    Q8KRowRepacker<k_nr, 32> rp;
 
     for (int ix = 0; ix < nrc_x; ix += k_nr) {
         for (int k = 0; k < k_nr; ++k) x8[k] = (const block_iq4_xs *)((const char *)vx + (ix + k)*bx);
@@ -3103,17 +3093,9 @@ void iqk_convert_iq4_xs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, in
                     xv[ib32] = _mm256_and_si256(MM256_SET_M128I(_mm_srli_epi16(bits, 4), bits), _mm256_set1_epi8(0xf));
                     xv[ib32] = _mm256_shuffle_epi8(values, xv[ib32]);
                 }
-                dnew[k] = d * convert_to_q8_k_r8<k_nr>(k, 1.f/127, xv, ls, block, y[i].qs);
+                rp.row(k, d, 1.f/127, xv, ls, y[i].d, y[i].qs);
             }
-#ifdef HAVE_FANCY_SIMD
-            _mm512_storeu_ps(y[i].d, _mm512_loadu_ps(dnew));
-            for (int l = 0; l < 64; ++l) {
-                auto v = _mm512_xor_si512(_mm512_loadu_si512((const __m512i *)y[i].qs + l), _mm512_set1_epi8(-128));
-                _mm512_storeu_si512((__m512i *)y[i].qs + l, v);
-            }
-#else
-            _mm_storeu_si128((__m128i *)y[i].d, _mm256_cvtps_ph(_mm256_loadu_ps(dnew), _MM_ROUND_NEAREST));
-#endif
+            rp.flush(y[i].d, y[i].qs);
         }
         y += nb;
     }
@@ -3125,7 +3107,7 @@ void iqk_convert_iq4_xs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, in
 bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
 
     auto etypeA = ggml_type(typeA);
-    if (etypeA == GGML_TYPE_Q8_K_R16 && ggml_type(typeB) == GGML_TYPE_Q8_K32) typeB = GGML_TYPE_Q8_K;
+    if ((etypeA == GGML_TYPE_Q8_K_R16 || etypeA == GGML_TYPE_Q8_K_R8) && ggml_type(typeB) == GGML_TYPE_Q8_K32) typeB = GGML_TYPE_Q8_K;
 
     auto expected_type_B = etypeA == GGML_TYPE_IQ4_XS_R8 || etypeA == GGML_TYPE_Q4_K_R4 || etypeA == GGML_TYPE_Q5_K_R4 ? GGML_TYPE_Q8_K32
                          //: etypeA == GGML_TYPE_Q8_K_R8 ? GGML_TYPE_Q8_KR8
