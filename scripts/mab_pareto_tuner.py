@@ -468,25 +468,42 @@ def evaluate_simulated_point(config: dict, model_name: str) -> dict:
     """
     # Base model profiles (VRAM, layers, parameters)
     model_profiles = {
-        "mistral-7b": {"params_b": 7.24, "weights_gb": 4.13, "layers": 32, "is_moe": False, "fits_gpu": True},
-        "qwen-27b": {"params_b": 26.90, "weights_gb": 16.42, "layers": 64, "is_moe": False, "fits_gpu": True},
-        "qwen-flash-next": {"params_b": 110.0, "weights_gb": 103.7, "layers": 80, "is_moe": True, "fits_gpu": False},
-        "kimi-k3": {"params_b": 553.0, "weights_gb": 553.2, "layers": 128, "is_moe": True, "fits_gpu": False},
+        "mistral-7b": {"params_b": 7.24, "active_params_b": 7.24, "weights_gb": 4.13, "layers": 32, "is_moe": False, "fits_gpu": True},
+        "qwen-27b": {"params_b": 26.90, "active_params_b": 26.90, "weights_gb": 16.42, "layers": 64, "is_moe": False, "fits_gpu": True},
+        "qwen-flash-next": {"params_b": 125.0, "active_params_b": 6.0, "weights_gb": 103.7, "layers": 48, "is_moe": True, "fits_gpu": False},
+        "kimi-k3": {"params_b": 553.0, "active_params_b": 37.0, "weights_gb": 553.2, "layers": 128, "is_moe": True, "fits_gpu": False},
     }
     prof = model_profiles.get(model_name, model_profiles["mistral-7b"])
 
-    # 1. GPU Offload Fraction
+    # 1. GPU Offload Fraction & MoE Attention/Expert Placement
     ngl = config.get("n_gpu_layers", 0)
     total_layers = prof["layers"]
     gpu_frac = min(1.0, ngl / float(total_layers)) if ngl < 999 else 1.0
-    if not prof["fits_gpu"] and gpu_frac > 0.35:
-        # Cannot fit all layers in 24 GB VRAM
-        gpu_frac = 0.25 # Partial offload only
+
+    # For MoE models, -ot allows 100% of Attention, RMSNorm, Routers & KV to stay in VRAM
+    # while routed experts are dynamically offloaded or placed across CPU NUMA
+    moe_attn_on_gpu = False
+    if prof["is_moe"]:
+        ot_strat = config.get("tensor_override_strategy", "")
+        if "attn.*=CUDA0" in ot_strat or "ffn_.*_exps.*=CPU" in ot_strat or ngl >= 48:
+            moe_attn_on_gpu = True
+            # Max 10 layers of routed experts fit in remaining 16.8 GB free VRAM on RTX 4090
+            gpu_expert_layers = min(10, ngl if ngl < 999 else 8)
+            gpu_frac = (gpu_expert_layers / float(total_layers)) * 0.4 + 0.6  # Heavy attention + partial experts
+        elif not prof["fits_gpu"] and gpu_frac > 0.35:
+            gpu_frac = 0.25 # Raw layer split without tensor override
+    elif not prof["fits_gpu"] and gpu_frac > 0.35:
+        gpu_frac = 0.25
 
     # 2. Compute Prompt Processing Throughput (PP tok/s)
-    # Peak GPU: 7425 tok/s (7B) / 2881 tok/s (27B) / 1250 tok/s (110B) / 280 tok/s (553B)
-    gpu_pp_peak = (7425.0 * 7.24) / prof["params_b"]
-    cpu_pp_peak = (639.0 * 7.24) / prof["params_b"]
+    # For MoE models, prompt processing evaluates all prompt tokens across experts, activating ~40-60B effective parameters
+    if prof["is_moe"]:
+        eff_pp_params = 60.0 if moe_attn_on_gpu else prof["params_b"]
+    else:
+        eff_pp_params = prof["params_b"]
+
+    gpu_pp_peak = (7425.0 * 7.24) / eff_pp_params
+    cpu_pp_peak = (639.0 * 7.24) / eff_pp_params
 
     # Threading scaling on CPU
     threads = config.get("threads", 56)
@@ -495,7 +512,7 @@ def evaluate_simulated_point(config: dict, model_name: str) -> dict:
         cpu_thread_mult *= 0.92
 
     # NUMA Split Bonus (+15% memory bandwidth saturation on NPS4)
-    numa_bonus = 1.15 if config.get("numa_mode") == "split" else 1.0
+    numa_bonus = 1.15 if config.get("numa_mode") in ["split", "distribute"] else 1.0
 
     # HugeTLB Bonus (+12% TLB walk elimination)
     thp_bonus = 1.12 if config.get("use_thp") == 1 else 1.0
@@ -506,26 +523,33 @@ def evaluate_simulated_point(config: dict, model_name: str) -> dict:
     # FlashAttention Bonus (+35% attention speedup)
     fa_bonus = 1.35 if config.get("flash_attn") == 1 else 1.0
 
+    # Batch and ubatch bonus on prompt processing (large ubatch = higher Tensor Core saturation)
+    ub = config.get("ubatch_size", 512)
+    ubatch_bonus = 1.0 + (math.log2(max(128, ub) / 128.0) * 0.18)
+
     # Blend GPU + CPU PP throughput
-    pp_tps = (gpu_frac * gpu_pp_peak * fp8_bonus * fa_bonus) + ((1.0 - gpu_frac) * cpu_pp_peak * cpu_thread_mult * numa_bonus * thp_bonus)
+    pp_tps = ((gpu_frac * gpu_pp_peak * fp8_bonus * fa_bonus * ubatch_bonus) +
+              ((1.0 - gpu_frac) * cpu_pp_peak * cpu_thread_mult * numa_bonus * thp_bonus))
 
     # 3. Compute Token Generation Throughput (TG tok/s)
-    # Peak GPU: 75 tok/s (7B) / 48 tok/s (27B) / 18 tok/s (110B) / 4.5 tok/s (553B)
-    gpu_tg_peak = (75.0 * 7.24) / prof["params_b"]
-    cpu_tg_peak = (25.7 * 7.24) / prof["params_b"]
+    # Peak generation is determined by ACTIVE parameters per token (e.g. 6.0B for Qwen Flash Next)
+    # Bounded by DDR4 8-channel memory bandwidth (~150 GB/s / 2.2 GB active weights = ~68 tok/s theoretical, 24.6 tok/s live measured)
+    eff_tg_params = prof["active_params_b"] if prof["is_moe"] else prof["params_b"]
+    gpu_tg_peak = (75.0 * 7.24) / eff_tg_params
+    cpu_tg_peak = min(35.0, (25.7 * 7.24) / eff_tg_params)
 
     tg_tps = (gpu_frac * gpu_tg_peak) + ((1.0 - gpu_frac) * cpu_tg_peak * cpu_thread_mult * numa_bonus)
 
-    # Speculative Decoding multiplier
+    # Speculative Decoding multiplier (MTP / DFlash / N-gram)
     spec_type = config.get("spec_type", "none")
     if spec_type != "none":
         n_draft = config.get("n_draft", 4)
         p_min = config.get("p_min", 0.7)
-        # Empirical acceptance rate alpha ~= 0.65 - 0.75
-        alpha = 0.70 if p_min <= 0.7 else 0.55
+        # Empirical acceptance rate alpha ~= 0.70 - 0.85 for MTP
+        alpha = 0.82 if spec_type == "mtp" else (0.70 if p_min <= 0.7 else 0.55)
         effective_drafts = min(n_draft, 8)
         # Expected accepted tokens per step = 1 + alpha + alpha^2 + ...
-        spec_multiplier = (1.0 - (alpha ** (effective_drafts + 1))) / (1.0 - alpha) / (1.0 + (effective_drafts * 0.12))
+        spec_multiplier = (1.0 - (alpha ** (effective_drafts + 1))) / (1.0 - alpha) / (1.0 + (effective_drafts * 0.10))
         tg_tps *= max(1.0, spec_multiplier)
 
     # 4. Compute TTFT (Time-To-First-Token in ms)
@@ -569,8 +593,8 @@ def compute_scalar_reward(metrics: dict, target_model: str) -> float:
     """Combines multi-objective performance metrics into normalized scalar utility for bandit update."""
     # Weights: 40% PP throughput, 40% TG throughput, 20% low TTFT
     # Normalization baselines based on model scale
-    norm_pp = 5000.0 if "7b" in target_model else (2000.0 if "27b" in target_model else 500.0)
-    norm_tg = 60.0 if "7b" in target_model else (40.0 if "27b" in target_model else 10.0)
+    norm_pp = 5000.0 if "7b" in target_model else (2000.0 if "27b" in target_model else (800.0 if "flash" in target_model else 300.0))
+    norm_tg = 60.0 if "7b" in target_model else (40.0 if "27b" in target_model else (35.0 if "flash" in target_model else 10.0))
 
     score_pp = min(1.0, metrics["pp_tps"] / norm_pp)
     score_tg = min(1.0, metrics["tg_tps"] / norm_tg)
