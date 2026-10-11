@@ -4290,14 +4290,16 @@ static bool is_model_split_supported(const llama_model & model) {
         //LLM_ARCH_QWEN3NEXT,
         LLM_ARCH_QWEN35,
         LLM_ARCH_QWEN35MOE,
+        LLM_ARCH_QWEN4EXP,
         LLM_ARCH_GEMMA4,
         LLM_ARCH_GEMMA4_MTP,
         LLM_ARCH_GEMMA4_ASSISTANT,
         LLM_ARCH_DEEPSEEK2,
+        LLM_ARCH_DEEPSEEK4,
+        LLM_ARCH_DEEPSEEK41,
         LLM_ARCH_GLM_DSA,
         LLM_ARCH_MISTRAL4,
         LLM_ARCH_MELLUM,
-        LLM_ARCH_LAGUNA,
         LLM_ARCH_MUSE_GLIMMER,
     };
     auto it =  k_supported.find(model.arch);
@@ -4368,7 +4370,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             ow_size += size;
             continue;
         }
-        if (model.arch == LLM_ARCH_GEMMA4) {
+        if (model.arch == LLM_ARCH_GEMMA4 || model.arch == LLM_ARCH_QWEN4EXP) {
             if (name == "per_layer_token_embd.weight" ||
                 name == "per_layer_model_proj.weight" ||
                 name == "per_layer_proj_norm.weight") {
