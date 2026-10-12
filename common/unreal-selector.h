@@ -1,0 +1,286 @@
+#pragma once
+
+#include <vector>
+#include <string>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <queue>
+#include <memory>
+#include <cstring>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+// =========================================================================================
+// UNREAL: Model-Internal Evidence Selector & Distractor-Eliminated Long-Context Pipeline
+// Grounded in:
+//   1. Kinderman et al. (NVIDIA Research & Technion, 2026, arXiv:2610.08463):
+//      "UNREAL: Unifying Retrieval and Long-Context with a Single Model":
+//      - Model-internal evidence selection across 6 orders of magnitude (8K to 3B tokens).
+//      - Eliminates distractor interference (NoLiMa accuracy 1.0% -> 24.8% at 128K tokens).
+//      - Asymptotic prefill complexity collapse: O(N^2) global attention -> O(N) chunk prefill.
+//      - Linear decode scaling and 98.5% KV cache VRAM reduction.
+//   2. Khattab & Zaharia (SIGIR 2020, arXiv:2004.12832): ColBERT Late-Interaction MaxSim.
+//   3. Santhanam et al. (NAACL 2022, arXiv:2112.01488): ColBERTv2 multi-vector compression.
+//   4. Hoffer et al. (2026, arXiv:2603.00198): INTRA intrinsic representation retrieval.
+// =========================================================================================
+
+namespace unreal {
+
+struct config {
+    int n_retrieval_tokens = 64;   // R: Number of soft retrieval tokens
+    int n_query_groups     = 4;    // G: Pooled query representation groups
+    int n_chunk_vectors    = 7;    // Lp: Compressed pooled vectors per chunk
+    int chunk_size         = 140;  // T: Mean token length per chunk
+    int index_layer        = 42;   // lc: Intermediate readout layer
+    float temperature      = 0.07f;// tau: Softmax contrastive temperature
+};
+
+struct chunk_span {
+    int chunk_id = -1;
+    int token_start = 0;
+    int token_count = 0;
+    int doc_id = 0;
+};
+
+// =========================================================================================
+// SIMD-Accelerated Vector Dot Product Primitives
+// =========================================================================================
+
+inline float vector_dot_product(const float * a, const float * b, int d) {
+    float sum = 0.0f;
+    int i = 0;
+
+#if defined(__AVX512F__)
+    __m512 vsum0 = _mm512_setzero_ps();
+    __m512 vsum1 = _mm512_setzero_ps();
+    for (; i + 31 < d; i += 32) {
+        __m512 va0 = _mm512_loadu_ps(a + i);
+        __m512 vb0 = _mm512_loadu_ps(b + i);
+        vsum0 = _mm512_fmadd_ps(va0, vb0, vsum0);
+
+        __m512 va1 = _mm512_loadu_ps(a + i + 16);
+        __m512 vb1 = _mm512_loadu_ps(b + i + 16);
+        vsum1 = _mm512_fmadd_ps(va1, vb1, vsum1);
+    }
+    vsum0 = _mm512_add_ps(vsum0, vsum1);
+    sum += _mm512_reduce_add_ps(vsum0);
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 vsum0 = _mm256_setzero_ps();
+    __m256 vsum1 = _mm256_setzero_ps();
+    for (; i + 15 < d; i += 16) {
+        __m256 va0 = _mm256_loadu_ps(a + i);
+        __m256 vb0 = _mm256_loadu_ps(b + i);
+        vsum0 = _mm256_fmadd_ps(va0, vb0, vsum0);
+
+        __m256 va1 = _mm256_loadu_ps(a + i + 8);
+        __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+        vsum1 = _mm256_fmadd_ps(va1, vb1, vsum1);
+    }
+    vsum0 = _mm256_add_ps(vsum0, vsum1);
+    alignas(32) float buffer[8];
+    _mm256_storeu_ps(buffer, vsum0);
+    for (int k = 0; k < 8; ++k) sum += buffer[k];
+#endif
+
+    for (; i < d; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+// =========================================================================================
+// Late-Interaction MaxSim Operator (ColBERT / UNREAL Formulation)
+// MaxSim(q, k) = sum_{a=0}^{G-1} max_{b=0}^{Lp-1} <q_a, k_b>
+// Evaluates G * Lp inner products of dimension d and reduces via maximum.
+// =========================================================================================
+
+inline float compute_maxsim(
+    const float * query_vecs,  // [G, d]
+    const float * chunk_vecs,  // [Lp, d]
+    int G,
+    int Lp,
+    int d)
+{
+    float total_maxsim = 0.0f;
+
+    for (int g = 0; g < G; ++g) {
+        const float * q = query_vecs + g * d;
+        float max_val = -1e30f;
+
+        for (int p = 0; p < Lp; ++p) {
+            const float * k = chunk_vecs + p * d;
+            float dot = vector_dot_product(q, k, d);
+            if (dot > max_val) {
+                max_val = dot;
+            }
+        }
+        total_maxsim += max_val;
+    }
+
+    return total_maxsim;
+}
+
+// =========================================================================================
+// UNREAL Chunk Embedding Buffer (Aligned for SIMD Vector Load)
+// Stores Lp x d float representations per chunk.
+// =========================================================================================
+
+struct chunk_record {
+    int chunk_id;
+    int doc_id;
+    int token_start;
+    int token_count;
+    std::vector<float> embeddings; // Lp * d elements
+};
+
+class selector {
+public:
+    explicit selector(const config & cfg = config()) : cfg_(cfg) {}
+
+    const config & get_config() const { return cfg_; }
+
+    void add_chunk(int chunk_id, int doc_id, int token_start, int token_count, const float * data, int d) {
+        chunk_record rec;
+        rec.chunk_id = chunk_id;
+        rec.doc_id = doc_id;
+        rec.token_start = token_start;
+        rec.token_count = token_count;
+        rec.embeddings.assign(data, data + cfg_.n_chunk_vectors * d);
+        chunks_.emplace_back(std::move(rec));
+    }
+
+    void clear() {
+        chunks_.clear();
+    }
+
+    size_t size() const {
+        return chunks_.size();
+    }
+
+    // Score all candidate chunks against query vectors and return top-n indices sorted descending
+    std::vector<std::pair<int, float>> rank_chunks(
+        const float * query_vecs, // [G, d]
+        int n,
+        int d) const
+    {
+        if (chunks_.empty() || n <= 0) return {};
+
+        std::vector<std::pair<int, float>> scored_chunks;
+        scored_chunks.reserve(chunks_.size());
+
+        for (size_t i = 0; i < chunks_.size(); ++i) {
+            float s = compute_maxsim(query_vecs, chunks_[i].embeddings.data(), cfg_.n_query_groups, cfg_.n_chunk_vectors, d);
+            scored_chunks.emplace_back((int)i, s);
+        }
+
+        // Min-heap to extract top-n
+        auto comp = [](const std::pair<int, float> & a, const std::pair<int, float> & b) {
+            return a.second > b.second; // ascending for min-heap
+        };
+
+        std::priority_queue<std::pair<int, float>, std::vector<std::pair<int, float>>, decltype(comp)> min_heap(comp);
+
+        for (const auto & item : scored_chunks) {
+            if ((int)min_heap.size() < n) {
+                min_heap.push(item);
+            } else if (item.second > min_heap.top().second) {
+                min_heap.pop();
+                min_heap.push(item);
+            }
+        }
+
+        std::vector<std::pair<int, float>> result;
+        result.reserve(min_heap.size());
+        while (!min_heap.empty()) {
+            result.push_back(min_heap.top());
+            min_heap.pop();
+        }
+        std::reverse(result.begin(), result.end()); // descending order
+        return result;
+    }
+
+    const chunk_record & get_chunk(int idx) const {
+        return chunks_[idx];
+    }
+
+    // =====================================================================================
+    // Exact-Cover Context Partitioner (Appendix B.2)
+    // Splits a sequence of N tokens into non-overlapping chunks of length <= chunk_size.
+    // =====================================================================================
+    static std::vector<chunk_span> partition_prompt(int total_tokens, int chunk_size = 140, int doc_id = 0) {
+        std::vector<chunk_span> spans;
+        if (total_tokens <= 0 || chunk_size <= 0) return spans;
+
+        int current = 0;
+        int chunk_idx = 0;
+        while (current < total_tokens) {
+            chunk_span span;
+            span.chunk_id = chunk_idx++;
+            span.doc_id = doc_id;
+            span.token_start = current;
+            span.token_count = std::min(chunk_size, total_tokens - current);
+            spans.push_back(span);
+            current += span.token_count;
+        }
+        return spans;
+    }
+
+    // =====================================================================================
+    // Theoretical Break-Even Context Length Calculation (Appendix C.2 - Equation 10)
+    // Computes N* where UNREAL FLOPs are strictly lower than full-context inference.
+    // =====================================================================================
+    static double calculate_break_even_n(
+        int64_t Theta_active,     // Active backbone parameters per token (e.g. 30e9 or 35e9)
+        int La,                   // Global attention layers
+        int da,                   // Attention dimension (d)
+        int n_selected_chunks,    // n (e.g. 5, 10, 20)
+        int chunk_size,           // T (e.g. 140)
+        int retrieval_tokens,     // R (e.g. 64)
+        int bm25_chunks,          // |C0(x)| (e.g. 5)
+        float lambda)             // 1 - lc / L (e.g. 1 - 42/52 = 0.1923)
+    {
+        if (La <= 0 || da <= 0) return 0.0;
+
+        double kappa = (double)Theta_active / ((double)La * da);
+        int64_t nT = (int64_t)n_selected_chunks * chunk_size;
+        int64_t x_ret = (int64_t)(bm25_chunks + 1) * chunk_size + retrieval_tokens;
+        double Q = (double)(nT + x_ret);
+
+        // Equation 10: N* = sqrt(kappa * Q + (lambda * kappa / 2)^2) - (lambda * kappa / 2)
+        double term1 = lambda * kappa / 2.0;
+        double N_star = std::sqrt(kappa * Q + term1 * term1) - term1;
+        return N_star;
+    }
+
+    // =====================================================================================
+    // Distractor-Free Context Reassembly
+    // Reassembles selected top-n chunks in original sequential document order.
+    // =====================================================================================
+    static std::vector<chunk_span> reassemble_selected_spans(
+        const std::vector<chunk_span> & all_spans,
+        const std::vector<int> & selected_indices)
+    {
+        std::vector<chunk_span> selected;
+        selected.reserve(selected_indices.size());
+        for (int idx : selected_indices) {
+            if (idx >= 0 && idx < (int)all_spans.size()) {
+                selected.push_back(all_spans[idx]);
+            }
+        }
+        // Restore chronological / document order to eliminate distractor permutations
+        std::sort(selected.begin(), selected.end(), [](const chunk_span & a, const chunk_span & b) {
+            if (a.doc_id != b.doc_id) return a.doc_id < b.doc_id;
+            return a.token_start < b.token_start;
+        });
+        return selected;
+    }
+
+private:
+    config cfg_;
+    std::vector<chunk_record> chunks_;
+};
+
+} // namespace unreal
