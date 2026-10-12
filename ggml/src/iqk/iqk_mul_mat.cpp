@@ -242,6 +242,7 @@ struct MulMat {
 #if defined(GGML_USE_IQK_AVX512)
         const bool has_fancy = iqk_cpu_has_avx512_vnni();
         auto q8_k_type = has_fancy ? GGML_TYPE_Q8_K_R16 : GGML_TYPE_Q8_K_R8;
+        const int k_min_nrc_y = has_fancy ? 16 : 32;
 #elif defined(HAVE_FANCY_SIMD)
         const bool has_fancy = true;
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
