@@ -9231,7 +9231,28 @@ struct llama_model * llama_model_load_from_file(
                 device_names.push_back(create_rpc_name(it.endpoint, it.device));
             }
         }
-        device_names.insert(device_names.end(), gpu_names.begin(), gpu_names.end());
+        int gpu_count = 0;
+#if defined(GGML_USE_CUDA)
+        gpu_count = (int) ggml_backend_cuda_get_device_count();
+#elif defined(GGML_USE_SYCL)
+        gpu_count = (int) ggml_backend_sycl_get_device_count();
+#elif defined(GGML_USE_VULKAN)
+        gpu_count = (int) ggml_backend_vk_get_device_count();
+#elif defined(GGML_USE_CANN)
+        gpu_count = (int) ggml_backend_cann_get_device_count();
+#elif defined(GGML_USE_METAL)
+        gpu_count = 1;
+#endif
+        if (gpu_count > 0) {
+            // When accelerator GPUs are present, default layer offloading targets the GPUs.
+            // Virtual CPU NUMA devices remain registered in buffer_names and ctx->backends
+            // for tensor overrides (-ot) and MoE expert sharding.
+            for (int i = 0; i < gpu_count && i < (int)gpu_names.size(); ++i) {
+                device_names.push_back(gpu_names[i]);
+            }
+        } else {
+            device_names.insert(device_names.end(), gpu_names.begin(), gpu_names.end());
+        }
     }
 
     for (auto & device : device_names) {

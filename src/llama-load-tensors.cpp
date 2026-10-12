@@ -482,11 +482,21 @@ static std::vector<int> create_split(int nr, int granularity, const std::vector<
 ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx, const std::string & name) {
     for (auto & o : overrides) {
         if (std::regex_search(name, o.first)) {
-            if (o.second == default_cpu_buft || ggml_backend_buft_is_cpu_numa(o.second)) has_buft_overrides = true;
+            auto buft = o.second;
+            if (ggml::cpu::numa::is_numa_split()) {
+                const int n_numa = ggml_backend_cpu_numa_node_count();
+                if (n_numa > 1 && buft == default_cpu_buft) {
+                    int il = -1;
+                    if (sscanf(name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && name.find("_exps") != std::string::npos) {
+                        buft = ggml_backend_cpu_numa_buffer_type(il % n_numa);
+                    }
+                }
+            }
+            if (buft == default_cpu_buft || ggml_backend_buft_is_cpu_numa(buft)) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
-            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
-            ctx = ctx_for_buft(o.second);
+            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(buft));
+            ctx = ctx_for_buft(buft);
             break;
         }
     }
