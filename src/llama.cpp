@@ -460,7 +460,7 @@ static size_t llama_get_device_count(const llama_model & model, int initial_coun
 #elif defined(GGML_USE_METAL)
     count = 1;
 #endif
-    if (ggml::cpu::numa::is_numa_split()) {
+    if (ggml::cpu::numa::is_numa_expert()) {
         count += ggml::cpu::numa::topology().size();
     }
 #if defined(GGML_USE_RPC)
@@ -512,7 +512,7 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
     }
 #endif
 
-    if (ggml::cpu::numa::is_numa_split()) {
+    if (ggml::cpu::numa::is_numa_expert()) {
         int numa_idx = gpu - gpu_count;
         const auto & topo = ggml::cpu::numa::topology();
         if (numa_idx >= 0 && numa_idx < (int) topo.size()) {
@@ -638,7 +638,7 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
     return 1;
 #endif
 
-    if (ggml::cpu::numa::is_numa_split()) {
+    if (ggml::cpu::numa::is_numa_expert()) {
         int numa_idx = device - gpu_count;
         const auto & topo = ggml::cpu::numa::topology();
         if (numa_idx >= 0 && numa_idx < (int) topo.size()) {
@@ -4725,6 +4725,13 @@ static bool llm_load_tensors(
         max_ctx_size = model.hparams.n_ctx_train;
     }
 
+    const size_t expert_mem_margin = 2560ULL * 1024 * 1024;
+    if (ggml::cpu::numa::is_numa_expert() && !ml.tensor_buft_overrides && ml.ncmoe == 0 && !model.devices.empty()) {
+        fit = true;
+        LLAMA_LOG_INFO("%s: --numa expert auto-fit activated: reserving %0.2f MiB compute margin + full hot KV cache on GPU (autotuning GPU offload to prevent OOM)\n",
+                __func__, expert_mem_margin / (1024.0 * 1024.0));
+    }
+
     if (fit) {
         if (ml.tensor_buft_overrides) {
             throw std::runtime_error("Manual tensor overrides cannot be used with --fit");
@@ -4743,7 +4750,7 @@ static bool llm_load_tensors(
     model.swa_compress = swa_compress;
     model.fit          = fit;
 
-    size_t mem_margin  = fit_margin > 0 ? size_t(fit_margin)*1024*1024 : k_default_mem_margin;
+    size_t mem_margin  = fit_margin > 0 ? size_t(fit_margin)*1024*1024 : (ggml::cpu::numa::is_numa_expert() ? expert_mem_margin : k_default_mem_margin);
     auto get_mem_margin = [mem_margin, fit_margin_array, n_gpu = int(model.devices.size()), func = __func__] (int gpu) {
         size_t result = mem_margin;
         bool have_margin_override = false;
@@ -4916,8 +4923,16 @@ static bool llm_load_tensors(
             if (has_experts) {
             if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) {
                 auto cur_mem = required_mem;
+                bool output_on_host = false;
+                if (available_mem <= layer_sizes[n_layer]) {
+                    cur_mem -= layer_sizes[n_layer];
+                    output_on_host = true;
+                    model.default_layer_device[n_layer] = -1;
+                    LLAMA_LOG_INFO("%s: output layer (%zu MiB) exceeds available device memory (%zu MiB), keeping output layer on host memory\n",
+                            __func__, (size_t)(layer_sizes[n_layer]/(1024*1024)), available_mem/(1024*1024));
+                }
                 int n_override = 0;
-                for (int il = 0; il < n_layer; ++il) {
+                for (int il = n_layer-1; il >= 0; --il) {
                     bool has_experts = false;
                     if (experts[il].down) {
                         cur_mem -= ggml_nbytes(experts[il].down);
@@ -4956,12 +4971,16 @@ static bool llm_load_tensors(
                     }
                     throw std::runtime_error("Unable to auto-fit model");
                 }
-                int id = model.default_layer_device[n_layer];
-                if (device_mem[id] <= layer_sizes[n_layer]) {
-                    LLAMA_LOG_ERROR("Not enough memory in device %d to offload the output layer\n", id);
-                    throw std::runtime_error("Unable to auto-fit model");
+                if (!output_on_host) {
+                    int id = model.default_layer_device[n_layer];
+                    if (device_mem[id] <= layer_sizes[n_layer]) {
+                        LLAMA_LOG_INFO("%s: output layer (%zu MiB) exceeds device %d memory (%zu MiB), keeping output layer on host memory\n",
+                                __func__, (size_t)(layer_sizes[n_layer]/(1024*1024)), id, device_mem[id]/(1024*1024));
+                        model.default_layer_device[n_layer] = -1;
+                    } else {
+                        device_mem[id] -= layer_sizes[n_layer];
+                    }
                 }
-                device_mem[id] -= layer_sizes[n_layer];
                 if (!tensor_split) {
                     float sum = 0;
                     for (int id = 0; id < int(model.splits.size()); ++id) {
@@ -4982,6 +5001,11 @@ static bool llm_load_tensors(
                 }
             } else {
                 for (int id = 0; id < device_count; ++id) {
+                    if (device_mem[id] <= layer_sizes[n_layer]) {
+                        LLAMA_LOG_INFO("%s: output layer (%zu MiB) exceeds device %d memory (%zu MiB), keeping output layer on host memory\n",
+                                __func__, (size_t)(layer_sizes[n_layer]/(1024*1024)), id, device_mem[id]/(1024*1024));
+                        model.default_layer_device[n_layer] = -1;
+                    }
                     size_t mem = 0;
                     for (int il = 0; il <= n_layer; ++il) {
                         if (model.default_layer_device[il] == id) {
@@ -5079,7 +5103,7 @@ static bool llm_load_tensors(
             model.buft_layer[i] = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[i]]);
         }
         // assign the output layer
-        if (n_gpu_layers > n_layer) {
+        if (n_gpu_layers > n_layer && model.default_layer_device[n_layer] >= 0) {
             model.buft_output = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[n_layer]]);
         } else {
             model.buft_output = llama_default_buffer_type_cpu(true);
@@ -5106,12 +5130,12 @@ static bool llm_load_tensors(
             }
         }
         // assign the output layer
-        if (n_gpu_layers > n_layer) {
+        if (n_gpu_layers > n_layer && model.default_layer_device[n_layer] >= 0) {
             model.buft_output = {
                 split_buft,
                 llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[n_layer]])
             };
-        } else if (n_gpu_layers > 0) {
+        } else if (n_gpu_layers > 0 && model.default_layer_device[n_layer] >= 0) {
             // Under partial -ngl with -sm graph, route output to the GPU buffer
             // to avoid synchronization issues between the GPU where the last
             // REDUCE op is performed and the CPU, where the fused RMS norm and
@@ -9089,16 +9113,16 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
 
-    if (numa == GGML_NUMA_STRATEGY_SPLIT) {
+    if (numa == GGML_NUMA_STRATEGY_EXPERT) {
         const auto & topo = ggml::cpu::numa::topology();
         if (topo.size() < 2) {
-            LLAMA_LOG_WARN("%s: --numa split requires at least 2 usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
+            LLAMA_LOG_WARN("%s: --numa expert requires at least 2 usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
                     __func__, topo.size());
             return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
         }
 
-        ggml::cpu::numa::set_numa_split(true);
-        LLAMA_LOG_INFO("%s: NUMA split initialized with %zu nodes\n", __func__, topo.size());
+        ggml::cpu::numa::set_numa_expert(true);
+        LLAMA_LOG_INFO("%s: NUMA expert initialized with %zu nodes\n", __func__, topo.size());
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
 
@@ -9953,7 +9977,7 @@ struct llama_context * llama_init_from_model(
             ctx->backends = std::move(backends);
         }
 
-        if (ggml::cpu::numa::is_numa_split()) {
+        if (ggml::cpu::numa::is_numa_expert()) {
             const auto & topo = ggml::cpu::numa::topology();
             for (size_t i = 0; i < topo.size(); ++i) {
                 ggml_backend_t numa_backend = ggml_backend_cpu_numa_init(topo[i].id);
@@ -10145,7 +10169,7 @@ struct llama_context * llama_init_from_model(
             // currently this is only implemented in the CUDA backend
             pipeline_parallel = false;
 #endif
-            if (ggml::cpu::numa::is_numa_split()) {
+            if (ggml::cpu::numa::is_numa_expert()) {
                 pipeline_parallel = false;
             }
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);

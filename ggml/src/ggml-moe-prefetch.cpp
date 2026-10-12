@@ -108,7 +108,7 @@ struct prefetch_pool {
         workers.reserve(n_threads);
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([this, i] {
-                if (ggml::cpu::numa::is_numa_split()) {
+                if (ggml::cpu::numa::is_numa_expert()) {
                     // Dynamically discover and bind prefetch threads to the NVMe storage NUMA node
                     // (e.g. Node 2 on PCIe NVMe carrier, Node 0 on NPS1/UMA, or PCIe parent bus).
                     int storage_node = ggml::cpu::numa::get_storage_numa_node();

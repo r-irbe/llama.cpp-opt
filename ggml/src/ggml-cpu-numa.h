@@ -50,9 +50,9 @@ int page_node(const void * addr);
 bool bind_current_thread(const std::vector<int> & cpus);
 bool bind_current_thread_to_node(int node_id, int thread_idx);
 
-// whether numa split is enabled
-bool is_numa_split();
-void set_numa_split(bool enable);
+// whether numa expert mode is enabled
+bool is_numa_expert();
+void set_numa_expert(bool enable);
 
 // Dynamic topology querying: physical socket count and node-to-socket mapping
 int socket_count();

@@ -36,14 +36,14 @@ namespace fs = std::filesystem;
 
 namespace ggml::cpu::numa {
 
-static std::atomic<bool> g_numa_split{false};
+static std::atomic<bool> g_numa_expert{false};
 
-bool is_numa_split() {
-    return g_numa_split.load(std::memory_order_relaxed);
+bool is_numa_expert() {
+    return g_numa_expert.load(std::memory_order_relaxed);
 }
 
-void set_numa_split(bool enable) {
-    g_numa_split.store(enable, std::memory_order_relaxed);
+void set_numa_expert(bool enable) {
+    g_numa_expert.store(enable, std::memory_order_relaxed);
 }
 
 static bool read_file(const std::string & path, std::string & out) {

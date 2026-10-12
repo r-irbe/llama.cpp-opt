@@ -283,8 +283,8 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
 
     if (ml.ncmoe > 0) {
         auto buft = llama_default_buffer_type_cpu(true);
-        const bool numa_split = ggml::cpu::numa::is_numa_split();
-        const int n_numa = numa_split ? ggml_backend_cpu_numa_node_count() : 1;
+        const bool numa_expert = ggml::cpu::numa::is_numa_expert();
+        const int n_numa = numa_expert ? ggml_backend_cpu_numa_node_count() : 1;
         if (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             const auto tn = LLM_TN(model.arch);
             int last_layer = n_layer - model.hparams.nextn_predict_layers;
@@ -294,7 +294,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
                 auto d_meta = ml.get_tensor_meta(d_name.c_str());
                 if (d_meta) {
                     auto cur_buft = buft;
-                    if (numa_split && n_numa > 1) {
+                    if (numa_expert && n_numa > 1) {
                         cur_buft = ggml_backend_cpu_numa_buffer_type(ndone % n_numa);
                     }
                     std::string pattern = "blk\\." + std::to_string(i) + "\\.ffn_(up|down|gate|gate_up)_exps\\.(weight|scale)";
@@ -483,7 +483,7 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
     for (auto & o : overrides) {
         if (std::regex_search(name, o.first)) {
             auto buft = o.second;
-            if (ggml::cpu::numa::is_numa_split()) {
+            if (ggml::cpu::numa::is_numa_expert()) {
                 const int n_numa = ggml_backend_cpu_numa_node_count();
                 if (n_numa > 1 && buft == default_cpu_buft) {
                     int il = -1;

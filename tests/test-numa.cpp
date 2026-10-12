@@ -181,15 +181,15 @@ int main() {
         check(alloc_onnode(size, 999, error) == nullptr && !error.empty(), "allocation on an unusable node fails");
     }
 
-    printf("numa split registration & backend verification\n");
+    printf("numa expert registration & backend verification\n");
     {
-        const enum llama_numa_init_status status = llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT);
+        const enum llama_numa_init_status status = llama_numa_init_ex(GGML_NUMA_STRATEGY_EXPERT);
 
         if (topology().size() < 2) {
             check(status == LLAMA_NUMA_INIT_STATUS_UNAVAILABLE, "unavailable with fewer than 2 nodes");
         } else {
-            check(status == LLAMA_NUMA_INIT_STATUS_SUCCESS, "split initialized");
-            check(is_numa_split(), "is_numa_split reports true");
+            check(status == LLAMA_NUMA_INIT_STATUS_SUCCESS, "expert initialized");
+            check(is_numa_expert(), "is_numa_expert reports true");
 
             for (const auto & n : topology()) {
                 const std::string expected = "CPU" + std::to_string(n.id);
@@ -235,7 +235,7 @@ int main() {
                 ggml_backend_free(backend);
             }
 
-            check(llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_SUCCESS, "second call is idempotent");
+            check(llama_numa_init_ex(GGML_NUMA_STRATEGY_EXPERT) == LLAMA_NUMA_INIT_STATUS_SUCCESS, "second call is idempotent");
         }
     }
 
