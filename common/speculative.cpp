@@ -1283,9 +1283,11 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
     const llama_model * model = llama_get_model(ctx_tgt);
     if (model != nullptr) {
         const std::string arch = llama_model_arch_string(model);
-        if (arch == "lfm2" || arch == "lfm2moe") {
-            LOG_WRN("%s: speculative decoding is not supported for LFM2 models (shortconv recurrent state is not rolled back)\n", __func__);
-            return false;
+        // LFM2 has a short-conv state (no SSM term): the CPU checkpoint rolls it back
+        if (arch == "lfm2") {
+            LOG_WRN("%s: LFM2 spec uses the CPU checkpoint for its short-conv state (--spec-ckpt-mode cpu)\n", __func__);
+        } else if (arch == "lfm2moe") {
+            LOG_WRN("%s: LFM2-MoE spec is lossless but the n-gram drafter accepts little here; usually not a win\n", __func__);
         }
     }
 
@@ -2239,6 +2241,7 @@ bool common_speculative_load_draft_model(
     params.model_dft = loaded_model;
     params.cuda_params = params_dft.cuda_params.empty() ? params_base.cuda_params : params_dft.cuda_params;
     params.cparams_dft = common_context_params_to_llama(params_dft);
+    params.cparams_dft.moe_cache_size = 0;
     if (!params.cuda_params.empty()) {
         params.cparams_dft.cuda_params = (void *)params.cuda_params.c_str();
     }
@@ -2291,6 +2294,7 @@ bool common_speculative_prepare_mtp_runtime(
         params.cuda_params = params_base.cuda_params;
         common_speculative_apply_draft_threads(params, params_mtp);
         params.cparams_dft = common_context_params_to_llama(params_mtp);
+        params.cparams_dft.moe_cache_size = 0;
         if (!params.cuda_params.empty()) {
             params.cparams_dft.cuda_params = (void *)params.cuda_params.c_str();
         }

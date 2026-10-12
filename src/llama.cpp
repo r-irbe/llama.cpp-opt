@@ -24,6 +24,7 @@
 #include "llama-cparams.h"
 #include "llama-hparams.h"
 #include "llama-context.h"
+#include "llama-moe-cache.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -456,6 +457,8 @@ static size_t llama_get_device_count(const llama_model & model, int initial_coun
     count = ggml_backend_vk_get_device_count();
 #elif defined(GGML_USE_CANN)
     return ggml_backend_cann_get_device_count();
+#elif defined(GGML_USE_METAL)
+    count = 1;
 #endif
     if (ggml::cpu::numa::is_numa_split()) {
         count += ggml::cpu::numa::topology().size();
@@ -604,7 +607,10 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
 #elif defined(GGML_USE_METAL)
     gpu_count = 1;
     if (device < gpu_count) {
-        return 1;
+        size_t total;
+        size_t free;
+        ggml_backend_metal_get_device_memory(&free, &total);
+        return free;
     }
 #else
     // CPU-only build: report free host RAM instead of the 1-byte placeholder.
@@ -958,6 +964,7 @@ llama_context::~llama_context() {
     free_dflash_kv_cache_tensors();
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
+    moe_cache.reset();
 
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
@@ -972,6 +979,12 @@ llama_context::~llama_context() {
             break;
         }
     }
+}
+
+bool llama_context::sched_copy_moe_cache(ggml_backend_t backend, const ggml_tensor * src,
+        ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_copy_phase phase, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    return ctx->moe_cache && ctx->moe_cache->copy(backend, src, dst, graph, phase);
 }
 
 static int llama_openpangu_chunked_graph_nodes(const llama_model & model, const llama_cparams & cparams, int n_tokens, int n_kv);
@@ -4728,6 +4741,7 @@ static bool llm_load_tensors(
     model.n_gpu_layers = n_gpu_layers;
     model.mtp          = mtp;
     model.swa_compress = swa_compress;
+    model.fit          = fit;
 
     size_t mem_margin  = fit_margin > 0 ? size_t(fit_margin)*1024*1024 : k_default_mem_margin;
     auto get_mem_margin = [mem_margin, fit_margin_array, n_gpu = int(model.devices.size()), func = __func__] (int gpu) {
@@ -5284,7 +5298,7 @@ static bool llm_load_tensors(
                     throw std::runtime_error("unable to allocate backend buffer");
                 }
                 model.bufs.push_back(buf);
-                if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+                if (use_mlock && ggml_backend_buffer_is_host(buf) && !ggml_backend_buffer_is_multi_buffer(buf)) {
                     model.mlock_bufs.emplace_back(new llama_mlock);
                     auto & mlock_buf = model.mlock_bufs.back();
                     mlock_buf->init   (ggml_backend_buffer_get_base(buf));
@@ -5329,7 +5343,7 @@ static bool llm_load_tensors(
     // Split display: deferred bytes get their own line, the rest counts as resident.
     // Resident totals are grouped by backend name since is_host covers CUDA_Host too.
     auto buf_deferred_mib = [&](ggml_backend_buffer_t buf) -> double {
-        if (!ggml_backend_buffer_is_host(buf)) {
+        if (!ggml_backend_buffer_is_host(buf) || ggml_backend_buffer_is_multi_buffer(buf)) {
             return 0.0;
         }
         const auto * base = (const uint8_t *) ggml_backend_buffer_get_base(buf);
@@ -8932,6 +8946,7 @@ struct llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.moe_cache_size              =*/ 0,
         /*.idx_type_k                  =*/ GGML_TYPE_F16,
         /*.type_reduce                 =*/ GGML_TYPE_F16,
         /*.type_graph_attn             =*/ GGML_TYPE_F16,
@@ -9362,6 +9377,21 @@ struct llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.moe_cache_size > 0) {
+        if (model->fit) {
+            LLAMA_LOG_ERROR("%s: MoE cache cannot be combined with --fit because fit does not reserve context-time cache memory\n", __func__);
+            return nullptr;
+        }
+        if (model->hparams.n_expert == 0 || model->hparams.n_expert_used == 0) {
+            LLAMA_LOG_ERROR("%s: MoE cache requires a MoE model\n", __func__);
+            return nullptr;
+        }
+        if (!model->rpc_servers.empty()) {
+            LLAMA_LOG_ERROR("%s: MoE cache does not support RPC devices\n", __func__);
+            return nullptr;
+        }
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
@@ -9542,6 +9572,7 @@ struct llama_context * llama_init_from_model(
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
+    cparams.moe_cache_size   = params.moe_cache_size;
     cparams.worst_graph_tokens = params.worst_case_tokens;
     cparams.dflash_query_capacity = params.dflash_query_capacity;
 
@@ -10087,6 +10118,7 @@ struct llama_context * llama_init_from_model(
                 model->n_gpu_layers > (int)model->hparams.n_layer &&
                 model->split_mode == LLAMA_SPLIT_MODE_LAYER &&
                 params.offload_kqv && !model->has_tensor_overrides();
+            pipeline_parallel = pipeline_parallel && params.moe_cache_size == 0;
 #ifndef GGML_USE_CUDA
             // pipeline parallelism requires support for async compute and events
             // currently this is only implemented in the CUDA backend
@@ -10102,6 +10134,18 @@ struct llama_context * llama_init_from_model(
             }
 
             llama_repack_up_gate_exps(*ctx);
+
+            if (cparams.moe_cache_size > 0) {
+                try {
+                    ctx->moe_cache = std::make_unique<llama_moe_cache>(*model, ctx->backends, backend_buft,
+                            cparams.moe_cache_size);
+                    ggml_backend_sched_set_copy_callback(ctx->sched, llama_context::sched_copy_moe_cache, ctx);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize MoE cache: %s\n", __func__, e.what());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
 
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
@@ -10124,6 +10168,9 @@ struct llama_context * llama_init_from_model(
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    if (ctx->moe_cache) {
+                        ggml_backend_sched_set_copy_callback(ctx->sched, llama_context::sched_copy_moe_cache, ctx);
+                    }
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
                 if (!gf_success) {
@@ -11904,6 +11951,13 @@ struct llama_data_read {
             }
 
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+
+            if (cell_count == 0) {
+                // an empty sequence state only clears the destination seq;
+                // the find_slot + cells asserts below index batch.pos[0], which
+                // does not exist for an empty batch
+                return true;
+            }
 
             llama_batch batch = llama_batch_init(cell_count, 0, 1);
             batch.n_tokens = cell_count;
