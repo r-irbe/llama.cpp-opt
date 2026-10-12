@@ -247,6 +247,8 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_BAILING_THINK,
     LLM_CHAT_TEMPLATE_BAILING2,
     LLM_CHAT_TEMPLATE_SEED_OSS,
+    LLM_CHAT_TEMPLATE_PHI_4,
+    LLM_CHAT_TEMPLATE_YANDEX,
     LLM_CHAT_TEMPLATE_UNKNOWN,
 };
 
@@ -295,6 +297,9 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "bailing-think",     LLM_CHAT_TEMPLATE_BAILING_THINK     },
     { "bailing2",          LLM_CHAT_TEMPLATE_BAILING2          },
     { "seed_oss",          LLM_CHAT_TEMPLATE_SEED_OSS          },
+    { "phi-4",             LLM_CHAT_TEMPLATE_PHI_4             },
+    { "phi4",              LLM_CHAT_TEMPLATE_PHI_4             },
+    { "yandex",            LLM_CHAT_TEMPLATE_YANDEX            },
 
 };
 
@@ -13690,7 +13695,9 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
     auto tmpl_contains = [&tmpl](const char * haystack) -> bool {
         return tmpl.find(haystack) != std::string::npos;
     };
-    if (tmpl_contains("<|im_start|>")) {
+    if (tmpl_contains("<|im_sep|>")) {
+        return LLM_CHAT_TEMPLATE_PHI_4;
+    } else if (tmpl_contains("<|im_start|>")) {
         return LLM_CHAT_TEMPLATE_CHATML;
     } else if (tmpl.find("mistral") == 0 || tmpl_contains("[INST]")) {
         if (tmpl_contains("[SYSTEM_PROMPT]")) {
@@ -13804,6 +13811,8 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_OPENAI_MOE;
     } else if (tmpl_contains("<seed:bos>")) {
         return LLM_CHAT_TEMPLATE_SEED_OSS;
+    } else if (tmpl_contains(LU8("Пользователь")) || tmpl_contains(LU8("Ассистент"))) {
+        return LLM_CHAT_TEMPLATE_YANDEX;
     }
     return LLM_CHAT_TEMPLATE_UNKNOWN;
 }
@@ -14164,7 +14173,7 @@ static int32_t llama_chat_apply_template_internal(
             ss << message->content << "<|end_of_text|>\n";
         }
         if (add_ass) {
-            ss << "<|start_of_role|>assistant<|end_of_role|>\n";
+            ss << "<|start_of_role|>assistant<|end_of_role|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_GIGACHAT) {
         // GigaChat template
@@ -14348,6 +14357,30 @@ static int32_t llama_chat_apply_template_internal(
         }
         if (add_ass) {
             ss << "<seed:bos>assistant\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_PHI_4) {
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                ss << "<|im_start|>system<|im_sep|>" << message->content << "<|im_end|>";
+            } else if (role == "user") {
+                ss << "<|im_start|>user<|im_sep|>" << message->content << "<|im_end|><|im_start|>assistant<|im_sep|>";
+            } else if (role == "assistant") {
+                ss << message->content << "<|im_end|>";
+            }
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_YANDEX) {
+        for (size_t i = 0; i < chat.size(); i++) {
+            auto message = chat[i];
+            std::string role(message->role);
+            if (role == "user") {
+                ss << " Пользователь: " << message->content << "\n\n";
+            } else if (role == "assistant" && i + 1 < chat.size()) {
+                ss << " Ассистент: " << message->content << "\n\n";
+            }
+        }
+        if (add_ass) {
+            ss << " Ассистент:[SEP]";
         }
     } else {
         // template not supported
