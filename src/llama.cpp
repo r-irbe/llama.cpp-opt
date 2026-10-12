@@ -5455,6 +5455,22 @@ static bool llm_load_tensors(
             }
         }
 
+        if (ggml::cpu::numa::is_numa_expert()) {
+            const int n_numa = ggml_backend_cpu_numa_node_count();
+            if (n_numa > 1) {
+                int n_bound = 0;
+                for (auto & pair : model.tensors_by_name) {
+                    struct ggml_tensor * t = pair.second;
+                    if (t && t->ne[2] > 1 && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                        if (ggml::cpu::numa::bind_tensor_experts_round_robin(t, n_numa)) {
+                            n_bound++;
+                        }
+                    }
+                }
+                LLAMA_LOG_INFO("%s: NUMA expert bound %d MoE tensors round-robin across %d nodes\n", __func__, n_bound, n_numa);
+            }
+        }
+
         if (defer_expert_mmap) {
             ml.drop_mmap_expert_pages();
         }
@@ -9122,6 +9138,7 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
         }
 
         ggml::cpu::numa::set_numa_expert(true);
+        ggml_numa_init(numa);
         LLAMA_LOG_INFO("%s: NUMA expert initialized with %zu nodes\n", __func__, topo.size());
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }

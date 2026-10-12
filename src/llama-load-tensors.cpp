@@ -283,8 +283,6 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
 
     if (ml.ncmoe > 0) {
         auto buft = llama_default_buffer_type_cpu(true);
-        const bool numa_expert = ggml::cpu::numa::is_numa_expert();
-        const int n_numa = numa_expert ? ggml_backend_cpu_numa_node_count() : 1;
         if (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             const auto tn = LLM_TN(model.arch);
             int last_layer = n_layer - model.hparams.nextn_predict_layers;
@@ -294,9 +292,6 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
                 auto d_meta = ml.get_tensor_meta(d_name.c_str());
                 if (d_meta) {
                     auto cur_buft = buft;
-                    if (numa_expert && n_numa > 1) {
-                        cur_buft = ggml_backend_cpu_numa_buffer_type(ndone % n_numa);
-                    }
                     std::string pattern = "blk\\." + std::to_string(i) + "\\.ffn_(up|down|gate|gate_up)_exps\\.(weight|scale)";
                     this->overrides.emplace_back(std::make_pair(std::regex(pattern), cur_buft));
                     if (++ndone == ml.ncmoe) break;
@@ -483,15 +478,6 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
     for (auto & o : overrides) {
         if (std::regex_search(name, o.first)) {
             auto buft = o.second;
-            if (ggml::cpu::numa::is_numa_expert()) {
-                const int n_numa = ggml_backend_cpu_numa_node_count();
-                if (n_numa > 1 && buft == default_cpu_buft) {
-                    int il = -1;
-                    if (sscanf(name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && name.find("_exps") != std::string::npos) {
-                        buft = ggml_backend_cpu_numa_buffer_type(il % n_numa);
-                    }
-                }
-            }
             if (buft == default_cpu_buft || ggml_backend_buft_is_cpu_numa(buft)) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;

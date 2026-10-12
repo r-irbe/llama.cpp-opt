@@ -25,12 +25,20 @@ namespace fs = std::filesystem;
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include "ggml.h"
+
 // from linux/mempolicy.h, not exposed by glibc
 #ifndef MPOL_DEFAULT
 #define MPOL_DEFAULT 0
 #endif
+#ifndef MPOL_PREFERRED
+#define MPOL_PREFERRED 1
+#endif
 #ifndef MPOL_BIND
 #define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE 1
 #endif
 #endif
 
@@ -867,6 +875,44 @@ int detect_path_numa_node(const char * path, const std::string & sysfs_root) {
     return 0; // Default to Node 0
 }
 
+bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nodes) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data || tensor->ne[2] <= 1 || n_numa_nodes <= 1) {
+        return false;
+    }
+
+    const int n_experts = (int)tensor->ne[2];
+    const size_t expert_stride = tensor->nb[2];
+    const uintptr_t page_mask = ~(4096ULL - 1);
+    const size_t bits_per_word = 8 * sizeof(unsigned long);
+
+    for (int e = 0; e < n_experts; ++e) {
+        int target_node = e % n_numa_nodes;
+        uintptr_t start_addr = (uintptr_t)tensor->data + e * expert_stride;
+        uintptr_t end_addr   = start_addr + expert_stride;
+
+        uintptr_t page_start = start_addr & page_mask;
+        uintptr_t page_end   = (end_addr + 4095ULL) & page_mask;
+        size_t len           = page_end - page_start;
+        if (len == 0) continue;
+
+        std::vector<unsigned long> nodemask(target_node / bits_per_word + 1, 0);
+        nodemask[target_node / bits_per_word] = 1UL << (target_node % bits_per_word);
+
+        long ret = syscall(__NR_mbind, (void *)page_start, len, MPOL_BIND, nodemask.data(), nodemask.size() * bits_per_word, MPOL_MF_MOVE);
+        if (ret != 0) {
+            syscall(__NR_mbind, (void *)page_start, len, MPOL_PREFERRED, nodemask.data(), nodemask.size() * bits_per_word, 0);
+        }
+        madvise((void *)page_start, len, MADV_HUGEPAGE);
+    }
+    return true;
+#else
+    (void)tensor;
+    (void)n_numa_nodes;
+    return false;
+#endif
+}
+
 } // namespace ggml::cpu::numa
 
 #ifdef __cplusplus
@@ -875,6 +921,10 @@ extern "C" {
 
 bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx) {
     return ggml::cpu::numa::bind_current_thread_to_node(node_id, thread_idx);
+}
+
+bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes) {
+    return ggml::cpu::numa::bind_tensor_experts_round_robin(tensor, n_numa_nodes);
 }
 
 #ifdef __cplusplus

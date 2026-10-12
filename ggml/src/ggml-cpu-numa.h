@@ -9,7 +9,12 @@
 // NUMA topology discovery for the CPU backend, used by --numa split.
 // Linux only, everything reports an empty topology on other platforms.
 
+struct ggml_tensor;
+
 namespace ggml::cpu::numa {
+
+// Bind individual expert slices within a 3D tensor to NUMA nodes round-robin via mbind(MPOL_BIND)
+bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nodes);
 
 struct node {
     int id = -1;
@@ -82,6 +87,9 @@ extern "C" {
 
 // C-compatible wrapper for binding the current thread during graph compute
 bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx);
+
+// C-compatible wrapper for binding expert tensor slices round-robin to NUMA nodes
+bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes);
 
 #ifdef __cplusplus
 }
