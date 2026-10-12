@@ -14,6 +14,10 @@
 #include <cstdio>
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_set>
+#include <mutex>
+#include <memory>
+#include <atomic>
 
 #ifndef __NR_io_uring_setup
 #define __NR_io_uring_setup 425
@@ -388,6 +392,240 @@ bool llama_io_uring_read_file(
     return ok;
 }
 
+struct llama_io_uring_context::impl {
+    io_uring_session session;
+    int fd = -1;
+    void * reg_addr = nullptr;
+    size_t reg_size = 0;
+    bool is_direct = false;
+    unsigned depth = 64;
+    std::atomic<uint64_t> req_counter{0};
+    std::unordered_set<uint64_t> completed_reqs;
+    std::unordered_set<uint64_t> failed_reqs;
+    size_t inflight = 0;
+    size_t total_bytes_read = 0;
+    std::chrono::high_resolution_clock::time_point start_time;
+    std::mutex mtx;
+
+    bool init(int in_fd, void * registered_buffer, size_t registered_buffer_size, const llama_io_uring_config & config) {
+        if (!config.enable || in_fd < 0) {
+            return false;
+        }
+        fd = in_fd;
+        reg_addr = registered_buffer;
+        reg_size = registered_buffer_size;
+
+        int fcntl_flags = fcntl(fd, F_GETFL);
+        is_direct = (fcntl_flags != -1) && (fcntl_flags & O_DIRECT);
+        if (is_direct && reg_addr && (reinterpret_cast<uintptr_t>(reg_addr) % 512 != 0)) {
+            is_direct = false;
+        }
+
+        if (config.populate_pages && reg_addr && reg_size > 0) {
+            madvise(reg_addr, reg_size, MADV_POPULATE_WRITE);
+        }
+
+        depth = std::max(8u, std::min(config.queue_depth, 512u));
+        if (!session.init(depth, config.try_sqpoll, reg_addr, reg_size, config.try_register_buffers && reg_addr && reg_size > 0)) {
+            return false;
+        }
+
+        start_time = std::chrono::high_resolution_clock::now();
+        return true;
+    }
+
+    void drain_completions(bool wait) {
+        unsigned head = *session.cq_head;
+        unsigned tail = __atomic_load_n(session.cq_tail, __ATOMIC_ACQUIRE);
+
+        if (wait && head == tail && inflight > 0) {
+            syscall(__NR_io_uring_enter, session.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+            tail = __atomic_load_n(session.cq_tail, __ATOMIC_ACQUIRE);
+        }
+
+        while (head != tail) {
+            struct io_uring_cqe * cqe = &session.cqes[head & *session.cq_mask];
+            uint64_t req = cqe->user_data;
+            if (cqe->res >= 0) {
+                completed_reqs.insert(req);
+                total_bytes_read += cqe->res;
+            } else {
+                failed_reqs.insert(req);
+            }
+            if (inflight > 0) inflight--;
+            head++;
+        }
+        __atomic_store_n(session.cq_head, head, __ATOMIC_RELEASE);
+    }
+
+    uint64_t submit_read(size_t file_offset, void * dest_addr, size_t len, uint64_t user_tag) {
+        if (session.ring_fd < 0 || len == 0 || dest_addr == nullptr) {
+            return 0;
+        }
+
+        std::lock_guard<std::mutex> lock(mtx);
+
+        while (inflight >= session.params.sq_entries) {
+            drain_completions(true);
+        }
+
+        uint64_t req_id = (user_tag != 0) ? user_tag : ++req_counter;
+
+        size_t read_len = len;
+        if (is_direct && (read_len % 4096 != 0)) {
+            read_len = ((read_len + 4095) / 4096) * 4096;
+        }
+
+        unsigned tail = *session.sq_tail;
+        unsigned index = tail & *session.sq_mask;
+        struct io_uring_sqe * sqe = &session.sqes[index];
+        std::memset(sqe, 0, sizeof(*sqe));
+
+        uintptr_t dest_u = reinterpret_cast<uintptr_t>(dest_addr);
+        uintptr_t reg_u = reinterpret_cast<uintptr_t>(reg_addr);
+
+        if (session.buffers_registered && reg_addr && dest_u >= reg_u && dest_u + read_len <= reg_u + reg_size) {
+            sqe->opcode = IORING_OP_READ_FIXED;
+            sqe->buf_index = 0;
+            sqe->addr = dest_u;
+        } else {
+            sqe->opcode = IORING_OP_READ;
+            sqe->addr = dest_u;
+        }
+        sqe->fd = fd;
+        sqe->off = file_offset;
+        sqe->len = (uint32_t)read_len;
+        sqe->user_data = req_id;
+
+        session.sq_array[index] = index;
+        __atomic_store_n(session.sq_tail, tail + 1, __ATOMIC_RELEASE);
+        inflight++;
+
+        if (session.is_sqpoll) {
+            unsigned fl = __atomic_load_n(session.sq_flags, __ATOMIC_ACQUIRE);
+            if (fl & IORING_SQ_NEED_WAKEUP) {
+                syscall(__NR_io_uring_enter, session.ring_fd, 1, 0, IORING_ENTER_SQ_WAKEUP, nullptr);
+            }
+        } else {
+            syscall(__NR_io_uring_enter, session.ring_fd, 1, 0, 0, nullptr);
+        }
+
+        return req_id;
+    }
+
+    bool poll_completion(uint64_t request_id, bool wait) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (completed_reqs.count(request_id)) {
+            return true;
+        }
+        if (failed_reqs.count(request_id)) {
+            return false;
+        }
+
+        drain_completions(wait);
+        if (completed_reqs.count(request_id)) {
+            return true;
+        }
+        if (failed_reqs.count(request_id)) {
+            return false;
+        }
+
+        if (wait && inflight > 0) {
+            while (inflight > 0 && !completed_reqs.count(request_id) && !failed_reqs.count(request_id)) {
+                drain_completions(true);
+            }
+            return completed_reqs.count(request_id) > 0;
+        }
+
+        return false;
+    }
+
+    bool wait_all() {
+        std::lock_guard<std::mutex> lock(mtx);
+        while (inflight > 0) {
+            drain_completions(true);
+        }
+        return failed_reqs.empty();
+    }
+
+    void cleanup() {
+        std::lock_guard<std::mutex> lock(mtx);
+        while (inflight > 0) {
+            drain_completions(true);
+        }
+        session.cleanup();
+        fd = -1;
+        reg_addr = nullptr;
+        reg_size = 0;
+        completed_reqs.clear();
+        failed_reqs.clear();
+    }
+
+    llama_io_uring_stats get_stats() const {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> diff = end_time - start_time;
+        double elapsed_s = diff.count();
+        double gb = (double)total_bytes_read / (1024.0 * 1024.0 * 1024.0);
+        double throughput = elapsed_s > 0.0 ? (gb / elapsed_s) : 0.0;
+
+        llama_io_uring_stats stats;
+        stats.total_bytes = total_bytes_read;
+        stats.elapsed_seconds = elapsed_s;
+        stats.throughput_gb_s = throughput;
+        stats.used_direct_io = is_direct;
+        stats.used_sqpoll = session.is_sqpoll;
+        stats.used_registered_buffers = session.buffers_registered;
+
+        std::string mode = "[";
+        if (is_direct) mode += "O_DIRECT";
+        else mode += "buffered";
+        if (session.is_sqpoll) mode += " + SQPOLL";
+        if (session.buffers_registered) mode += " + registered HugeTLB";
+        mode += "]";
+        stats.mode_str = mode;
+        return stats;
+    }
+};
+
+llama_io_uring_context::llama_io_uring_context() : pimpl(std::make_unique<impl>()) {}
+llama_io_uring_context::~llama_io_uring_context() = default;
+llama_io_uring_context::llama_io_uring_context(llama_io_uring_context &&) noexcept = default;
+llama_io_uring_context & llama_io_uring_context::operator=(llama_io_uring_context &&) noexcept = default;
+
+bool llama_io_uring_context::init(int fd, void * reg_buf, size_t reg_size, const llama_io_uring_config & config) {
+    return pimpl->init(fd, reg_buf, reg_size, config);
+}
+uint64_t llama_io_uring_context::submit_read(size_t file_offset, void * dest_addr, size_t len, uint64_t user_tag) {
+    return pimpl->submit_read(file_offset, dest_addr, len, user_tag);
+}
+bool llama_io_uring_context::poll_completion(uint64_t request_id, bool wait) {
+    return pimpl->poll_completion(request_id, wait);
+}
+bool llama_io_uring_context::wait_all() {
+    return pimpl->wait_all();
+}
+size_t llama_io_uring_context::in_flight() const {
+    return pimpl ? pimpl->inflight : 0;
+}
+llama_io_uring_stats llama_io_uring_context::get_stats() const {
+    return pimpl ? pimpl->get_stats() : llama_io_uring_stats{};
+}
+bool llama_io_uring_context::is_direct_io() const {
+    return pimpl && pimpl->is_direct;
+}
+bool llama_io_uring_context::is_registered_buffers() const {
+    return pimpl && pimpl->session.buffers_registered;
+}
+bool llama_io_uring_context::is_sqpoll() const {
+    return pimpl && pimpl->session.is_sqpoll;
+}
+bool llama_io_uring_context::is_valid() const {
+    return pimpl && pimpl->session.ring_fd >= 0;
+}
+void llama_io_uring_context::cleanup() {
+    if (pimpl) pimpl->cleanup();
+}
+
 #else
 
 // Non-Linux Stubs
@@ -410,5 +648,22 @@ bool llama_io_uring_read_file(
 ) {
     return false;
 }
+
+struct llama_io_uring_context::impl {};
+llama_io_uring_context::llama_io_uring_context() = default;
+llama_io_uring_context::~llama_io_uring_context() = default;
+llama_io_uring_context::llama_io_uring_context(llama_io_uring_context &&) noexcept = default;
+llama_io_uring_context & llama_io_uring_context::operator=(llama_io_uring_context &&) noexcept = default;
+bool llama_io_uring_context::init(int, void *, size_t, const llama_io_uring_config &) { return false; }
+uint64_t llama_io_uring_context::submit_read(size_t, void *, size_t, uint64_t) { return 0; }
+bool llama_io_uring_context::poll_completion(uint64_t, bool) { return false; }
+bool llama_io_uring_context::wait_all() { return true; }
+size_t llama_io_uring_context::in_flight() const { return 0; }
+llama_io_uring_stats llama_io_uring_context::get_stats() const { return {}; }
+bool llama_io_uring_context::is_direct_io() const { return false; }
+bool llama_io_uring_context::is_registered_buffers() const { return false; }
+bool llama_io_uring_context::is_sqpoll() const { return false; }
+bool llama_io_uring_context::is_valid() const { return false; }
+void llama_io_uring_context::cleanup() {}
 
 #endif

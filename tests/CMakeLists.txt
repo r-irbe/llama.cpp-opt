@@ -223,6 +223,9 @@ target_include_directories(test-cohort-prefix-sharing PRIVATE ${PROJECT_SOURCE_D
 
 llama_build_and_test(test-io-uring.cpp)
 
+llama_build_and_test(test-moe-dma-prefetch.cpp)
+target_include_directories(test-moe-dma-prefetch PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/ggml/src)
+
 llama_build_and_test(test-model-loader-npmc.cpp)
 target_include_directories(test-model-loader-npmc PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
 
