@@ -2833,6 +2833,11 @@ llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int i
             return entry.first;
         }
     }
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        if (tensor_name == ::format("blk.%d.engram_kv.weight", il)) return LLM_TENSOR_ENGRAM_WKV;
+        if (tensor_name == ::format("blk.%d.engram_k_norm.weight", il)) return LLM_TENSOR_ENGRAM_K;
+        if (tensor_name == ::format("blk.%d.engram_q_norm.weight", il)) return LLM_TENSOR_ENGRAM_Q;
+    }
     return LLM_TENSOR_UNKNOWN;
 }
 
