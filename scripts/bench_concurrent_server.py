@@ -101,6 +101,8 @@ def send_request(server_url: str, prompt: str, cohort_id: str, prompt_cache_key:
     }
 
     data = json.dumps(payload).encode("utf-8")
+    if not server_url.rstrip("/").endswith("/completion"):
+        server_url = server_url.rstrip("/") + "/completion"
     req = urllib.request.Request(server_url, data=data, headers=headers)
 
     t0 = time.perf_counter()
