@@ -197,14 +197,25 @@ void llm_load_hparams(
     hparams.rope_finetuned = rope_finetuned;
 
     hparams.n_ctx_orig_yarn = hparams.n_ctx_train;
-    ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false);
+    if (!ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false)) {
+        float orig_ctx_f = 0.0f;
+        if (ml.get_key("deepseek41.rope_scaling.original_max_position_embeddings", orig_ctx_f, false) && orig_ctx_f > 0.0f) {
+            hparams.n_ctx_orig_yarn = (uint32_t) orig_ctx_f;
+        }
+    }
 
     // rope_freq_base (optional)
     hparams.rope_freq_base_train = 10000.0f;
     ml.get_key(LLM_KV_ROPE_FREQ_BASE, hparams.rope_freq_base_train, false);
 
     std::string rope_scaling("linear");
-    ml.get_key(LLM_KV_ROPE_SCALING_TYPE, rope_scaling, false);
+    if (!ml.get_key(LLM_KV_ROPE_SCALING_TYPE, rope_scaling, false)) {
+        float beta_fast = 0.0f;
+        if ((ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, beta_fast, false) && beta_fast > 0.0f) ||
+            model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) {
+            rope_scaling = "yarn";
+        }
+    }
     hparams.rope_scaling_type_train = llama_rope_scaling_type_from_string(rope_scaling);
     GGML_ASSERT(hparams.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED);
 
@@ -2101,8 +2112,10 @@ void llm_load_hparams(
                 const uint32_t dsv4_probe_layer = hparams.n_layer > dsv4_probe_offset
                     ? hparams.n_layer - dsv4_probe_offset
                     : 0;
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+                if (hparams.f_norm_rms_eps <= 0.0f) {
+                    hparams.f_norm_rms_eps = 1e-6f;
+                }
                 // GLM-DSA lightning-indexer k_norm is a (non-RMS) LayerNorm built via LLM_NORM,
                 // which uses hparams.f_norm_eps in ggml_norm(). The GGUF only carries the RMS eps,
                 // so f_norm_eps stays 0 and CPU ggml_norm aborts (GGML_ASSERT(eps > 0)). On CUDA
@@ -2122,8 +2135,14 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
 
                 if (is_dsv4) {
-                    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_limits,   hparams.n_layer);
-                    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,   hparams.swiglu_limits_shared, hparams.n_layer, 0)) {
+                    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_limits, hparams.n_layer, false)) {
+                        float swiglu_limit = 10.0f;
+                        if (ml.get_key("deepseek41.swiglu_limit", swiglu_limit, false) ||
+                            ml.get_key("deepseek4.swiglu_limit", swiglu_limit, false)) {
+                            std::fill(hparams.swiglu_limits.begin(), hparams.swiglu_limits.end(), swiglu_limit);
+                        }
+                    }
+                    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_limits_shared, hparams.n_layer, 0)) {
                         hparams.swiglu_limits_shared = hparams.swiglu_limits;
                     }
                 }
@@ -2231,10 +2250,16 @@ void llm_load_hparams(
                             ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), ids);
                             std::copy_n(ids.begin(), std::min<size_t>(ids.size(), LLAMA_MAX_LAYERS), hparams.engram_layer_ids.begin());
                         }
-                        ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
-                        ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
-                        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
-                        ml.get_key(LLM_KV_ENGRAM_PAD_ID,         model.engram_pad_id);
+                        if (!ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT, hparams.engram_n_head, false)) {
+                            hparams.engram_n_head = 8;
+                        }
+                        if (!ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH, hparams.engram_key_length, false)) {
+                            hparams.engram_key_length = 256;
+                        }
+                        if (!ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size, false)) {
+                            hparams.engram_max_ngram_size = 4;
+                        }
+                        ml.get_key(LLM_KV_ENGRAM_PAD_ID, model.engram_pad_id, false);
                         if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
                             throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
                         }
@@ -2245,7 +2270,20 @@ void llm_load_hparams(
                         }
                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS),     model.engram_offsets);
+                        if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS), model.engram_offsets, false)) {
+                            const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
+                            model.engram_offsets.resize(model.engram_primes.size());
+                            for (uint32_t l = 0; l < hparams.engram_n_layer; ++l) {
+                                uint64_t cur_offset = 0;
+                                for (size_t b = 0; b < n_bucket; ++b) {
+                                    size_t idx = l * n_bucket + b;
+                                    if (idx < model.engram_offsets.size()) {
+                                        model.engram_offsets[idx] = cur_offset;
+                                        cur_offset += model.engram_primes[idx];
+                                    }
+                                }
+                            }
+                        }
                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP),   model.engram_token_map);
                         const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                         if (model.engram_multipliers.size() != (size_t) hparams.engram_n_layer * hparams.engram_max_ngram_size) {
@@ -2266,7 +2304,7 @@ void llm_load_hparams(
                             throw std::runtime_error("DeepSeek-V4 compress_ratios is shorter than block_count");
                         }
                         std::vector<uint32_t> compress_ratios;
-                        ml.get_arr(ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS), compress_ratios);
+                        ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
                         std::copy_n(compress_ratios.begin(), hparams.n_layer, hparams.dsv4_compress_ratios.begin());
                     } else {
                         for (uint32_t il = 0; il < hparams.n_layer; ++il) {

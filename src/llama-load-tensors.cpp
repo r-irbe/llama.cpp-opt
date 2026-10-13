@@ -3669,9 +3669,18 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
         // so -ngl never moves it off the file mapping
         layer.engram_embd = create_tensor_from_meta(ctx_input, format("blk.%d.engram_embd.weight", i), llama_model_loader::TENSOR_NOT_REQUIRED);
         if (layer.engram_embd) {
-            layer.engram_wkv = create_tensor_from_meta(ctx_split, format("blk.%d.engram_wkv.weight", i));
-            layer.engram_k   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_k.weight", i));
-            layer.engram_q   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_q.weight", i));
+            layer.engram_wkv = create_tensor_from_meta(ctx_split, pick_tensor_name({
+                format("blk.%d.engram_wkv.weight", i),
+                format("blk.%d.engram_kv.weight", i),
+            }));
+            layer.engram_k   = create_tensor_from_meta(ctx_split, pick_tensor_name({
+                format("blk.%d.engram_k.weight", i),
+                format("blk.%d.engram_k_norm.weight", i),
+            }));
+            layer.engram_q   = create_tensor_from_meta(ctx_split, pick_tensor_name({
+                format("blk.%d.engram_q.weight", i),
+                format("blk.%d.engram_q_norm.weight", i),
+            }));
         }
 
     }
