@@ -1100,6 +1100,10 @@ static ggml_tensor * ds4_build_engram(ggml_context * ctx0, llm_build_context & l
     lctx.inp_engram_rows[eg] = rows;
 
     ggml_tensor * emb = ggml_get_rows(ctx0, layer.engram_embd, rows);          // [key_len, n_cols*nt] f32
+    if (layer.engram_embd->ne[0] > key_len) {
+        // e4m3_e8m0_32_row264: slice the 256 embedding components from the 264-byte row
+        emb = ggml_cont(ctx0, ggml_view_2d(ctx0, emb, key_len, n_cols*nt, emb->nb[1], 0));
+    }
     emb = ggml_reshape_2d(ctx0, emb, n_cols*key_len, nt);
     cb(emb, "engram_embd", il);
 
