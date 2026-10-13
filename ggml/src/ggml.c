@@ -20219,6 +20219,121 @@ static void ggml_compute_forward_get_rows_bf16(
     }
 }
 
+static const float e4m3_lut[256] = {
+        0.000000f,     0.001953f,     0.003906f,     0.005859f,     0.007812f,     0.009766f,     0.011719f,     0.013672f,
+        0.015625f,     0.017578f,     0.019531f,     0.021484f,     0.023438f,     0.025391f,     0.027344f,     0.029297f,
+        0.031250f,     0.035156f,     0.039062f,     0.042969f,     0.046875f,     0.050781f,     0.054688f,     0.058594f,
+        0.062500f,     0.070312f,     0.078125f,     0.085938f,     0.093750f,     0.101562f,     0.109375f,     0.117188f,
+        0.125000f,     0.140625f,     0.156250f,     0.171875f,     0.187500f,     0.203125f,     0.218750f,     0.234375f,
+        0.250000f,     0.281250f,     0.312500f,     0.343750f,     0.375000f,     0.406250f,     0.437500f,     0.468750f,
+        0.500000f,     0.562500f,     0.625000f,     0.687500f,     0.750000f,     0.812500f,     0.875000f,     0.937500f,
+        1.000000f,     1.125000f,     1.250000f,     1.375000f,     1.500000f,     1.625000f,     1.750000f,     1.875000f,
+        2.000000f,     2.250000f,     2.500000f,     2.750000f,     3.000000f,     3.250000f,     3.500000f,     3.750000f,
+        4.000000f,     4.500000f,     5.000000f,     5.500000f,     6.000000f,     6.500000f,     7.000000f,     7.500000f,
+        8.000000f,     9.000000f,    10.000000f,    11.000000f,    12.000000f,    13.000000f,    14.000000f,    15.000000f,
+       16.000000f,    18.000000f,    20.000000f,    22.000000f,    24.000000f,    26.000000f,    28.000000f,    30.000000f,
+       32.000000f,    36.000000f,    40.000000f,    44.000000f,    48.000000f,    52.000000f,    56.000000f,    60.000000f,
+       64.000000f,    72.000000f,    80.000000f,    88.000000f,    96.000000f,   104.000000f,   112.000000f,   120.000000f,
+      128.000000f,   144.000000f,   160.000000f,   176.000000f,   192.000000f,   208.000000f,   224.000000f,   240.000000f,
+      256.000000f,   288.000000f,   320.000000f,   352.000000f,   384.000000f,   416.000000f,   448.000000f,     0.000000f,
+       -0.000000f,    -0.001953f,    -0.003906f,    -0.005859f,    -0.007812f,    -0.009766f,    -0.011719f,    -0.013672f,
+       -0.015625f,    -0.017578f,    -0.019531f,    -0.021484f,    -0.023438f,    -0.025391f,    -0.027344f,    -0.029297f,
+       -0.031250f,    -0.035156f,    -0.039062f,    -0.042969f,    -0.046875f,    -0.050781f,    -0.054688f,    -0.058594f,
+       -0.062500f,    -0.070312f,    -0.078125f,    -0.085938f,    -0.093750f,    -0.101562f,    -0.109375f,    -0.117188f,
+       -0.125000f,    -0.140625f,    -0.156250f,    -0.171875f,    -0.187500f,    -0.203125f,    -0.218750f,    -0.234375f,
+       -0.250000f,    -0.281250f,    -0.312500f,    -0.343750f,    -0.375000f,    -0.406250f,    -0.437500f,    -0.468750f,
+       -0.500000f,    -0.562500f,    -0.625000f,    -0.687500f,    -0.750000f,    -0.812500f,    -0.875000f,    -0.937500f,
+       -1.000000f,    -1.125000f,    -1.250000f,    -1.375000f,    -1.500000f,    -1.625000f,    -1.750000f,    -1.875000f,
+       -2.000000f,    -2.250000f,    -2.500000f,    -2.750000f,    -3.000000f,    -3.250000f,    -3.500000f,    -3.750000f,
+       -4.000000f,    -4.500000f,    -5.000000f,    -5.500000f,    -6.000000f,    -6.500000f,    -7.000000f,    -7.500000f,
+       -8.000000f,    -9.000000f,   -10.000000f,   -11.000000f,   -12.000000f,   -13.000000f,   -14.000000f,   -15.000000f,
+      -16.000000f,   -18.000000f,   -20.000000f,   -22.000000f,   -24.000000f,   -26.000000f,   -28.000000f,   -30.000000f,
+      -32.000000f,   -36.000000f,   -40.000000f,   -44.000000f,   -48.000000f,   -52.000000f,   -56.000000f,   -60.000000f,
+      -64.000000f,   -72.000000f,   -80.000000f,   -88.000000f,   -96.000000f,  -104.000000f,  -112.000000f,  -120.000000f,
+     -128.000000f,  -144.000000f,  -160.000000f,  -176.000000f,  -192.000000f,  -208.000000f,  -224.000000f,  -240.000000f,
+     -256.000000f,  -288.000000f,  -320.000000f,  -352.000000f,  -384.000000f,  -416.000000f,  -448.000000f,     0.000000f,
+};
+
+static void ggml_compute_forward_get_rows_i8(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+
+    assert(ne0  == nc);
+    assert(ne02 == ne11);
+    assert(nb00 == sizeof(int8_t));
+    assert(ggml_nrows(dst) == nr);
+
+    const struct ggml_thread_tile tile = ggml_get_thread_tile(params, nr, nc, 1024);
+    const int64_t tc = tile.ic1 - tile.ic0;
+
+    if (tc > 0) {
+        if (nc == 264) {
+            // DwarfStar e4m3_e8m0_32_row264:
+            // 8 blocks of 32 FP8 e4m3 elements (256 bytes) followed by 8 scale bytes (e8m0)
+            for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+                const int64_t i12 = i/(ne11*ne10);
+                const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+                const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+                const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+                float * dst_row = (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3);
+                if (i01 >= 0 && i01 < ne01) {
+                    const uint8_t * src_row = (const uint8_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03);
+                    const uint8_t * scales  = src_row + 256;
+                    for (int64_t j = tile.ic0; j < tile.ic1; ++j) {
+                        if (j < 256) {
+                            int blk = (int)(j / 32);
+                            uint8_t sc_byte = scales[blk];
+                            float sc = 0.0f;
+                            if (sc_byte > 0) {
+                                uint32_t u = (uint32_t)sc_byte << 23;
+                                memcpy(&sc, &u, sizeof(float));
+                            }
+                            dst_row[j] = e4m3_lut[src_row[j]] * sc;
+                        } else {
+                            uint8_t sc_byte = src_row[j];
+                            float sc = 0.0f;
+                            if (sc_byte > 0) {
+                                uint32_t u = (uint32_t)sc_byte << 23;
+                                memcpy(&sc, &u, sizeof(float));
+                            }
+                            dst_row[j] = sc;
+                        }
+                    }
+                } else {
+                    memset(dst_row + tile.ic0, 0, tc * sizeof(float));
+                }
+            }
+        } else {
+            // Generic int8 conversion to float
+            for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+                const int64_t i12 = i/(ne11*ne10);
+                const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+                const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+                const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+                float * dst_row = (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3);
+                if (i01 >= 0 && i01 < ne01) {
+                    const int8_t * src_row = (const int8_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03);
+                    for (int64_t j = tile.ic0; j < tile.ic1; ++j) {
+                        dst_row[j] = (float)src_row[j];
+                    }
+                } else {
+                    memset(dst_row + tile.ic0, 0, tc * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_get_rows_f32(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -20429,6 +20544,10 @@ static void ggml_compute_forward_get_rows(
         case GGML_TYPE_BF16:
             {
                 ggml_compute_forward_get_rows_bf16(params, dst);
+            } break;
+        case GGML_TYPE_I8:
+            {
+                ggml_compute_forward_get_rows_i8(params, dst);
             } break;
         case GGML_TYPE_F32:
         case GGML_TYPE_I32:
