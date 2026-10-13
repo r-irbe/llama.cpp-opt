@@ -82,19 +82,53 @@ def parse_arguments():
         help="Number of CPU threads to use during batch processing (default: 14)"
     )
     parser.add_argument(
+        "-fa", "--flash-attn",
+        action="store_true",
+        default=True,
+        help="Enable Flash Attention (default: True)"
+    )
+    parser.add_argument(
+        "--no-fa",
+        dest="flash_attn",
+        action="store_false",
+        help="Disable Flash Attention"
+    )
+    parser.add_argument(
+        "-b", "--batch-size",
+        type=int,
+        default=2048,
+        help="Batch size for prompt processing (default: 2048)"
+    )
+    parser.add_argument(
+        "-ub", "--ubatch-size",
+        type=int,
+        default=512,
+        help="Physical micro-batch size (default: 512)"
+    )
+    parser.add_argument(
         "--numa",
-        default="expert",
-        help="NUMA policy (default: expert, or split/isolate/distribute/none)"
+        default=None,
+        help="NUMA policy (default: None, or split/isolate/distribute/expert)"
     )
     parser.add_argument(
         "-sm", "--split-mode",
-        default="graph",
-        help="Split mode for GPU acceleration (default: graph)"
+        default=None,
+        help="Split mode for multi-GPU acceleration (default: None, or layer/graph)"
     )
     parser.add_argument(
         "-ot", "--tensor-override",
-        default=r"^blk\..*\.ffn_.*_exps.*=CPU",
-        help="Tensor override pattern for selective host/device placement"
+        default=None,
+        help="Tensor override pattern for selective host/device placement (e.g. ^blk\\..*\\.ffn_.*_exps.*=CPU)"
+    )
+    parser.add_argument(
+        "--spec-type",
+        default=None,
+        help="Speculative decoding stage type (e.g. ngram-mod:n_max=16,n_min=2, mtp, dflash)"
+    )
+    parser.add_argument(
+        "-md", "--model-draft",
+        default=None,
+        help="Draft model path for speculative decoding"
     )
     parser.add_argument(
         "--defer-ple",
@@ -143,24 +177,52 @@ def estimate_stage_duration(ctx_len: int, n_predict: int, is_huge_model: bool) -
     return round(base_overhead + pp_sec + tg_sec, 1)
 
 
-def parse_llama_cli_output(output: str, elapsed_sec: float) -> dict:
+def parse_llama_cli_output(output: str, elapsed_sec: float, returncode: int = 0) -> dict:
     """Extracts performance metrics from llama-cli stdout and stderr."""
+    if returncode != 0:
+        error_lines = [
+            line.strip() for line in output.splitlines()
+            if any(err_kw in line.lower() for err_kw in ["error", "failed", "unable to load", "out of memory", "cuda error"])
+        ]
+        err_msg = error_lines[-1] if error_lines else f"llama-cli process failed with exit code {returncode}"
+        return {
+            "error": err_msg,
+            "pp_ms": 0.0,
+            "pp_tokens": 0,
+            "pp_tps": 0.0,
+            "tg_ms": 0.0,
+            "tg_tokens": 0,
+            "tg_tps": 0.0,
+            "ttft_ms": 0.0
+        }
+
     pp_match = re.search(
-        r"prompt eval time =\s+([\d\.]+)\s+ms\s+/\s+(\d+)\s+tokens\s+\(\s*[\d\.]+\s+ms per token,\s+([\d\.]+)\s+tokens per second\)",
+        r"prompt eval time\s*=\s*([\d\.]+)\s*ms\s*/\s*(\d+)\s*tokens\s*\(\s*[\d\.]+\s*ms per token,\s*([\d\.]+)\s*tokens per second\)",
         output
     )
+    # Negative lookbehind (?<!prompt ) prevents matching 'prompt eval time'
     tg_match = re.search(
-        r"eval time =\s+([\d\.]+)\s+ms\s+/\s+(\d+)\s+tokens\s+\(\s*[\d\.]+\s+ms per token,\s+([\d\.]+)\s+tokens per second\)",
+        r"(?<!prompt )eval time\s*=\s*([\d\.]+)\s*ms\s*/\s*(\d+)\s*tokens\s*\(\s*[\d\.]+\s*ms per token,\s*([\d\.]+)\s*tokens per second\)",
         output
     )
 
-    pp_ms = float(pp_match.group(1)) if pp_match else (elapsed_sec * 0.4 * 1000.0)
-    pp_tokens = int(pp_match.group(2)) if pp_match else 1
-    pp_tps = float(pp_match.group(3)) if pp_match else (pp_tokens / max(0.001, pp_ms / 1000.0))
+    if pp_match:
+        pp_ms = float(pp_match.group(1))
+        pp_tokens = int(pp_match.group(2))
+        pp_tps = float(pp_match.group(3))
+    else:
+        pp_ms = 0.0
+        pp_tokens = 0
+        pp_tps = 0.0
 
-    tg_ms = float(tg_match.group(1)) if tg_match else (elapsed_sec * 0.6 * 1000.0)
-    tg_tokens = int(tg_match.group(2)) if tg_match else 1
-    tg_tps = float(tg_match.group(3)) if tg_match else (tg_tokens / max(0.001, tg_ms / 1000.0))
+    if tg_match:
+        tg_ms = float(tg_match.group(1))
+        tg_tokens = int(tg_match.group(2))
+        tg_tps = float(tg_match.group(3))
+    else:
+        tg_ms = 0.0
+        tg_tokens = 0
+        tg_tps = 0.0
 
     ttft_ms = pp_ms
 
@@ -306,7 +368,14 @@ def main():
         eta_sec = estimate_stage_duration(ctx_len, args.n_predict, is_huge_model)
         print(f"\n>>> [Stage {idx}/{total_stages}: Context = {ctx_len:,} Tokens] ETA: ~{eta_sec:.1f}s | Evaluating prompt processing & decode...")
 
-        stage_prompt = base_prompt[:min(len(base_prompt), max(120, ctx_len * 3))]
+        # Scale prompt text safely within context budget (ctx_len - n_predict - margin)
+        safe_prompt_tokens = max(16, ctx_len - args.n_predict - 16)
+        target_chars = int(safe_prompt_tokens * 2.8)
+        if len(base_prompt) < target_chars:
+            multiplier = (target_chars // max(1, len(base_prompt))) + 1
+            stage_prompt = ("\n\n" + (base_prompt.strip() + " ") * multiplier)[:target_chars].strip()
+        else:
+            stage_prompt = base_prompt[:target_chars].strip()
 
         stage_start = time.time()
         if is_endpoint_mode:
@@ -341,9 +410,13 @@ def main():
                 "-n", str(args.n_predict),
                 "--temp", "0",
                 "-c", str(ctx_len),
+                "-b", str(args.batch_size),
+                "-ub", str(args.ubatch_size),
                 "-t", str(args.threads),
                 "-tb", str(args.threads_batch)
             ]
+            if args.flash_attn:
+                cmd.extend(["-fa", "1"])
             if args.n_gpu_layers > 0:
                 cmd.extend(["-ngl", str(args.n_gpu_layers)])
             if args.split_mode:
@@ -352,6 +425,10 @@ def main():
                 cmd.extend(["-ot", args.tensor_override])
             if args.numa:
                 cmd.extend(["--numa", args.numa])
+            if args.spec_type:
+                cmd.extend(["--spec-type", args.spec_type])
+            if args.model_draft:
+                cmd.extend(["-md", str(args.model_draft)])
             if args.defer_ple:
                 cmd.append("--defer-ple")
             if args.defer_experts:
@@ -376,23 +453,29 @@ def main():
                 )
                 elapsed = time.time() - stage_start
                 out = proc.stdout + proc.stderr
-                metrics = parse_llama_cli_output(out, elapsed)
+                metrics = parse_llama_cli_output(out, elapsed, returncode=proc.returncode)
             except subprocess.TimeoutExpired:
                 elapsed = time.time() - stage_start
                 print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] TIMEOUT after {elapsed:.1f}s", file=sys.stderr)
-                metrics = {"pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
+                metrics = {"error": "TimeoutExpired", "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
             except Exception as e:
                 elapsed = time.time() - stage_start
                 print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] ERROR: {e}", file=sys.stderr)
-                metrics = {"pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
+                metrics = {"error": str(e), "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
 
-        print(
-            f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
-            f"DONE in {elapsed:>5.2f}s (ETA: {eta_sec:>5.1f}s) | "
-            f"PP: {metrics['pp_tps']:>7.2f} t/s ({metrics['pp_ms']:>7.1f} ms) | "
-            f"TG: {metrics['tg_tps']:>5.2f} t/s ({metrics['tg_ms']:>6.1f} ms) | "
-            f"TTFT: {metrics['ttft_ms']:>7.1f} ms"
-        )
+        if "error" in metrics:
+            print(
+                f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
+                f"FAILED in {elapsed:>5.2f}s | Error: {metrics['error']}"
+            )
+        else:
+            print(
+                f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
+                f"DONE in {elapsed:>5.2f}s (ETA: {eta_sec:>5.1f}s) | "
+                f"PP: {metrics['pp_tps']:>7.2f} t/s ({metrics['pp_ms']:>7.1f} ms) | "
+                f"TG: {metrics['tg_tps']:>5.2f} t/s ({metrics['tg_ms']:>6.1f} ms) | "
+                f"TTFT: {metrics['ttft_ms']:>7.1f} ms"
+            )
 
         stage_results.append({
             "stage": idx,
