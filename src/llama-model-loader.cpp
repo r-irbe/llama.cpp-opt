@@ -1300,11 +1300,21 @@ bool llama_model_loader::get_key_or_arr(const enum llm_kv kid, T & result, uint3
 
     bool found = false;
     switch (kid) {
-        case LLM_KV_ATTENTION_SLIDING_WINDOW:
-            found = get_key_or_arr(arch_name + ".sliding_window", result, n, false);
+        case LLM_KV_ATTENTION_HEAD_COUNT:
+            found = get_key_or_arr(arch_name + ".num_attention_heads", result, n, false);
             break;
         case LLM_KV_ATTENTION_HEAD_COUNT_KV:
             found = get_key_or_arr(arch_name + ".num_key_value_heads", result, n, false);
+            break;
+        case LLM_KV_FEED_FORWARD_LENGTH:
+            found = get_key_or_arr(arch_name + ".intermediate_size", result, n, false);
+            break;
+        case LLM_KV_EXPERT_FEED_FORWARD_LENGTH:
+            found = get_key_or_arr(arch_name + ".moe_intermediate_size", result, n, false) ||
+                    get_key_or_arr(arch_name + ".intermediate_size", result, n, false);
+            break;
+        case LLM_KV_ATTENTION_SLIDING_WINDOW:
+            found = get_key_or_arr(arch_name + ".sliding_window", result, n, false);
             break;
         default:
             break;
@@ -1326,14 +1336,43 @@ bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool
     int id = gguf_find_key(meta, key.c_str());
 
     if (id < 0) {
-        if (kid == LLM_KV_ATTENTION_SLIDING_WINDOW) {
-            std::string alt = arch_name + ".sliding_window";
-            id = gguf_find_key(meta, alt.c_str());
-            if (id >= 0) key = alt;
-        } else if (kid == LLM_KV_ATTENTION_HEAD_COUNT_KV) {
-            std::string alt = arch_name + ".num_key_value_heads";
-            id = gguf_find_key(meta, alt.c_str());
-            if (id >= 0) key = alt;
+        switch (kid) {
+            case LLM_KV_ATTENTION_HEAD_COUNT: {
+                std::string alt = arch_name + ".num_attention_heads";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_ATTENTION_HEAD_COUNT_KV: {
+                std::string alt = arch_name + ".num_key_value_heads";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_FEED_FORWARD_LENGTH: {
+                std::string alt = arch_name + ".intermediate_size";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_EXPERT_FEED_FORWARD_LENGTH: {
+                std::string alt = arch_name + ".moe_intermediate_size";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id < 0) {
+                    alt = arch_name + ".intermediate_size";
+                    id = gguf_find_key(meta, alt.c_str());
+                }
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_ATTENTION_SLIDING_WINDOW: {
+                std::string alt = arch_name + ".sliding_window";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            default:
+                break;
         }
     }
 
