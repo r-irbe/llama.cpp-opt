@@ -58,6 +58,12 @@ def parse_arguments():
         help="Prompt text to evaluate"
     )
     parser.add_argument(
+        "-pf", "--prompt-file",
+        type=str,
+        default=None,
+        help="Optional path to text file containing prompt corpus (e.g. promessi_sposi.txt or wiki.test.raw)"
+    )
+    parser.add_argument(
         "-ngl", "--n-gpu-layers",
         type=int,
         default=999,
@@ -275,6 +281,17 @@ def main():
         print(f"  Execution Target: OPENAI-COMPATIBLE API -> {args.endpoint}")
     else:
         print(f"  Model Size      : {file_size_gb:.1f} GiB ({'HUGE MODEL' if is_huge_model else 'STANDARD'})")
+
+    base_prompt = args.prompt
+    if args.prompt_file:
+        pf = Path(args.prompt_file).resolve()
+        if pf.exists():
+            with open(pf, "r", encoding="utf-8", errors="replace") as f:
+                base_prompt = f.read()
+            print(f"  Prompt Source   : FILE ({pf.name}, {len(base_prompt):,} chars)")
+        else:
+            print(f"Warning: Prompt file '{args.prompt_file}' not found, falling back to default.", file=sys.stderr)
+
     print(f"  Context Stages  : {total_stages} Stages -> {[f'{c:,}' for c in context_lengths]}")
     print(f"  Tokens / Stage  : {args.n_predict} Generated Tokens")
     if not is_endpoint_mode:
@@ -289,12 +306,14 @@ def main():
         eta_sec = estimate_stage_duration(ctx_len, args.n_predict, is_huge_model)
         print(f"\n>>> [Stage {idx}/{total_stages}: Context = {ctx_len:,} Tokens] ETA: ~{eta_sec:.1f}s | Evaluating prompt processing & decode...")
 
+        stage_prompt = base_prompt[:min(len(base_prompt), max(120, ctx_len * 3))]
+
         stage_start = time.time()
         if is_endpoint_mode:
             metrics = query_openai_endpoint(
                 endpoint=args.endpoint,
                 model=args.model,
-                prompt=args.prompt,
+                prompt=stage_prompt,
                 ctx_len=ctx_len,
                 n_predict=args.n_predict,
                 timeout=max(300, int(eta_sec * 3.0))
@@ -307,7 +326,7 @@ def main():
             elapsed = 0.1
             metrics = {
                 "pp_ms": round(15.0 + ctx_len * 0.05, 2),
-                "pp_tokens": len(args.prompt.split()),
+                "pp_tokens": len(stage_prompt.split()),
                 "pp_tps": round(1000.0 / (1.0 + ctx_len * 0.002), 2),
                 "tg_ms": round(args.n_predict * 60.0, 2),
                 "tg_tokens": args.n_predict,
@@ -318,7 +337,7 @@ def main():
             cmd = [
                 "./build/bin/llama-cli",
                 "-m", str(model_path),
-                "-p", args.prompt,
+                "-p", stage_prompt,
                 "-n", str(args.n_predict),
                 "--temp", "0",
                 "-c", str(ctx_len),
