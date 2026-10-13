@@ -265,6 +265,11 @@ target_include_directories(test-eytzinger-layout PRIVATE ${PROJECT_SOURCE_DIR}/c
 llama_build_and_test(test-unreal-selector.cpp)
 target_include_directories(test-unreal-selector PRIVATE ${PROJECT_SOURCE_DIR}/common)
 
+if (GGML_CUDA)
+    llama_build_and_test(test-cuda-l2-persistence.cpp)
+    target_include_directories(test-cuda-l2-persistence PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
+
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 

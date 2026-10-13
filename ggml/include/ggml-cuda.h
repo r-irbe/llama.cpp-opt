@@ -46,6 +46,10 @@ GGML_API GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log
 
 GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
 
+// L2 cache residency control (Ada Lovelace sm_89 / Ampere sm_80)
+GGML_API GGML_CALL void ggml_backend_cuda_set_l2_persistence_window(ggml_backend_t backend, void * base_ptr, size_t num_bytes, float hit_ratio);
+GGML_API GGML_CALL void ggml_backend_cuda_get_l2_cache_info(int device, size_t * l2_size, size_t * max_persisting_size, size_t * cur_persisting_limit);
+
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
 #ifdef  __cplusplus
 }

@@ -517,7 +517,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     // The minimum granularity with cp.async is 16 bytes, with synchronous data loading it's 4 bytes.
 
     if constexpr (use_cp_async) {
-        constexpr int preload = 64;
+        constexpr int preload = 128;
         constexpr int h2_per_chunk = 16/sizeof(half2);
         const int chunks_per_row = D2 / h2_per_chunk;
 

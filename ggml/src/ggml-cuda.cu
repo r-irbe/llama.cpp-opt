@@ -253,6 +253,36 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+
+        info.devices[id].l2_cache_size = prop.l2CacheSize;
+        info.devices[id].persisting_l2_cache_max_size = prop.persistingL2CacheMaxSize;
+
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+        if (prop.persistingL2CacheMaxSize > 0) {
+            size_t limit = prop.persistingL2CacheMaxSize;
+            const char * env_persist = getenv("GGML_CUDA_PERSISTING_L2_CACHE_SIZE");
+            if (env_persist) {
+                limit = (size_t) (atof(env_persist) * 1024.0 * 1024.0);
+                limit = std::min(limit, (size_t) prop.persistingL2CacheMaxSize);
+            }
+            const char * env_disable = getenv("GGML_CUDA_DISABLE_PERSISTING_L2");
+            if (env_disable && atoi(env_disable) != 0) {
+                limit = 0;
+            }
+
+            if (limit > 0) {
+                cudaError_t set_err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit);
+                if (set_err == cudaSuccess) {
+                    info.devices[id].persisting_l2_cache_cur_limit = limit;
+                    GGML_CUDA_LOG_INFO("    L2 cache: %.2f MiB, persistent L2 window: %.2f MiB (max: %.2f MiB)\n",
+                        prop.l2CacheSize / (1024.0 * 1024.0), limit / (1024.0 * 1024.0),
+                        prop.persistingL2CacheMaxSize / (1024.0 * 1024.0));
+                } else {
+                    cudaGetLastError(); // clear error
+                }
+            }
+        }
+#endif
     }
 
     for (int id = 0; id < info.device_count; ++id) {
@@ -425,6 +455,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
+
+    void * get_base_ptr() const override { return buffer_pool[0].ptr; }
+    size_t get_size() const override { return pool_size; }
+    size_t get_used() const override { return pool_size; }
 };
 
 // pool with virtual memory
@@ -521,6 +555,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) (pool_addr + pool_used));
     }
+
+    void * get_base_ptr() const override { return (void *) pool_addr; }
+    size_t get_size() const override { return pool_size; }
+    size_t get_used() const override { return pool_used; }
 };
 #endif // !defined(GGML_USE_HIPBLAS) && !defined(GGML_CUDA_NO_VMM) && !defined(GGML_USE_MUSA)
 
@@ -584,6 +622,88 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     //    info->all_ctx[device] = nullptr;
     //}
 
+}
+
+void ggml_backend_cuda_context::set_l2_persistence_window(cudaStream_t s, void * base_ptr, size_t num_bytes, float hit_ratio) {
+#if CUDART_VERSION >= 11000 && !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+    if (base_ptr == nullptr || num_bytes == 0) {
+        clear_l2_persistence_window(s);
+        return;
+    }
+
+    const auto & dev_info = ggml_cuda_info().devices[device];
+    if (dev_info.persisting_l2_cache_cur_limit == 0) {
+        return;
+    }
+
+    size_t window_bytes = std::min(num_bytes, dev_info.persisting_l2_cache_cur_limit);
+
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr = base_ptr;
+    attr.accessPolicyWindow.num_bytes = window_bytes;
+    attr.accessPolicyWindow.hitRatio = std::clamp(hit_ratio, 0.0f, 1.0f);
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+    CUDA_CHECK(cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &attr));
+    persisting_base_ptr  = base_ptr;
+    persisting_num_bytes = window_bytes;
+    persisting_hit_ratio = hit_ratio;
+#else
+    GGML_UNUSED(s);
+    GGML_UNUSED(base_ptr);
+    GGML_UNUSED(num_bytes);
+    GGML_UNUSED(hit_ratio);
+#endif
+}
+
+void ggml_backend_cuda_context::clear_l2_persistence_window(cudaStream_t s) {
+#if CUDART_VERSION >= 11000 && !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+    const auto & dev_info = ggml_cuda_info().devices[device];
+    if (dev_info.persisting_l2_cache_cur_limit == 0) {
+        return;
+    }
+
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio = 0.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyStreaming;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+    CUDA_CHECK(cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &attr));
+    persisting_base_ptr  = nullptr;
+    persisting_num_bytes = 0;
+    persisting_hit_ratio = 0.0f;
+#else
+    GGML_UNUSED(s);
+#endif
+}
+
+void ggml_backend_cuda_context::apply_l2_persistence_window(cudaStream_t s) {
+#if CUDART_VERSION >= 11000 && !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+    const auto & dev_info = ggml_cuda_info().devices[device];
+    if (dev_info.persisting_l2_cache_cur_limit == 0) {
+        return;
+    }
+
+    if (persisting_base_ptr != nullptr && persisting_num_bytes > 0) {
+        set_l2_persistence_window(s, persisting_base_ptr, persisting_num_bytes, persisting_hit_ratio);
+        return;
+    }
+
+    auto & p = pool(device);
+    void * base = p.get_base_ptr();
+    size_t used = p.get_used();
+    size_t sz = p.get_size();
+    size_t target_size = (used > 0) ? used : sz;
+
+    if (base != nullptr && target_size > 0) {
+        set_l2_persistence_window(s, base, target_size, 1.0f);
+    }
+#else
+    GGML_UNUSED(s);
+#endif
 }
 
 // cuda buffer
@@ -4826,6 +4946,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->apply_l2_persistence_window(cuda_ctx->stream());
 
 #ifdef USE_CUDA_GRAPH
     cuda_ctx->cur_graph = nullptr;
@@ -5691,3 +5812,26 @@ GGML_CALL int ggml_backend_cuda_reg_devices() {
     }
     return device_count;
 }
+
+extern "C" void ggml_backend_cuda_set_l2_persistence_window(ggml_backend_t backend, void * base_ptr, size_t num_bytes, float hit_ratio) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->set_l2_persistence_window(cuda_ctx->stream(), base_ptr, num_bytes, hit_ratio);
+}
+
+extern "C" void ggml_backend_cuda_get_l2_cache_info(int device, size_t * l2_size, size_t * max_persisting_size, size_t * cur_persisting_limit) {
+    const auto & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        if (l2_size) *l2_size = 0;
+        if (max_persisting_size) *max_persisting_size = 0;
+        if (cur_persisting_limit) *cur_persisting_limit = 0;
+        return;
+    }
+    const auto & dev = info.devices[device];
+    if (l2_size) *l2_size = dev.l2_cache_size;
+    if (max_persisting_size) *max_persisting_size = dev.persisting_l2_cache_max_size;
+    if (cur_persisting_limit) *cur_persisting_limit = dev.persisting_l2_cache_cur_limit;
+}
+
