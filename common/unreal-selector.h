@@ -8,6 +8,12 @@
 #include <queue>
 #include <memory>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
+#include <chrono>
+
+#include "llama.h"
+#include "common.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -282,5 +288,280 @@ private:
     config cfg_;
     std::vector<chunk_record> chunks_;
 };
+
+// =========================================================================================
+// UNREAL Token Embedder with Deduplicated Fast Lookup Cache
+// Retrieves token embeddings directly from model.tok_embd and caches L2-normalized vectors.
+// =========================================================================================
+class token_embedder {
+public:
+    explicit token_embedder(const struct llama_model * model) : model_(model) {
+        if (model_) {
+            d_ = llama_model_n_embd(model_);
+        }
+    }
+
+    int dim() const { return d_; }
+    bool is_valid() const { return model_ != nullptr && d_ > 0; }
+
+    bool get_embedding(llama_token token, float * dest) {
+        if (!is_valid() || !dest) return false;
+        auto it = cache_.find(token);
+        if (it != cache_.end()) {
+            std::memcpy(dest, it->second.data(), d_ * sizeof(float));
+            return true;
+        }
+
+        std::vector<float> vec(d_, 0.0f);
+        if (llama_model_get_token_embedding(model_, token, vec.data())) {
+            // L2 normalize vector for cosine similarity / dot product MaxSim
+            float norm = 0.0f;
+            for (int k = 0; k < d_; ++k) {
+                norm += vec[k] * vec[k];
+            }
+            norm = std::sqrt(norm);
+            if (norm > 1e-8f) {
+                float inv = 1.0f / norm;
+                for (int k = 0; k < d_; ++k) {
+                    vec[k] *= inv;
+                }
+            }
+            std::memcpy(dest, vec.data(), d_ * sizeof(float));
+            cache_.emplace(token, std::move(vec));
+            return true;
+        }
+        return false;
+    }
+
+private:
+    const struct llama_model * model_ = nullptr;
+    int d_ = 0;
+    std::unordered_map<llama_token, std::vector<float>> cache_;
+};
+
+// =========================================================================================
+// End-to-End UNREAL Long-Context Prompt Evidence Filter (arXiv:2610.08463)
+// - Partitions prompt into prefix, context haystack, and query spans
+// - Dynamically calculates N* break-even threshold if min_tokens <= 0
+// - Computes G query vectors and Lp chunk vectors via SIMD Late-Interaction MaxSim
+// - Incorporates lexical overlap BM25 boost (Section 2.1)
+// - Eliminates distractor chunks and restores original chronological order
+// =========================================================================================
+inline std::vector<llama_token> filter_prompt(
+    const struct llama_model * model,
+    const std::vector<llama_token> & prompt_tokens,
+    const gpt_params & params)
+{
+    if (!params.unreal_filter) {
+        return prompt_tokens;
+    }
+
+    const int N = (int)prompt_tokens.size();
+    int min_tokens = params.unreal_min_tokens;
+    if (min_tokens <= 0) {
+        // Automatic N* calculation (UNREAL Appendix C.2 Equation 10)
+        int64_t n_params = model ? llama_model_n_params(model) : 30000000000ULL;
+        int n_layer = model ? llama_n_layer(model) : 52;
+        int n_embd = model ? llama_model_n_embd(model) : 2688;
+        double n_star = selector::calculate_break_even_n(
+            n_params, n_layer, n_embd,
+            params.unreal_top_n, params.unreal_chunk_size,
+            64, 5, 0.2f);
+        min_tokens = (int)std::max(2048.0, n_star);
+    }
+
+    if (N <= min_tokens) {
+        return prompt_tokens;
+    }
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    // 1. Structure the prompt into:
+    //    - prefix_tokens (system prompt, instruction preamble)
+    //    - context_tokens (the long documents/haystack)
+    //    - query_tokens (the question/task)
+    int query_len = std::min(256, std::max(32, N / 16));
+    int prefix_len = std::min(128, std::max(16, N / 32));
+
+    // Ensure prefix and query do not overlap
+    if (prefix_len + query_len + params.unreal_chunk_size >= N) {
+        return prompt_tokens;
+    }
+
+    int context_start = prefix_len;
+    int context_len = (N - query_len) - prefix_len;
+    int chunk_size = params.unreal_chunk_size > 0 ? params.unreal_chunk_size : 140;
+
+    auto spans = selector::partition_prompt(context_len, chunk_size, 0);
+    if ((int)spans.size() <= params.unreal_top_n) {
+        // All chunks already fit within top_n budget
+        return prompt_tokens;
+    }
+
+    // 2. Set up UNREAL selector & Embedder
+    config cfg;
+    cfg.n_query_groups = params.unreal_query_groups > 0 ? params.unreal_query_groups : 4;
+    cfg.n_chunk_vectors = params.unreal_chunk_vectors > 0 ? params.unreal_chunk_vectors : 7;
+    cfg.chunk_size = chunk_size;
+
+    token_embedder embedder(model);
+    int d = embedder.dim();
+    bool use_embeddings = embedder.is_valid();
+
+    // Set of non-trivial query tokens for lexical matching (BM25 hybrid bonus)
+    std::unordered_set<llama_token> query_tokens_set;
+    for (int i = N - query_len; i < N; ++i) {
+        query_tokens_set.insert(prompt_tokens[i]);
+    }
+
+    // 3. Compute Query Representations: G pooled vectors of dimension d
+    std::vector<float> query_vecs;
+    if (use_embeddings) {
+        query_vecs.assign(cfg.n_query_groups * d, 0.0f);
+        int q_stride = (query_len + cfg.n_query_groups - 1) / cfg.n_query_groups;
+        std::vector<float> tok_vec(d);
+
+        for (int g = 0; g < cfg.n_query_groups; ++g) {
+            float * q_dst = query_vecs.data() + g * d;
+            int q_start = (N - query_len) + g * q_stride;
+            int q_end = std::min(N, q_start + q_stride);
+
+            for (int t = q_start; t < q_end; ++t) {
+                if (embedder.get_embedding(prompt_tokens[t], tok_vec.data())) {
+                    for (int k = 0; k < d; ++k) q_dst[k] += tok_vec[k];
+                }
+            }
+
+            // Normalize pooled vector
+            float norm = 0.0f;
+            for (int k = 0; k < d; ++k) norm += q_dst[k] * q_dst[k];
+            norm = std::sqrt(norm);
+            if (norm > 1e-8f) {
+                float inv = 1.0f / norm;
+                for (int k = 0; k < d; ++k) q_dst[k] *= inv;
+            }
+        }
+    }
+
+    // 4. Compute Chunk Representations and Add to Selector
+    selector sel(cfg);
+    std::vector<float> chunk_vecs;
+    if (use_embeddings) {
+        chunk_vecs.assign(cfg.n_chunk_vectors * d, 0.0f);
+    }
+    std::vector<float> tok_vec(d > 0 ? d : 1);
+
+    for (size_t i = 0; i < spans.size(); ++i) {
+        int c_start = context_start + spans[i].token_start;
+        int c_count = spans[i].token_count;
+
+        if (use_embeddings) {
+            std::fill(chunk_vecs.begin(), chunk_vecs.end(), 0.0f);
+            int p_stride = std::max(1, (c_count + cfg.n_chunk_vectors - 1) / cfg.n_chunk_vectors);
+
+            for (int p = 0; p < cfg.n_chunk_vectors; ++p) {
+                float * p_dst = chunk_vecs.data() + p * d;
+                int sub_start = c_start + p * p_stride;
+                int sub_end = std::min(c_start + c_count, sub_start + p_stride);
+
+                for (int t = sub_start; t < sub_end; ++t) {
+                    if (embedder.get_embedding(prompt_tokens[t], tok_vec.data())) {
+                        for (int k = 0; k < d; ++k) p_dst[k] += tok_vec[k];
+                    }
+                }
+
+                // Normalize pooled slice
+                float norm = 0.0f;
+                for (int k = 0; k < d; ++k) norm += p_dst[k] * p_dst[k];
+                norm = std::sqrt(norm);
+                if (norm > 1e-8f) {
+                    float inv = 1.0f / norm;
+                    for (int k = 0; k < d; ++k) p_dst[k] *= inv;
+                }
+            }
+
+            sel.add_chunk((int)i, 0, spans[i].token_start, c_count, chunk_vecs.data(), d);
+        }
+    }
+
+    // 5. Rank Chunks via SIMD MaxSim & Lexical Overlap
+    int top_n = std::min((int)spans.size(), params.unreal_top_n);
+    std::vector<int> selected_chunk_indices;
+
+    if (use_embeddings) {
+        auto ranked = sel.rank_chunks(query_vecs.data(), (int)spans.size(), d);
+
+        // Incorporate BM25/lexical boost (UNREAL Section 2.1)
+        for (auto & item : ranked) {
+            int chunk_idx = item.first;
+            int c_start = context_start + spans[chunk_idx].token_start;
+            int c_count = spans[chunk_idx].token_count;
+
+            int match_count = 0;
+            for (int t = c_start; t < c_start + c_count; ++t) {
+                if (query_tokens_set.count(prompt_tokens[t])) {
+                    match_count++;
+                }
+            }
+            float lexical_overlap = query_tokens_set.empty() ? 0.0f : (float)match_count / query_tokens_set.size();
+            item.second += 1.5f * lexical_overlap;
+        }
+
+        std::sort(ranked.begin(), ranked.end(), [](const std::pair<int, float> & a, const std::pair<int, float> & b) {
+            return a.second > b.second;
+        });
+
+        for (int k = 0; k < top_n && k < (int)ranked.size(); ++k) {
+            selected_chunk_indices.push_back(ranked[k].first);
+        }
+    } else {
+        // Fallback lexical overlap if no embeddings available
+        std::vector<std::pair<int, float>> scores;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            int c_start = context_start + spans[i].token_start;
+            int c_count = spans[i].token_count;
+            int match_count = 0;
+            for (int t = c_start; t < c_start + c_count; ++t) {
+                if (query_tokens_set.count(prompt_tokens[t])) match_count++;
+            }
+            scores.emplace_back((int)i, (float)match_count);
+        }
+        std::sort(scores.begin(), scores.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+        for (int k = 0; k < top_n && k < (int)scores.size(); ++k) {
+            selected_chunk_indices.push_back(scores[k].first);
+        }
+    }
+
+    // 6. Chronological Reassembly to preserve document context flow without distractors
+    auto reassembled_spans = selector::reassemble_selected_spans(spans, selected_chunk_indices);
+
+    // 7. Assemble Distractor-Free Filtered Prompt
+    std::vector<llama_token> filtered;
+    filtered.reserve(prefix_len + reassembled_spans.size() * chunk_size + query_len);
+
+    // 7a. Prepend prefix tokens
+    filtered.insert(filtered.end(), prompt_tokens.begin(), prompt_tokens.begin() + prefix_len);
+
+    // 7b. Append selected evidence chunks in original chronological order
+    for (const auto & span : reassembled_spans) {
+        int c_start = context_start + span.token_start;
+        int c_end = c_start + span.token_count;
+        filtered.insert(filtered.end(), prompt_tokens.begin() + c_start, prompt_tokens.begin() + c_end);
+    }
+
+    // 7c. Append query tokens
+    filtered.insert(filtered.end(), prompt_tokens.begin() + (N - query_len), prompt_tokens.end());
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    fprintf(stderr, "\nUNREAL: prompt compressed from %d to %d tokens (%.1fx compression, %.1f%% KV savings) in %.2f ms [selected %d/%d chunks]\n\n",
+        N, (int)filtered.size(),
+        (double)N / std::max(1, (int)filtered.size()),
+        (1.0 - (double)filtered.size() / N) * 100.0,
+        elapsed_ms, (int)reassembled_spans.size(), (int)spans.size());
+
+    return filtered;
+}
 
 } // namespace unreal

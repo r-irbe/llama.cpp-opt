@@ -3054,6 +3054,39 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cohort_max_idle_sec = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--unreal-filter" || arg == "-unreal") {
+        params.unreal_filter = true;
+        return true;
+    }
+    if (arg == "--no-unreal-filter" || arg == "-no-unreal") {
+        params.unreal_filter = false;
+        return true;
+    }
+    if (arg == "--unreal-chunk-size") {
+        CHECK_ARG
+        params.unreal_chunk_size = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-top-n") {
+        CHECK_ARG
+        params.unreal_top_n = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-min-tokens") {
+        CHECK_ARG
+        params.unreal_min_tokens = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-query-groups") {
+        CHECK_ARG
+        params.unreal_query_groups = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-chunk-vectors") {
+        CHECK_ARG
+        params.unreal_chunk_vectors = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-pps") {
         params.is_pp_shared = true;
         return true;
@@ -3364,6 +3397,11 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
 
     options.push_back({ "*",           "-c,    --ctx-size N",           "size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx });
     options.push_back({ "*",           "-cd,   --ctx-size-draft N",     "size of the prompt context for the draft model (default: %d, 0 = inherits target context for DFlash/DSpark, otherwise loaded from model)", params.speculative.n_ctx });
+    options.push_back({ "*",           "-unreal, --unreal-filter",      "enable UNREAL model-internal evidence selection for long context (arXiv:2610.08463)" });
+    options.push_back({ "*",           "       --no-unreal-filter",     "disable UNREAL evidence selection (default: %s)", params.unreal_filter ? "enabled" : "disabled" });
+    options.push_back({ "*",           "       --unreal-chunk-size N",  "UNREAL chunk size in tokens (default: %d)", params.unreal_chunk_size });
+    options.push_back({ "*",           "       --unreal-top-n N",       "UNREAL top evidence chunks to retain (default: %d)", params.unreal_top_n });
+    options.push_back({ "*",           "       --unreal-min-tokens N",  "minimum prompt tokens to activate UNREAL filtering (default: %d, 0 = auto N*)", params.unreal_min_tokens });
 
     options.push_back({ "*",           "-ctx-ckpt N, --ctx-checkpoints N",           "max number of context checkpoints to create per slot (default: %d)",params.ctx_checkpoints_n});
     options.push_back({ "*",           "--ctx-ckpt-spill-dir DIR, --ctx-checkpoints-spill-dir DIR",           "spill evicted checkpoints to DIR (NVMe) instead of dropping them; empty disables"});

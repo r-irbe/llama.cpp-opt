@@ -673,6 +673,15 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp(const struct llama_model* model);
 
+    // Retrieve float embedding vector for a given token from model.tok_embd.
+    // If the tensor is quantized, it is automatically dequantized to float.
+    // dest must point to an allocated buffer of at least llama_model_n_embd(model) floats.
+    // Returns true on success, false if token is invalid or model has no token embedding tensor.
+    LLAMA_API bool llama_model_get_token_embedding(
+        const struct llama_model * model,
+        llama_token token,
+        float * dest);
+
     LLAMA_API int32_t llama_n_layer    (const struct llama_model * model);
 
     // Compat

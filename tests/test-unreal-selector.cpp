@@ -207,6 +207,61 @@ int main() {
               << elapsed_ms << " ms (" << (big_chunks / (elapsed_ms / 1000.0)) << " chunks/sec) OK\n";
     ASSERT_TRUE(big_top.size() == 10);
 
+    // ---------------------------------------------------------------------------------
+    // 8. End-to-End Prompt Filtering & Distractor Elimination (filter_prompt)
+    // ---------------------------------------------------------------------------------
+    std::cout << "\n[Step 8] Verifying end-to-end prompt evidence filtering & distractor collapse...\n";
+    {
+        gpt_params params;
+        params.unreal_filter = true;
+        params.unreal_min_tokens = 4096;
+        params.unreal_chunk_size = 140;
+        params.unreal_top_n = 5;
+
+        // Create a 16K long context prompt with distractors and gold evidence needles
+        int prompt_len = 16384;
+        std::vector<llama_token> long_prompt(prompt_len);
+        for (int i = 0; i < prompt_len; ++i) {
+            long_prompt[i] = (llama_token)(100 + (i % 500)); // background distractors
+        }
+
+        // Distinctive query at the end
+        int query_len = 64;
+        for (int i = prompt_len - query_len; i < prompt_len; ++i) {
+            long_prompt[i] = (llama_token)(9000 + (i % 20)); // rare query tokens
+        }
+
+        // Plant gold evidence needle in chunk 25 (around token 3500)
+        int needle_pos = 3550;
+        for (int i = 0; i < 20; ++i) {
+            long_prompt[needle_pos + i] = (llama_token)(9000 + i);
+        }
+
+        // Test disabled filter returns original prompt
+        params.unreal_filter = false;
+        auto unfiltered = unreal::filter_prompt(nullptr, long_prompt, params);
+        ASSERT_TRUE(unfiltered.size() == long_prompt.size());
+
+        // Test enabled filter compresses prompt and retains gold evidence
+        params.unreal_filter = true;
+        auto filtered = unreal::filter_prompt(nullptr, long_prompt, params);
+        ASSERT_TRUE(filtered.size() < long_prompt.size());
+        ASSERT_TRUE(filtered.size() <= (size_t)(128 + params.unreal_top_n * params.unreal_chunk_size + 256));
+
+        // Verify gold needle tokens are preserved in the filtered output
+        bool needle_found = false;
+        for (size_t i = 0; i + 10 < filtered.size(); ++i) {
+            if (filtered[i] == 9000 && filtered[i + 1] == 9001 && filtered[i + 2] == 9002) {
+                needle_found = true;
+                break;
+            }
+        }
+        ASSERT_TRUE(needle_found);
+        std::cout << "  Filtered prompt compressed from " << long_prompt.size() << " to " 
+                  << filtered.size() << " tokens (" << (double)long_prompt.size() / filtered.size() 
+                  << "x compression) with gold evidence preserved OK\n";
+    }
+
     std::cout << "\n===================================================================\n";
     std::cout << "  ALL UNREAL SELECTOR TESTS PASSED WITH 100% SUCCESS               \n";
     std::cout << "===================================================================\n";

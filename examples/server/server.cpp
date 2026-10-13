@@ -11,6 +11,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "llama-vocab.h"
+#include "unreal-selector.h"
 #include <fstream>
        
 
@@ -1159,6 +1160,19 @@ int main(int argc, char ** argv) {
                     // Everything else, including multimodal completions.
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
+
+                if (ctx_server.params_base.unreal_filter) {
+                    for (size_t i = 0; i < inputs.size(); i++) {
+                        if (!inputs[i].has_mtmd_data()) {
+                            std::vector<llama_token> raw_toks(inputs[i].begin(), inputs[i].end());
+                            if ((int)raw_toks.size() > ctx_server.params_base.unreal_min_tokens) {
+                                auto filtered = unreal::filter_prompt(llama_get_model(ctx_server.ctx), raw_toks, ctx_server.params_base);
+                                inputs[i] = server_tokens(filtered, false);
+                            }
+                        }
+                    }
+                }
+
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);

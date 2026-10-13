@@ -3,6 +3,7 @@
 #include "chat.h"
 #include "console.h"
 #include "llama.h"
+#include "unreal-selector.h"
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -407,6 +408,10 @@ int main(int argc, char ** argv) {
         LOG("prompt: \"%s\"\n", log_tostr(prompt));
         LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
 
+    }
+
+    if (params.unreal_filter) {
+        embd_inp = unreal::filter_prompt(model, embd_inp, params);
     }
 
     // Should not run without any tokens

@@ -10513,6 +10513,53 @@ int32_t llama_model_n_embd_inp(const llama_model* model) {
     return model->hparams.n_embd_inp();
 }
 
+bool llama_model_get_token_embedding(const struct llama_model * model, llama_token token, float * dest) {
+    if (!model || !dest) {
+        return false;
+    }
+    const struct ggml_tensor * t = model->tok_embd ? model->tok_embd : model->tok_embd_per_layer;
+    if (!t) {
+        return false;
+    }
+    const int64_t n_embd = t->ne[0];
+    const int64_t n_vocab = t->ne[1];
+    if (token < 0 || token >= n_vocab) {
+        return false;
+    }
+
+    const size_t row_size = ggml_row_size(t->type, n_embd);
+    const size_t offset = (size_t)token * t->nb[1];
+
+    if (t->type == GGML_TYPE_F32) {
+        if (t->data != nullptr) {
+            memcpy(dest, (const char *)t->data + offset, n_embd * sizeof(float));
+            return true;
+        } else if (t->buffer != nullptr) {
+            ggml_backend_tensor_get(t, dest, offset, n_embd * sizeof(float));
+            return true;
+        }
+        return false;
+    }
+
+    auto type_traits = ggml_internal_get_type_traits(t->type);
+    if (!type_traits.to_float) {
+        return false;
+    }
+
+    if (t->data != nullptr) {
+        const char * src = (const char *)t->data + offset;
+        type_traits.to_float(src, dest, n_embd);
+        return true;
+    } else if (t->buffer != nullptr) {
+        std::vector<uint8_t> row_buf(row_size);
+        ggml_backend_tensor_get(t, row_buf.data(), offset, row_size);
+        type_traits.to_float(row_buf.data(), dest, n_embd);
+        return true;
+    }
+
+    return false;
+}
+
 int32_t llama_n_layer(const struct llama_model * model) {
     return model->hparams.n_layer;
 }

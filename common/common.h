@@ -582,6 +582,14 @@ struct gpt_params {
     int32_t cohort_min_prefix_tokens = 16;     // min shared prompt tokens to trigger cross-slot KV replication
     int32_t cohort_max_idle_sec = 0;           // max idle seconds before reclaiming private cohort slot (0 = disabled)
 
+    // UNREAL: Model-Internal Evidence Selection (arXiv:2610.08463)
+    bool    unreal_filter           = false; // enable UNREAL model-internal evidence selection
+    int32_t unreal_chunk_size       = 140;   // chunk size in tokens (T)
+    int32_t unreal_top_n            = 10;    // number of top-scoring chunks to select (n)
+    int32_t unreal_min_tokens       = 4096;  // minimum prompt tokens to activate UNREAL filtering (0 = auto N*)
+    int32_t unreal_query_groups     = 4;     // pooled query groups (G)
+    int32_t unreal_chunk_vectors    = 7;     // pooled vectors per chunk (Lp)
+
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot
     std::string ctx_checkpoint_spill_dir = ""; // disk dir for checkpoint spill (empty = disabled, behavior unchanged)
