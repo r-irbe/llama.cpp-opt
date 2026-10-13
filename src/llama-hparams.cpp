@@ -2414,6 +2414,7 @@ void llm_load_hparams(
                 }
 
                 // Expert gating function (GLM-4.5 uses sigmoid, DSV4/4.1 uses sqrtsoftplus)
+                hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_TYPE_NONE;
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func, false);
                 if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
                     std::string scoring_func;
