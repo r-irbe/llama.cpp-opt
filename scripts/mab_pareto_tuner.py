@@ -1019,11 +1019,16 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
         cmd.extend(["-prexp-t", str(config.get("prefetch_threads", 8))])
     if config.get("flash_attn", 0) == 1:
         cmd.extend(["-fa", "1"])
+    if config.get("cache_type_k"):
+        cmd.extend(["-ctk", str(config.get("cache_type_k"))])
+    if config.get("cache_type_v"):
+        cmd.extend(["-ctv", str(config.get("cache_type_v"))])
 
     eff_draft_path = draft_model_path or config.get("model_draft")
     spec_type = config.get("spec_type", "none")
     if eff_draft_path and os.path.exists(eff_draft_path):
         cmd.extend(["-md", eff_draft_path])
+        cmd.extend(["-ngld", str(config.get("n_gpu_layers_draft", 999))])
         if spec_type != "none":
             cmd.extend(["--spec-type", spec_type])
         if config.get("n_draft"):
@@ -1094,7 +1099,10 @@ def run_mab_multicontext_search(
     mab_profile: dict = None,
     live_bench: bool = False,
     model_path: str = None,
-    draft_model_path: str = None
+    draft_model_path: str = None,
+    draft_gpu_layers: int = 999,
+    cache_type_k: str = None,
+    cache_type_v: str = None
 ) -> dict:
     """
     Executes staged Multi-Armed Bandit optimization across progressive context lengths up to the maximum context.
@@ -1175,6 +1183,11 @@ def run_mab_multicontext_search(
             config["ctx_size"] = ctx_len
             if draft_model_path:
                 config["model_draft"] = draft_model_path
+                config["n_gpu_layers_draft"] = draft_gpu_layers
+            if cache_type_k:
+                config["cache_type_k"] = cache_type_k
+            if cache_type_v:
+                config["cache_type_v"] = cache_type_v
 
             if live_bench and model_path and os.path.exists(model_path):
                 metrics = execute_live_trial(config, model_path, ctx_len, hw, draft_model_path=draft_model_path)
@@ -1491,6 +1504,9 @@ def main():
     parser.add_argument("--live-bench", action="store_true", help="Execute real live binary benchmark via llama-cli")
     parser.add_argument("--model-path", default=None, help="Path to local GGUF model for live benchmarking")
     parser.add_argument("-md", "--model-draft", default=None, help="Path to local speculative draft companion GGUF model (DFlash/DSpark/MTP)")
+    parser.add_argument("-ngld", "--n-gpu-layers-draft", type=int, default=999, help="Number of GPU layers for draft model (default: 999)")
+    parser.add_argument("-ctk", "--cache-type-k", default=None, help="KV cache quantization type for K (e.g. f16, q8_0, q4_0)")
+    parser.add_argument("-ctv", "--cache-type-v", default=None, help="KV cache quantization type for V (e.g. f16, q8_0, q4_0)")
     parser.add_argument("--db-path", default="results/mab_pareto_tuning.sqlite", help="Path to SQLite results database")
     parser.add_argument("--output-md", default=None, help="Path to Markdown Pareto summary report")
 
@@ -1563,7 +1579,10 @@ def main():
         mab_profile=profile_data,
         live_bench=args.live_bench,
         model_path=args.model_path,
-        draft_model_path=args.model_draft
+        draft_model_path=args.model_draft,
+        draft_gpu_layers=args.n_gpu_layers_draft,
+        cache_type_k=args.cache_type_k,
+        cache_type_v=args.cache_type_v
     )
     pareto_points = search_results["global_pareto"]
 

@@ -131,6 +131,33 @@ def parse_arguments():
         help="Draft model path for speculative decoding"
     )
     parser.add_argument(
+        "-ngld", "--n-gpu-layers-draft",
+        type=int,
+        default=999,
+        help="Number of layers to offload to GPU for the draft model (default: 999)"
+    )
+    parser.add_argument(
+        "--draft",
+        type=int,
+        default=None,
+        help="Number of tokens to draft per speculative step"
+    )
+    parser.add_argument(
+        "--spec-autotune",
+        action="store_true",
+        help="Enable dynamic speculative autotuning"
+    )
+    parser.add_argument(
+        "-ctk", "--cache-type-k",
+        default=None,
+        help="KV cache type for K (e.g. f16, q8_0, q4_0)"
+    )
+    parser.add_argument(
+        "-ctv", "--cache-type-v",
+        default=None,
+        help="KV cache type for V (e.g. f16, q8_0, q4_0)"
+    )
+    parser.add_argument(
         "--defer-ple",
         action="store_true",
         help="Enable deferred streaming for sparse PLE / engram tables"
@@ -429,6 +456,16 @@ def main():
                 cmd.extend(["--spec-type", args.spec_type])
             if args.model_draft:
                 cmd.extend(["-md", str(args.model_draft)])
+                if args.n_gpu_layers_draft is not None:
+                    cmd.extend(["-ngld", str(args.n_gpu_layers_draft)])
+            if args.draft is not None:
+                cmd.extend(["--draft", str(args.draft)])
+            if args.spec_autotune:
+                cmd.append("--spec-autotune")
+            if args.cache_type_k:
+                cmd.extend(["-ctk", args.cache_type_k])
+            if args.cache_type_v:
+                cmd.extend(["-ctv", args.cache_type_v])
             if args.defer_ple:
                 cmd.append("--defer-ple")
             if args.defer_experts:
