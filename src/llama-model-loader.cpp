@@ -889,24 +889,90 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
     struct GGUFMeta::ArrayInfo arr_info =
         GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(meta, kid);
 
-    switch (arr_info.gt) {
-        case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T, float>::value)); break;
-        case GGUF_TYPE_UINT32:
-        case GGUF_TYPE_BOOL:
-        case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
-        case GGUF_TYPE_UINT64:
-        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>) || (std::is_same_v<T, uint64_t>));  break;
-        default:
-            throw std::runtime_error(format("%s is not a float32, int32, uint32, int64, uint64 or bool array", key.c_str()));
-    }
-
     result.resize(arr_info.length);
-    if (arr_info.gt == GGUF_TYPE_BOOL) {
-        std::transform((const int8_t *)arr_info.data, (const int8_t *)arr_info.data + arr_info.length, result.begin(),
-                [] (int8_t x) { return static_cast<T>(x != 0); });
 
-    } else {
-        result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+    switch (arr_info.gt) {
+        case GGUF_TYPE_UINT8: {
+            const auto * p = static_cast<const uint8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT8: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT16: {
+            const auto * p = static_cast<const uint16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT16: {
+            const auto * p = static_cast<const int16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT32: {
+            if constexpr (std::is_same_v<T, uint32_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const uint32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT32: {
+            if constexpr (std::is_same_v<T, int32_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const int32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_UINT64: {
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const uint64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT64: {
+            if constexpr (std::is_same_v<T, int64_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const int64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT32: {
+            if constexpr (std::is_same_v<T, float>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const float *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT64: {
+            if constexpr (std::is_same_v<T, double>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const double *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_BOOL: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i] != 0);
+            break;
+        }
+        default:
+            throw std::runtime_error(format("%s is not a numeric or bool array", key.c_str()));
     }
 
     return true;
@@ -926,24 +992,92 @@ bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> &
     struct GGUFMeta::ArrayInfo arr_info =
         GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(meta, kid);
 
-    switch (arr_info.gt) {
-        case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same_v<T, float>)); break;
-        case GGUF_TYPE_UINT32:
-        case GGUF_TYPE_BOOL:
-        case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
-        default:
-            throw std::runtime_error(format("%s is not a float32, int32 array", key.c_str()));
-    }
-
     if (arr_info.length > N_MAX) {
         throw std::runtime_error(format("array length %u for key %s exceeds max %u", (uint32_t) arr_info.length, key.c_str(), (uint32_t) N_MAX));
     }
 
-    if (arr_info.gt == GGUF_TYPE_BOOL) {
-        std::transform((const int8_t *)arr_info.data, (const int8_t *)arr_info.data + arr_info.length, result.begin(),
-                [] (int8_t x) { return static_cast<T>(x != 0); });
-    } else {
-        std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+    switch (arr_info.gt) {
+        case GGUF_TYPE_UINT8: {
+            const auto * p = static_cast<const uint8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT8: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT16: {
+            const auto * p = static_cast<const uint16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT16: {
+            const auto * p = static_cast<const int16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT32: {
+            if constexpr (std::is_same_v<T, uint32_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const uint32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT32: {
+            if constexpr (std::is_same_v<T, int32_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const int32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_UINT64: {
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const uint64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT64: {
+            if constexpr (std::is_same_v<T, int64_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const int64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT32: {
+            if constexpr (std::is_same_v<T, float>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const float *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT64: {
+            if constexpr (std::is_same_v<T, double>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const double *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_BOOL: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i] != 0);
+            break;
+        }
+        default:
+            throw std::runtime_error(format("%s is not a numeric or bool array", key.c_str()));
     }
 
     return true;
