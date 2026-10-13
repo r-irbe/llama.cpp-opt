@@ -2413,10 +2413,25 @@ void llm_load_hparams(
                     hparams.indexer_is_full[il] = (il <= 1) || (il % 4 == 2);
                 }
 
-                // Expert gating function (GLM-4.5 uses sigmoid)
-                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                // Expert gating function (GLM-4.5 uses sigmoid, DSV4/4.1 uses sqrtsoftplus)
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func, false);
                 if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
-                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                    std::string scoring_func;
+                    const std::string arch_str = llama_model_arch_name(model.arch);
+                    if (ml.get_key("deepseek41.scoring_func", scoring_func, false) ||
+                        ml.get_key("deepseek4.scoring_func", scoring_func, false) ||
+                        ml.get_key(arch_str + ".scoring_func", scoring_func, false)) {
+                        if (scoring_func == "sqrtsoftplus") {
+                            hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS;
+                        } else if (scoring_func == "sigmoid") {
+                            hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                        } else if (scoring_func == "softmax") {
+                            hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SOFTMAX;
+                        }
+                    }
+                }
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = is_dsv4 ? LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS : LLM_EXPERT_GATING_FUNC_SIGMOID;
                 }
 
                 if (is_dsv4 &&
