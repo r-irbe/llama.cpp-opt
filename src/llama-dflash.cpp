@@ -46,9 +46,15 @@ static ggml_backend_t llama_backend_for_tensor(const llama_context & lctx, const
 
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
     for (ggml_backend_t backend : lctx.backends) {
-        ggml_backend_buffer_type_t backend_buft = ggml_backend_is_cpu(backend)
-                ? llama_default_buffer_type_cpu(true)
-                : ggml_backend_get_default_buffer_type(backend);
+        ggml_backend_buffer_type_t backend_buft = nullptr;
+        if (ggml_backend_is_cpu_numa(backend)) {
+            int node_id = ggml_backend_cpu_numa_get_node(backend);
+            backend_buft = ggml_backend_cpu_numa_buffer_type(node_id);
+        } else if (ggml_backend_is_cpu(backend)) {
+            backend_buft = llama_default_buffer_type_cpu(true);
+        } else {
+            backend_buft = ggml_backend_get_default_buffer_type(backend);
+        }
         if (backend_buft == buft) {
             return backend;
         }
@@ -506,7 +512,10 @@ bool llama_prepare_dflash_graph_inputs(
         std::vector<ggml_backend_buffer_type_t> backend_buft;
         backend_buft.reserve(lctx.backends.size());
         for (auto * backend : lctx.backends) {
-            if (ggml_backend_is_cpu(backend)) {
+            if (ggml_backend_is_cpu_numa(backend)) {
+                int node_id = ggml_backend_cpu_numa_get_node(backend);
+                backend_buft.push_back(ggml_backend_cpu_numa_buffer_type(node_id));
+            } else if (ggml_backend_is_cpu(backend)) {
                 backend_buft.push_back(llama_default_buffer_type_cpu(true));
             } else {
                 backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
