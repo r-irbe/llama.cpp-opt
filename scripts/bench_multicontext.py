@@ -21,18 +21,25 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Staged Multi-Context Benchmarking Harness for ik_llama.cpp"
+        description="Staged Multi-Context Benchmarking Harness for ik_llama.cpp and OpenAI-Compatible Engines"
     )
     parser.add_argument(
         "-m", "--model",
         required=True,
-        help="Path to GGUF model file"
+        help="Path to GGUF model file or model identifier (for API endpoints)"
+    )
+    parser.add_argument(
+        "--endpoint",
+        default=None,
+        help="Optional OpenAI-compatible HTTP endpoint for cross-engine testing (e.g. http://localhost:8000/v1 for vLLM, SGLang, TensorRT-LLM, or llama-server)"
     )
     parser.add_argument(
         "-c", "--context-lengths",
@@ -162,15 +169,97 @@ def parse_llama_cli_output(output: str, elapsed_sec: float) -> dict:
     }
 
 
+def query_openai_endpoint(endpoint: str, model: str, prompt: str, ctx_len: int, n_predict: int, timeout: int = 300) -> dict:
+    """Streams token generation from an OpenAI-compatible endpoint (vLLM, SGLang, TensorRT-LLM, llama-server)."""
+    url = f"{endpoint.rstrip('/')}/chat/completions"
+
+    words = prompt.split()
+    target_words = max(len(words), int(ctx_len * 0.75))
+    if len(words) < target_words:
+        multiplier = (target_words // len(words)) + 1
+        expanded_prompt = " ".join((words * multiplier)[:target_words])
+    else:
+        expanded_prompt = prompt
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": expanded_prompt}],
+        "max_tokens": n_predict,
+        "temperature": 0.0,
+        "stream": True
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+
+    t0 = time.time()
+    first_token_time = None
+    token_times = []
+    generated_tokens = 0
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            for line in response:
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if line_str.startswith("data: ") and line_str != "data: [DONE]":
+                    t_token = time.time()
+                    if first_token_time is None:
+                        first_token_time = t_token
+                    token_times.append(t_token)
+                    generated_tokens += 1
+
+        total_time = time.time() - t0
+        ttft_ms = (first_token_time - t0) * 1000.0 if first_token_time else total_time * 1000.0
+        decode_time_sec = (time.time() - first_token_time) if first_token_time else 0.001
+        tg_tps = (generated_tokens / max(0.001, decode_time_sec)) if generated_tokens > 0 else 0.0
+        pp_tokens = ctx_len
+        pp_tps = (pp_tokens / max(0.001, ttft_ms / 1000.0))
+
+        return {
+            "elapsed_sec": round(total_time, 2),
+            "pp_ms": round(ttft_ms, 2),
+            "pp_tokens": pp_tokens,
+            "pp_tps": round(pp_tps, 2),
+            "tg_ms": round(decode_time_sec * 1000.0, 2),
+            "tg_tokens": generated_tokens,
+            "tg_tps": round(tg_tps, 2),
+            "ttft_ms": round(ttft_ms, 2)
+        }
+    except Exception as e:
+        elapsed = time.time() - t0
+        return {
+            "error": str(e),
+            "elapsed_sec": round(elapsed, 2),
+            "pp_ms": 0.0,
+            "pp_tokens": 0,
+            "pp_tps": 0.0,
+            "tg_ms": 0.0,
+            "tg_tokens": 0,
+            "tg_tps": 0.0,
+            "ttft_ms": 0.0
+        }
+
+
 def main():
     args = parse_arguments()
-    model_path = Path(args.model).resolve()
-    if not model_path.exists() and not args.dry_run:
-        print(f"Error: Model file '{model_path}' not found.", file=sys.stderr)
-        sys.exit(1)
 
-    file_size_gb = (model_path.stat().st_size / (1024 ** 3)) if model_path.exists() else 0.0
-    is_huge_model = file_size_gb > 50.0
+    is_endpoint_mode = bool(args.endpoint)
+    if is_endpoint_mode:
+        model_basename = args.model.split("/")[-1]
+        model_path = args.model
+        file_size_gb = 0.0
+        is_huge_model = False
+    else:
+        model_path = Path(args.model).resolve()
+        if not model_path.exists() and not args.dry_run:
+            print(f"Error: Model file '{model_path}' not found.", file=sys.stderr)
+            sys.exit(1)
+        file_size_gb = (model_path.stat().st_size / (1024 ** 3)) if model_path.exists() else 0.0
+        is_huge_model = file_size_gb > 50.0
+        model_basename = model_path.stem
 
     try:
         context_lengths = [int(c.strip()) for c in args.context_lengths.split(",") if c.strip()]
@@ -179,15 +268,18 @@ def main():
         sys.exit(1)
 
     total_stages = len(context_lengths)
-    model_basename = model_path.stem
 
     print("================================================================================")
     print(f"  STAGED MULTI-CONTEXT BENCHMARK: {model_basename}")
-    print(f"  Model Size      : {file_size_gb:.1f} GiB ({'HUGE MODEL' if is_huge_model else 'STANDARD'})")
+    if is_endpoint_mode:
+        print(f"  Execution Target: OPENAI-COMPATIBLE API -> {args.endpoint}")
+    else:
+        print(f"  Model Size      : {file_size_gb:.1f} GiB ({'HUGE MODEL' if is_huge_model else 'STANDARD'})")
     print(f"  Context Stages  : {total_stages} Stages -> {[f'{c:,}' for c in context_lengths]}")
     print(f"  Tokens / Stage  : {args.n_predict} Generated Tokens")
-    print(f"  Offload Config  : -ngl {args.n_gpu_layers} | -sm {args.split_mode} | --numa {args.numa}")
-    print(f"  Streaming       : defer_ple={args.defer_ple} | defer_experts={args.defer_experts} | prefetch={args.prefetch_experts}")
+    if not is_endpoint_mode:
+        print(f"  Offload Config  : -ngl {args.n_gpu_layers} | -sm {args.split_mode} | --numa {args.numa}")
+        print(f"  Streaming       : defer_ple={args.defer_ple} | defer_experts={args.defer_experts} | prefetch={args.prefetch_experts}")
     print("================================================================================")
 
     stage_results = []
@@ -197,34 +289,20 @@ def main():
         eta_sec = estimate_stage_duration(ctx_len, args.n_predict, is_huge_model)
         print(f"\n>>> [Stage {idx}/{total_stages}: Context = {ctx_len:,} Tokens] ETA: ~{eta_sec:.1f}s | Evaluating prompt processing & decode...")
 
-        cmd = [
-            "./build/bin/llama-cli",
-            "-m", str(model_path),
-            "-p", args.prompt,
-            "-n", str(args.n_predict),
-            "--temp", "0",
-            "-c", str(ctx_len),
-            "-t", str(args.threads),
-            "-tb", str(args.threads_batch)
-        ]
-        if args.n_gpu_layers > 0:
-            cmd.extend(["-ngl", str(args.n_gpu_layers)])
-        if args.split_mode:
-            cmd.extend(["-sm", args.split_mode])
-        if args.tensor_override:
-            cmd.extend(["-ot", args.tensor_override])
-        if args.numa:
-            cmd.extend(["--numa", args.numa])
-        if args.defer_ple:
-            cmd.append("--defer-ple")
-        if args.defer_experts:
-            cmd.append("--defer-experts")
-        if args.prefetch_experts:
-            cmd.append("-prexp")
-            cmd.extend(["-prexp-t", str(args.prefetch_threads)])
-
         stage_start = time.time()
-        if args.dry_run:
+        if is_endpoint_mode:
+            metrics = query_openai_endpoint(
+                endpoint=args.endpoint,
+                model=args.model,
+                prompt=args.prompt,
+                ctx_len=ctx_len,
+                n_predict=args.n_predict,
+                timeout=max(300, int(eta_sec * 3.0))
+            )
+            elapsed = metrics.get("elapsed_sec", time.time() - stage_start)
+            if "error" in metrics:
+                print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] API ERROR: {metrics['error']}", file=sys.stderr)
+        elif args.dry_run:
             time.sleep(0.1)
             elapsed = 0.1
             metrics = {
@@ -237,6 +315,32 @@ def main():
                 "ttft_ms": round(15.0 + ctx_len * 0.05, 2)
             }
         else:
+            cmd = [
+                "./build/bin/llama-cli",
+                "-m", str(model_path),
+                "-p", args.prompt,
+                "-n", str(args.n_predict),
+                "--temp", "0",
+                "-c", str(ctx_len),
+                "-t", str(args.threads),
+                "-tb", str(args.threads_batch)
+            ]
+            if args.n_gpu_layers > 0:
+                cmd.extend(["-ngl", str(args.n_gpu_layers)])
+            if args.split_mode:
+                cmd.extend(["-sm", args.split_mode])
+            if args.tensor_override:
+                cmd.extend(["-ot", args.tensor_override])
+            if args.numa:
+                cmd.extend(["--numa", args.numa])
+            if args.defer_ple:
+                cmd.append("--defer-ple")
+            if args.defer_experts:
+                cmd.append("--defer-experts")
+            if args.prefetch_experts:
+                cmd.append("-prexp")
+                cmd.extend(["-prexp-t", str(args.prefetch_threads)])
+
             env = os.environ.copy()
             env["GGML_CUDA_NO_PINNED"] = "1"
             timeout = max(300, int(eta_sec * 3.0))
