@@ -1892,7 +1892,12 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     cb(lctx.dflash.kv.draft_tail_rows_tensor, "dflash_draft_tail_rows", -1);
 
     ggml_tensor * tok_embd = model.tok_embd;
-    GGML_ASSERT(tok_embd != nullptr);
+    if (tok_embd == nullptr) {
+        LLAMA_LOG_ERROR("%s: model '%s' is a DFlash/DSpark draft model with shared embeddings (tok_embd is null). "
+                        "Draft models cannot run standalone and must be paired with a base model via --spec-type dflash -md <path>\n",
+                        __func__, model.name.c_str());
+        return nullptr;
+    }
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, tok_embd, cb);
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hparams.dsv4_hc_mult, n_tokens, 1);
