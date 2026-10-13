@@ -966,33 +966,35 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
 
 def compute_scalar_reward(metrics: dict, target_model: str) -> float:
     """Combines multi-objective performance metrics into normalized scalar utility for bandit update."""
+    if metrics.get("error") or metrics.get("pp_tps", 0) <= 0:
+        return 0.0001
     m_lower = target_model.lower()
     if "7b" in m_lower:
-        norm_pp, norm_tg = 5000.0, 60.0
+        norm_pp, norm_tg = 6000.0, 150.0
     elif "27b" in m_lower:
-        norm_pp, norm_tg = 2000.0, 40.0
+        norm_pp, norm_tg = 3500.0, 160.0
     elif "deepseek" in m_lower:
-        norm_pp, norm_tg = 1200.0, 25.0
+        norm_pp, norm_tg = 3000.0, 150.0
     elif "flash" in m_lower:
-        norm_pp, norm_tg = 800.0, 35.0
+        norm_pp, norm_tg = 3000.0, 150.0
     else:
-        norm_pp, norm_tg = 500.0, 15.0
+        norm_pp, norm_tg = 2500.0, 100.0
 
     score_pp = min(1.0, metrics["pp_tps"] / norm_pp)
     score_tg = min(1.0, metrics["tg_tps"] / norm_tg)
     score_ttft = min(1.0, 100.0 / max(10.0, metrics["ttft_ms"]))
 
-    reward = (0.40 * score_pp) + (0.40 * score_tg) + (0.20 * score_ttft)
+    reward = (0.45 * score_pp) + (0.45 * score_tg) + (0.10 * score_ttft)
     return round(reward, 4)
 
 
-def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHardwareProfile) -> dict:
+def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHardwareProfile, draft_model_path: str = None) -> dict:
     """Executes a real llama-cli benchmark on host hardware and records measured throughput and latency."""
     cmd = [
         "./build/bin/llama-cli",
         "-m", model_path,
         "-p", "Artificial intelligence is",
-        "-n", "10",
+        "-n", "16",
         "--temp", "0",
         "-c", str(ctx_len),
         "-t", str(config.get("threads", min(14, hw.physical_cores))),
@@ -1002,11 +1004,11 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
     ]
     if config.get("n_gpu_layers", 0) > 0 and hw.has_gpu:
         cmd.extend(["-ngl", str(config.get("n_gpu_layers", 999))])
-    if config.get("split_mode") and config.get("split_mode") != "none":
+    if config.get("split_mode") and config.get("split_mode") != "none" and hw.gpu_count >= 2:
         cmd.extend(["-sm", config.get("split_mode")])
     if config.get("tensor_override_strategy") and config.get("tensor_override_strategy") != "none":
         cmd.extend(["-ot", config.get("tensor_override_strategy")])
-    if config.get("numa_mode") and config.get("numa_mode") != "none":
+    if config.get("numa_mode") and config.get("numa_mode") != "none" and hw.numa_nodes > 1:
         cmd.extend(["--numa", config.get("numa_mode")])
     if config.get("defer_ple", 0) == 1:
         cmd.append("--defer-ple")
@@ -1016,7 +1018,26 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
         cmd.append("-prexp")
         cmd.extend(["-prexp-t", str(config.get("prefetch_threads", 8))])
     if config.get("flash_attn", 0) == 1:
-        cmd.append("-fa")
+        cmd.extend(["-fa", "1"])
+
+    eff_draft_path = draft_model_path or config.get("model_draft")
+    spec_type = config.get("spec_type", "none")
+    if eff_draft_path and os.path.exists(eff_draft_path):
+        cmd.extend(["-md", eff_draft_path])
+        if spec_type != "none":
+            cmd.extend(["--spec-type", spec_type])
+        if config.get("n_draft"):
+            cmd.extend(["--draft", str(config.get("n_draft"))])
+        if config.get("p_min"):
+            cmd.extend(["--p-min", str(config.get("p_min"))])
+        if config.get("spec_autotune", 1) == 1:
+            cmd.append("--spec-autotune")
+        if config.get("spec_ckpt_mode"):
+            cmd.extend(["--spec-ckpt-mode", str(config.get("spec_ckpt_mode"))])
+    elif spec_type in ["ngram-mod", "suffix"]:
+        cmd.extend(["--spec-type", spec_type])
+        if config.get("n_draft"):
+            cmd.extend(["--draft", str(config.get("n_draft"))])
 
     env = os.environ.copy()
     env["GGML_CUDA_NO_PINNED"] = "1"
@@ -1025,12 +1046,26 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
     try:
         proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=180)
         out = proc.stdout + proc.stderr
-        pp_match = re.search(r"prompt eval time =\s+([\d\.]+)\s+ms\s+/\s+(\d+)\s+tokens\s+\(\s*[\d\.]+\s+ms per token,\s+([\d\.]+)\s+tokens per second\)", out)
-        tg_match = re.search(r"eval time =\s+([\d\.]+)\s+ms\s+/\s+(\d+)\s+tokens\s+\(\s*[\d\.]+\s+ms per token,\s+([\d\.]+)\s+tokens per second\)", out)
+        if proc.returncode != 0:
+            err_lines = [
+                line.strip() for line in out.splitlines()
+                if any(k in line.lower() for k in ["error", "failed", "out of memory", "cuda error", "exception"])
+            ]
+            err_msg = err_lines[-1] if err_lines else f"Process exited with code {proc.returncode}"
+            return {
+                "error": err_msg,
+                "pp_tps": 0.0,
+                "tg_tps": 0.0,
+                "ttft_ms": (time.time() - t0) * 1000.0,
+                "mem_gb": 0.0
+            }
 
-        pp_tps = float(pp_match.group(3)) if pp_match else 0.66
+        pp_match = re.search(r"prompt eval time\s*=\s*([\d\.]+)\s*ms\s*/\s*(\d+)\s*tokens\s*\(\s*[\d\.]+\s*ms per token,\s*([\d\.]+)\s*tokens per second\)", out)
+        tg_match = re.search(r"(?<!prompt )eval time\s*=\s*([\d\.]+)\s*ms\s*/\s*(\d+)\s*tokens\s*\(\s*[\d\.]+\s*ms per token,\s*([\d\.]+)\s*tokens per second\)", out)
+
+        pp_tps = float(pp_match.group(3)) if pp_match else 0.0
         pp_ms = float(pp_match.group(1)) if pp_match else (time.time() - t0) * 1000.0
-        tg_tps = float(tg_match.group(3)) if tg_match else 1.24
+        tg_tps = float(tg_match.group(3)) if tg_match else 0.0
         ttft_ms = pp_ms
         mem_gb = 18.0
         return {
@@ -1039,10 +1074,11 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
             "ttft_ms": round(ttft_ms, 2),
             "mem_gb": round(mem_gb, 2)
         }
-    except Exception:
+    except Exception as e:
         return {
-            "pp_tps": 0.5,
-            "tg_tps": 0.5,
+            "error": str(e),
+            "pp_tps": 0.0,
+            "tg_tps": 0.0,
             "ttft_ms": 10000.0,
             "mem_gb": 20.0
         }
@@ -1057,7 +1093,8 @@ def run_mab_multicontext_search(
     db_path: str = "results/mab_pareto_tuning.sqlite",
     mab_profile: dict = None,
     live_bench: bool = False,
-    model_path: str = None
+    model_path: str = None,
+    draft_model_path: str = None
 ) -> dict:
     """
     Executes staged Multi-Armed Bandit optimization across progressive context lengths up to the maximum context.
@@ -1082,6 +1119,8 @@ def run_mab_multicontext_search(
     print(f"  Context Length Stages ({total_stages})  : {[f'{c:,}' for c in context_lengths]}")
     print(f"  Optimization Budget per Stage: {trials_per_ctx} Combinatorial Trials ({total_evals} Total)")
     print(f"  Execution Mode               : {'LIVE HOST BENCHMARK' if live_bench else 'HARDWARE-CALIBRATED SIMULATION'}")
+    if draft_model_path:
+        print(f"  Speculative Companion Model  : {os.path.basename(draft_model_path)}")
     print("================================================================================")
 
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1134,9 +1173,11 @@ def run_mab_multicontext_search(
             epsilon = max(0.05, 0.35 * (1.0 - (trial / float(trials_per_ctx))))
             config = bandit.sample_configuration(epsilon=epsilon)
             config["ctx_size"] = ctx_len
+            if draft_model_path:
+                config["model_draft"] = draft_model_path
 
             if live_bench and model_path and os.path.exists(model_path):
-                metrics = execute_live_trial(config, model_path, ctx_len, hw)
+                metrics = execute_live_trial(config, model_path, ctx_len, hw, draft_model_path=draft_model_path)
             else:
                 metrics = evaluate_simulated_point(config, model_name, hw)
 
@@ -1449,6 +1490,7 @@ def main():
     parser.add_argument("--trials", type=int, default=10, help="Number of combinatorial bandit optimization trials per context stage")
     parser.add_argument("--live-bench", action="store_true", help="Execute real live binary benchmark via llama-cli")
     parser.add_argument("--model-path", default=None, help="Path to local GGUF model for live benchmarking")
+    parser.add_argument("-md", "--model-draft", default=None, help="Path to local speculative draft companion GGUF model (DFlash/DSpark/MTP)")
     parser.add_argument("--db-path", default="results/mab_pareto_tuning.sqlite", help="Path to SQLite results database")
     parser.add_argument("--output-md", default=None, help="Path to Markdown Pareto summary report")
 
@@ -1520,7 +1562,8 @@ def main():
         db_path=args.db_path,
         mab_profile=profile_data,
         live_bench=args.live_bench,
-        model_path=args.model_path
+        model_path=args.model_path,
+        draft_model_path=args.model_draft
     )
     pareto_points = search_results["global_pareto"]
 

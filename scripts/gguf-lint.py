@@ -60,14 +60,45 @@ GGML_TYPE_NAMES = {
     28: ("F64", 8.0),
     29: ("IQ1_M", 0.21875),
     30: ("BF16", 2.0),
-    41: ("Q1_0", 0.1484375),
+    31: ("Q4_0_4_4", 0.5625),
+    32: ("Q4_0_4_8", 0.5625),
+    33: ("Q4_0_8_8", 0.5625),
+    36: ("I2_S", 0.25),
+    39: ("MXFP4", 0.53125),
+    41: ("Q1_0_G128", 0.140625),
     66: ("Q1_0", 0.1484375),
+    97: ("Q8_0_X4", 1.0625),
+    98: ("Q8_1_X4", 1.125),
+    99: ("Q8_2_X4", 1.0625),
     133: ("Q6_0", 0.8125),
+    134: ("IQ1_BN", 0.203125),
+    135: ("IQ2_BN", 0.25),
+    136: ("Q8_K64", 1.0625),
     137: ("IQ2_K", 0.296875),
     138: ("IQ3_K", 0.4296875),
     139: ("IQ4_K", 0.5625),
+    140: ("IQ5_K", 0.6875),
+    141: ("IQ6_K", 0.828125),
+    142: ("PQ2_0", 0.265625),
+    143: ("PTQ1_0", 0.21875),
     144: ("IQ4_KS", 0.53125),
+    145: ("IQ2_KS", 0.265625),
     146: ("IQ4_KSS", 0.5),
+    147: ("Q8_K16", 1.0),
+    148: ("Q8_K32", 1.0625),
+    149: ("Q8_KR8", 1.0625),
+    150: ("Q8_K128", 1.125),
+    151: ("Q8_KV", 1.0),
+    152: ("IQ5_KS", 0.65625),
+    153: ("IQ2_KT", 0.28125),
+    154: ("IQ3_KT", 0.40625),
+    155: ("IQ4_KT", 0.5),
+    156: ("IQ3_KS", 0.4140625),
+    157: ("IQ2_KL", 0.3125),
+    158: ("IQ1_KT", 0.21875),
+    159: ("Q1_0_G128_R8", 0.140625),
+    160: ("PQ2_0_R8", 0.265625),
+    161: ("PTQ1_0_R8", 0.21875),
 }
 
 # GGML Quantization Sizes: (block_size, type_size_bytes)
@@ -101,14 +132,45 @@ GGML_QUANT_SIZES = {
     28: (1, 8),       # F64
     29: (256, 56),    # IQ1_M
     30: (1, 2),       # BF16
+    31: (32, 18),     # Q4_0_4_4
+    32: (32, 18),     # Q4_0_4_8
+    33: (32, 18),     # Q4_0_8_8
+    36: (1, 1),       # I2_S
+    39: (32, 17),     # MXFP4
     41: (128, 18),    # Q1_0_G128
     66: (128, 18),    # Q1_0
+    97: (32, 34),     # Q8_0_X4
+    98: (32, 36),     # Q8_1_X4
+    99: (32, 34),     # Q8_2_X4
     133: (32, 26),    # Q6_0
+    134: (64, 13),    # IQ1_BN
+    135: (64, 16),    # IQ2_BN
+    136: (64, 68),    # Q8_K64
     137: (256, 76),   # IQ2_K
     138: (256, 110),  # IQ3_K
     139: (256, 144),  # IQ4_K
+    140: (256, 176),  # IQ5_K
+    141: (256, 212),  # IQ6_K
+    142: (128, 34),   # PQ2_0
+    143: (128, 28),   # PTQ1_0
     144: (256, 136),  # IQ4_KS
+    145: (256, 68),   # IQ2_KS
     146: (256, 128),  # IQ4_KSS
+    147: (64, 64),    # Q8_K16
+    148: (256, 292),  # Q8_K32
+    149: (256, 292),  # Q8_KR8
+    150: (128, 144),  # Q8_K128
+    151: (32, 32),    # Q8_KV
+    152: (256, 168),  # IQ5_KS
+    153: (256, 72),   # IQ2_KT
+    154: (256, 104),  # IQ3_KT
+    155: (256, 128),  # IQ4_KT
+    156: (256, 106),  # IQ3_KS
+    157: (256, 80),   # IQ2_KL
+    158: (256, 56),   # IQ1_KT
+    159: (128, 18),   # Q1_0_G128_R8
+    160: (128, 34),   # PQ2_0_R8
+    161: (128, 28),   # PTQ1_0_R8
 }
 
 def get_tensor_row_bytes(type_id: int, ne0: int, bpe: float = 2.0) -> int:
@@ -445,7 +507,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
 
     # Categorize Tensors into Critical Path, Routed MoE Experts, and Sparse PLE / Engram Tables
     meta = gguf_info.get("metadata", {})
-    arch = str(meta.get("general.architecture", "llama"))
+    arch = str(meta.get("general.architecture", "llama")).lower()
 
     critical_tensors = []
     moe_expert_tensors = []
@@ -457,6 +519,13 @@ def analyze_and_lint_gguf(gguf_info, hw):
     moe_bytes = 0
     engram_table_bytes = 0
     engram_dense_bytes = 0
+
+    # Detect whether this model is a speculative draft companion model (DFlash, DSpark, MTP, etc.)
+    primary_filename = os.path.basename(gguf_info.get("primary_file", "")).lower()
+    has_embeddings = any("token_embd" in t["name"] or "tok_embd" in t["name"] for t in tensors)
+    is_dflash = (arch in ["dflash", "dflash2", "dflash-draft"] or any(t["name"].startswith("dflash") for t in tensors) or "dspark" in primary_filename or "dflash" in primary_filename)
+    is_mtp = (arch in ["mtp", "gemma4_mtp"] or any("nextn" in t["name"] or "mtp" in t["name"] for t in tensors) or "mtp-" in primary_filename or "-mtp" in primary_filename)
+    is_draft_companion = is_dflash or is_mtp or (not has_embeddings and len(tensors) < 80)
 
     for t in tensors:
         name = t["name"]
@@ -841,6 +910,19 @@ def analyze_and_lint_gguf(gguf_info, hw):
         "recommendation": f"Scale context dynamically up to -c {max_safe_ctx} with -ctk q8_0 -ctv q8_0 for minimal memory footprint."
     })
 
+    # 14. Speculative Companion Draft Model Analysis
+    if is_draft_companion:
+        spec_kind = "DFlash / DSpark" if is_dflash else ("MTP (Multi-Token Prediction)" if is_mtp else "Speculative Draft")
+        findings.append({
+            "code": "LINT014_COMPANION_DRAFT_MODEL",
+            "severity": "PASS",
+            "penalty": 0,
+            "title": f"Speculative Draft Companion Model Verified ({spec_kind})",
+            "detail": f"Model is structured as a speculative decoding companion ({spec_kind}, {len(tensors)} tensors, {file_size / (1024**3):.2f} GiB). "
+                      f"Designed for high-speed multi-token proposal running in tandem with a base model. Embeddings are shared with base model.",
+            "recommendation": f"Pair with compatible base model: `./build/bin/llama-cli -m <base.gguf> -md {os.path.basename(gguf_info.get('primary_file', 'draft.gguf'))} --spec-type {'dflash' if is_dflash else 'mtp'} -fa 1`."
+        })
+
     score = max(0, min(100, score))
 
     mab_profile = {
@@ -848,6 +930,9 @@ def analyze_and_lint_gguf(gguf_info, hw):
         "arch": arch,
         "is_deepseek4": is_deepseek4,
         "is_mla": is_mla,
+        "is_draft_companion": is_draft_companion,
+        "is_dflash": is_dflash,
+        "is_mtp": is_mtp,
         "file_size_gb": round(file_size / (1024**3), 2),
         "critical_bytes_gb": round(critical_bytes / (1024**3), 2),
         "moe_bytes_gb": round(moe_bytes / (1024**3), 2),
@@ -862,7 +947,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
             "--defer-experts" if len(moe_expert_tensors) > 0 else "",
             "-prexp" if len(moe_expert_tensors) > 0 else "",
             f"-prexp-t {min(8, hw['physical_cores'])}" if len(moe_expert_tensors) > 0 else "",
-            "-sm graph" if hw["gpu_vram_bytes"] > 0 else "",
+            "-sm graph" if (hw["gpu_vram_bytes"] > 0 and hw.get("gpu_count", 1) >= 2) else "",
             "-ot \"^.*\\.attn.*=CUDA0,.*\\.router.*=CUDA0,.*\\.ffn_shared.*=CUDA0,.*\\.engram_kv.*=CUDA0,.*\\.engram_k.*=CUDA0,.*\\.engram_q.*=CUDA0,^blk\\..*\\.engram_embd.*=CPU,^blk\\..*\\.ffn_.*_exps.*=CPU\"" if is_deepseek4 else "",
             f"-t {min(14, hw['physical_cores'])}",
             f"-tb {min(14, hw['physical_cores'])}",
@@ -878,6 +963,9 @@ def analyze_and_lint_gguf(gguf_info, hw):
         "total_weight_bytes": critical_bytes + moe_bytes + engram_table_bytes,
         "is_deepseek4": is_deepseek4,
         "is_mla": is_mla,
+        "is_draft_companion": is_draft_companion,
+        "is_dflash": is_dflash,
+        "is_mtp": is_mtp,
         "max_safe_ctx": max_safe_ctx,
         "ctx_scaling_table": ctx_scaling_table,
         "mab_profile": mab_profile,
@@ -923,24 +1011,43 @@ def print_report(filepath, gguf_info, hw, analysis, show_multi_context=True):
         print()
 
     print("=" * 80)
-    print("RECOMMENDED RUNTIME FLAGS:")
-    print("  ./build/bin/llama-server \\")
-    print(f"      -m {filepath} \\")
-    if hw["numa_nodes"] > 1:
-        print("      --numa split \\")
-    if analysis.get("is_deepseek4") or analysis.get("engram_table_bytes", 0) > 0:
-        print("      --defer-ple \\")
-        print("      --defer-experts \\")
-        print("      -prexp \\")
-        print(f"      -prexp-t {min(8, hw['physical_cores'])} \\")
-        print("      -sm graph \\")
-        print("      -ot \"^.*\\.attn.*=CUDA0,.*\\.router.*=CUDA0,.*\\.ffn_shared.*=CUDA0,.*\\.engram_kv.*=CUDA0,.*\\.engram_k.*=CUDA0,.*\\.engram_q.*=CUDA0,^blk\\..*\\.engram_embd.*=CPU,^blk\\..*\\.ffn_.*_exps.*=CPU\" \\")
-    elif hw["gpu_vram_bytes"] > 0:
-        print("      -sm graph \\")
-        print("      -ot \"^.*\\.attn.*=CUDA0,.*\\.router.*=CUDA0,.*\\.ffn_shared.*=CUDA0,.*\\.nextn\\..*=CPU,^blk\\..*\\.ffn_.*_exps.*=CPU\" \\")
-    print(f"      -t {min(14, hw['physical_cores'])} \\")
-    print(f"      -tb {min(14, hw['physical_cores'])} \\")
-    print("      -thp")
+    if analysis.get("is_draft_companion"):
+        spec_kind = "dflash" if analysis.get("is_dflash") else "mtp"
+        print(f"RECOMMENDED SPECULATIVE COMPANION RUNTIME FLAGS ({spec_kind.upper()}):")
+        print("  ./build/bin/llama-cli \\")
+        print("      -m <path/to/base_model.gguf> \\")
+        print(f"      -md {filepath} \\")
+        print(f"      --spec-type {spec_kind} \\")
+        print("      --spec-autotune 1 \\")
+        print("      --draft 4 \\")
+        print("      -fa 1 \\")
+        print("      -b 2048 -ub 512 \\")
+        if hw["gpu_vram_bytes"] > 0:
+            print("      -ngl 999 -ngld 99 \\")
+        print(f"      -t {min(14, hw['physical_cores'])} \\")
+        print(f"      -tb {min(14, hw['physical_cores'])} \\")
+        print("      -thp")
+    else:
+        print("RECOMMENDED RUNTIME FLAGS:")
+        print("  ./build/bin/llama-server \\")
+        print(f"      -m {filepath} \\")
+        if hw["numa_nodes"] > 1:
+            print("      --numa split \\")
+        if analysis.get("is_deepseek4") or analysis.get("engram_table_bytes", 0) > 0:
+            print("      --defer-ple \\")
+            print("      --defer-experts \\")
+            print("      -prexp \\")
+            print(f"      -prexp-t {min(8, hw['physical_cores'])} \\")
+            if hw.get("gpu_count", 1) >= 2:
+                print("      -sm graph \\")
+            print("      -ot \"^.*\\.attn.*=CUDA0,.*\\.router.*=CUDA0,.*\\.ffn_shared.*=CUDA0,.*\\.engram_kv.*=CUDA0,.*\\.engram_k.*=CUDA0,.*\\.engram_q.*=CUDA0,^blk\\..*\\.engram_embd.*=CPU,^blk\\..*\\.ffn_.*_exps.*=CPU\" \\")
+        elif hw["gpu_vram_bytes"] > 0:
+            if hw.get("gpu_count", 1) >= 2:
+                print("      -sm graph \\")
+            print("      -ot \"^.*\\.attn.*=CUDA0,.*\\.router.*=CUDA0,.*\\.ffn_shared.*=CUDA0,.*\\.nextn\\..*=CPU,^blk\\..*\\.ffn_.*_exps.*=CPU\" \\")
+        print(f"      -t {min(14, hw['physical_cores'])} \\")
+        print(f"      -tb {min(14, hw['physical_cores'])} \\")
+        print("      -thp")
     print("=" * 80)
 
 def main():
