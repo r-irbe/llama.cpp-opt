@@ -526,17 +526,24 @@ BENCHMARK_MODELS = [
 ]
 
 def resolve_model_path(models_dir, filename):
-    """Resolve model file checking direct path, models_dir, and local caches."""
+    """Resolve model file checking direct path, models_dir, standard env vars, and in-tree caches."""
     if os.path.exists(filename):
         return os.path.abspath(filename)
-    cand = os.path.join(models_dir, filename)
+    cand = os.path.join(models_dir, filename) if models_dir else filename
     if os.path.exists(cand):
         return os.path.abspath(cand)
-    for cache_dir in [
-        "/home/radu/.unsloth/.cache",
-        "/home/radu/code/llama.cpp/unsloth",
-        "/home/radu/code/llama.cpp/models"
-    ]:
+
+    search_dirs = [models_dir] if models_dir else []
+    for env_var in ["LLAMA_CACHE", "HF_HOME", "MODELS_DIR"]:
+        val = os.environ.get(env_var)
+        if val and os.path.exists(val) and val not in search_dirs:
+            search_dirs.append(val)
+    for default_rel in ["models", "scratch"]:
+        rel_path = os.path.abspath(default_rel)
+        if os.path.exists(rel_path) and rel_path not in search_dirs:
+            search_dirs.append(rel_path)
+
+    for cache_dir in search_dirs:
         if os.path.exists(cache_dir):
             for root, _, files in os.walk(cache_dir):
                 if filename in files:
