@@ -116,7 +116,11 @@ static bool server_speculative_uses_target_features(const common_params_speculat
 }
 
 static bool server_speculative_requires_single_slot(const common_params_speculative & spec) {
-    return spec.has_stage_chain();
+    // Draft-model, DFlash-family, MTP and target-feature stages hold shared model/GPU state
+    // that is not yet partitioned per slot. Pure token-lookup stages (ngram-*, suffix) are
+    // independent per-slot instances and are safe with parallel slots.
+    return spec.has_stage_chain() &&
+        (spec.needs_dft_model() || spec.uses_target_features() || spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP));
 }
 
 static bool server_speculative_same_stage_types(
