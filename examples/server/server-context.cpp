@@ -269,8 +269,10 @@ bool server_context::load_model(const gpt_params& params_) {
         return false;
     }
 
-    if (server_speculative_requires_single_slot(params_base.speculative) && params_base.n_parallel > 1) {
-        LOG_ERROR("Speculative decoding is currently limited to a single server slot: restart with -np 1, or drop the --spec-type stage(s) to keep parallel slots.\n", {
+    const bool model_has_global_ckpt = llama_model_is_recurrent(model) || llama_model_is_hybrid(model) || llama_model_is_deepseek4(model);
+    if ((server_speculative_requires_single_slot(params_base.speculative) ||
+         (params_base.speculative.has_stage_chain() && model_has_global_ckpt)) && params_base.n_parallel > 1) {
+        LOG_ERROR("Speculative decoding is currently limited to a single server slot for this model/stage chain: restart with -np 1, or drop the --spec-type stage(s) to keep parallel slots.\n", {
             {"n_parallel", params_base.n_parallel},
             {"stage_chain", common_speculative_stage_chain_to_str(params_base.speculative)},
         });
