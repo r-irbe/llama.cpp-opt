@@ -925,6 +925,8 @@ extern "C" {
 
     // Discard the saved checkpoint and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
+    // Per-sequence variant: in CPU mode only drops the snapshot of seq_id (safe with multiple slots)
+    LLAMA_API void llama_spec_ckpt_discard_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails

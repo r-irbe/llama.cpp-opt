@@ -71,6 +71,7 @@ void common_speculative_checkpoint::clear() {
     valid = false;
     mode = LLAMA_SPEC_CKPT_NONE;
     n_past = 0;
+    seq_id = -1;
     sampled = LLAMA_TOKEN_NULL;
 
     if (sampler != nullptr) {
@@ -2739,6 +2740,7 @@ static bool common_speculative_checkpoint_save(
         int ckpt_mode) {
     ckpt.clear();
     ckpt.n_past = n_past;
+    ckpt.seq_id = seq_id;
     ckpt.sampled = sampled;
 
     const int actual_mode = llama_spec_ckpt_init(ctx, ckpt_mode, max_tokens);
@@ -2749,7 +2751,7 @@ static bool common_speculative_checkpoint_save(
 
     ckpt.valid = llama_spec_ckpt_save(ctx, seq_id);
     if (!ckpt.valid) {
-        llama_spec_ckpt_discard(ctx);
+        llama_spec_ckpt_discard_seq(ctx, seq_id);
         return false;
     }
 
@@ -2773,8 +2775,13 @@ const common_speculative_checkpoint * common_speculative_get_checkpoint(const co
 void common_speculative_checkpoint_discard(
         common_speculative_checkpoint & ckpt,
         llama_context * ctx) {
+    const llama_seq_id seq = ckpt.seq_id;
     ckpt.clear();
-    llama_spec_ckpt_discard(ctx);
+    if (seq >= 0) {
+        llama_spec_ckpt_discard_seq(ctx, seq);
+    } else {
+        llama_spec_ckpt_discard(ctx);
+    }
 }
 
 bool common_speculative_checkpoint_restore(

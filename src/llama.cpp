@@ -11084,7 +11084,6 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     if (resolved == LLAMA_SPEC_CKPT_CPU && !is_dsv4) {
         const size_t cpu_reserve = llama_spec_ckpt_cpu_state_reserve(ctx, 0);
         kv.ckpt.cpu_state_data.clear();
-        kv.ckpt.cpu_state_data.reserve(cpu_reserve);
         LLAMA_LOG_INFO("%s: CPU serialized checkpoint reserve = %8.2f MiB (per seq)\n",
                 __func__, cpu_reserve / 1024.0 / 1024.0);
     }
@@ -11122,10 +11121,11 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
                 return llama_dsv4_spec_ckpt_save(ctx, false);
             }
             const size_t need = llama_state_seq_get_size(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            kv.ckpt.cpu_state_data.resize(need);
+            auto & buf = kv.ckpt.cpu_state_data[seq_id];
+            buf.resize(need);
             const size_t written = llama_state_seq_get_data(
-                ctx, kv.ckpt.cpu_state_data.data(), need, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            kv.ckpt.cpu_state_data.resize(written);
+                ctx, buf.data(), need, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            buf.resize(written);
             return written > 0;
         }
 
@@ -11178,11 +11178,13 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 // conv state is position-strict, so the tail goes before it is written, with or without state
                 llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
             }
-            if (!kv.ckpt.cpu_state_data.empty()) {
+            const auto it_ckpt = kv.ckpt.cpu_state_data.find(seq_id);
+            if (it_ckpt != kv.ckpt.cpu_state_data.end() && !it_ckpt->second.empty()) {
+                const auto & buf = it_ckpt->second;
                 const size_t restored = llama_state_seq_set_data(
-                    ctx, kv.ckpt.cpu_state_data.data(), kv.ckpt.cpu_state_data.size(),
+                    ctx, buf.data(), buf.size(),
                     seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                if (is_openpangu && restored != kv.ckpt.cpu_state_data.size()) {
+                if (is_openpangu && restored != buf.size()) {
                     return LLAMA_SPEC_CKPT_RESTORE_FAILED;
                 }
             }
@@ -11216,6 +11218,17 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
     kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
     kv.ckpt.cpu_state_data.clear();
     llama_dsv4_spec_ckpt_discard(ctx);
+}
+
+void llama_spec_ckpt_discard_seq(struct llama_context * ctx, llama_seq_id seq_id) {
+    auto & kv = ctx->kv_self;
+    // CPU recurrent checkpoints are per sequence: drop only this sequence's snapshot and keep the
+    // fixed mode selected so other slots can still restore theirs.
+    if (kv.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_CPU && !llm_arch_is_dsv4(ctx->model.arch)) {
+        kv.ckpt.cpu_state_data.erase(seq_id);
+        return;
+    }
+    llama_spec_ckpt_discard(ctx);
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

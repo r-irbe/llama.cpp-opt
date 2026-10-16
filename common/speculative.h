@@ -148,6 +148,7 @@ struct common_speculative_checkpoint {
     bool valid = false;
     int mode = LLAMA_SPEC_CKPT_NONE;
     llama_pos n_past = 0;
+    llama_seq_id seq_id = -1;
     llama_token sampled = LLAMA_TOKEN_NULL;
     common_sampler * sampler = nullptr;
 

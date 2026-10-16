@@ -269,7 +269,17 @@ bool server_context::load_model(const gpt_params& params_) {
         return false;
     }
 
-    const bool model_has_global_ckpt = llama_model_is_recurrent(model) || llama_model_is_hybrid(model) || llama_model_is_deepseek4(model);
+    // Recurrent/hybrid models can run speculation with several slots only through the per-sequence
+    // CPU checkpoint (per-step and gpu-fallback snapshots are single-sequence); DSV4 stays single-slot.
+    const bool model_has_seq_ckpt    = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+    const bool model_has_global_ckpt = llama_model_is_deepseek4(model);
+    if (params_base.n_parallel > 1 && model_has_seq_ckpt && params_base.speculative.has_stage_chain() &&
+        !server_speculative_requires_single_slot(params_base.speculative)) {
+        if (params_base.speculative.spec_ckpt_mode != LLAMA_SPEC_CKPT_CPU) {
+            LOG_WARNING("forcing --spec-ckpt-mode cpu: per-sequence checkpoints are required for speculation with multiple slots\n", {});
+        }
+        params_base.speculative.spec_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
+    }
     if ((server_speculative_requires_single_slot(params_base.speculative) ||
          (params_base.speculative.has_stage_chain() && model_has_global_ckpt)) && params_base.n_parallel > 1) {
         LOG_ERROR("Speculative decoding is currently limited to a single server slot for this model/stage chain: restart with -np 1, or drop the --spec-type stage(s) to keep parallel slots.\n", {
@@ -4671,6 +4681,21 @@ void server_context::extend_context(const int32_t n_tokens) {
 }
 
 void server_context::speculative_decoding_accept() {
+    struct spec_accepted_slot {
+        server_slot * slot = nullptr;
+        llama_token sampled_before = LLAMA_TOKEN_NULL;
+        size_t n_draft = 0;
+        std::vector<llama_token> ids;
+        std::vector<int32_t> accepted_output_indices;
+        llama_pos spec_pos_base = 0;
+    };
+
+    std::vector<spec_accepted_slot> accepted_slots;
+    accepted_slots.reserve(slots.size());
+
+    // Phase 1: Sample accepted tokens for all active slots from batch logits.
+    // MUST complete before Phase 2 because slot commits (especially CPU checkpoint restore)
+    // may execute replay decodes that invalidate ctx->logits and ctx->output_ids.
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
             continue;
@@ -4744,16 +4769,25 @@ void server_context::speculative_decoding_accept() {
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
+        accepted_slots.push_back({ &slot, sampled_before, n_draft, std::move(ids), std::move(accepted_output_indices), spec_pos_base });
+    }
+
+    // Phase 2: Commit accepted tokens, restore/replay checkpoints if needed, and emit outputs.
+    for (auto & item : accepted_slots) {
+        auto & slot = *item.slot;
+        const auto & ids = item.ids;
+        const size_t n_draft = item.n_draft;
+
         if (!common_speculative_commit(
             slot.spec,
             ctx,
             slot.ctx_sampling,
             slot.id,
-            sampled_before,
+            item.sampled_before,
             ids,
             n_draft,
-            spec_pos_base,
-            accepted_output_indices)) {
+            item.spec_pos_base,
+            item.accepted_output_indices)) {
             LOG_ERROR("speculative checkpoint restore/commit failed, releasing slot", {
                 {"id_slot", slot.id},
                 {"id_task", slot.id_task},
@@ -4817,11 +4851,11 @@ void server_context::speculative_decoding_accept() {
 
             update_allowlist_state(slot);
         }
-        SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)slot.drafted.size(), slot.n_past);
+        SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)n_draft, slot.n_past);
         LOG_VERBOSE("speculative decoding result", {
             {"id_slot", slot.id},
             {"accepted", (int)ids.size() - 1},
-            {"total", (int)slot.drafted.size()},
+            {"total", (int)n_draft},
             {"new_n_past", slot.n_past}
             });
     }
