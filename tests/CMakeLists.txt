@@ -227,3 +227,7 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
 target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
+
+add_executable(test-kv-zdd test-kv-zdd.cpp)
+target_include_directories(test-kv-zdd PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-kv-zdd COMMAND $<TARGET_FILE:test-kv-zdd>)
