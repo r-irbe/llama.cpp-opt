@@ -609,8 +609,20 @@ extern "C" {
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
+    enum llama_numa_init_status {
+        LLAMA_NUMA_INIT_STATUS_SUCCESS     = 0, // the requested strategy is in effect
+        LLAMA_NUMA_INIT_STATUS_UNAVAILABLE = 1, // not supported on this system, NUMA is left disabled
+        LLAMA_NUMA_INIT_STATUS_FAILED      = 2, // initialization was attempted and failed, see the log
+    };
+
     //optional:
+    LLAMA_API enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa);
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
+    LLAMA_API bool llama_numa_bind_current_thread(int node_id, int thread_idx);
+    LLAMA_API int  llama_numa_node_count(void);
+    LLAMA_API int  llama_numa_get_optimal_draft_node(int target_node);
+    LLAMA_API int  llama_numa_get_gpu_node(int device);
+    LLAMA_API int  llama_numa_get_storage_numa_node(void);
 
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
