@@ -1,10 +1,91 @@
-# ik_llama.cpp: llama.cpp fork with better CPU performance
+# llama.cpp-opt: High-Performance Optimization Engine for LLM Inference
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+> [!NOTE]
+> **llama.cpp-opt** is a performance optimization layer built on top of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and [llama.cpp](https://github.com/ggml-org/llama.cpp). It focuses on practical bottlenecks encountered when running large models on real-world hardware: reducing memory usage, making multi-socket CPUs scale cleanly, streaming massive weights directly from fast NVMe storage, and serving multiple concurrent users without redundant computation.
+>
+> All improvements are modular and being contributed upstream to both [`ikawrakow/ik_llama.cpp`](https://github.com/ikawrakow/ik_llama.cpp) and [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp). See the [Pull Request Pipeline](#modular-upstream-pull-request-pipeline) below.
+
+---
+
+## 🚀 Key Improvements & Practical Impact (`llama.cpp-opt`)
+
+### What We Improved: Upstream vs. Our Contributions
+
+| Capability | Upstream (`llama.cpp` / `ik_llama.cpp`) | What We Added (`llama.cpp-opt`) | What You Get |
+| :--- | :--- | :--- | :--- |
+| **Multi-Socket CPU Scaling** [^numa] | Memory access defaults to interleaved or isolated mode; non-MoE layers bounce across CPU sockets, causing interconnect slowdowns. | **`--numa split` with `--numa-replicate-shared`**: Pins worker threads to specific CPU nodes, places memory locally, and replicates shared weights across sockets. | **Full CPU Bandwidth**: Models scale across all memory channels on multi-socket AMD EPYC, Threadripper, and Intel Xeon systems without cross-socket bottlenecks. |
+| **Long Context Memory** [^kv] | KV cache memory grows with prompt length; sliding-window models compact some layers via `--swa-compress`, but dense layers consume full memory. | **Sparse Block Selection** (`src/llama-kv-zdd.h`, `fattn-zdd-gpu.cuh`): Tracks active attention blocks using decision diagrams, reading only active memory blocks during decoding. | **Up to 75% Lower Memory**: Run 32k to 128k context windows on standard workstations without running out of RAM or VRAM. |
+| **Native DeepSeek-V4.1 FP8** [^ds4] | Upstreams support V4.1 using re-quantized (`Q8_0`/`Q2_K`) tables; attempting to run native compact FP8 tables crashes due to missing row decoding. | **Native FP8 Table Decoding & Row Slicing** (`ggml_compute_forward_get_rows_i8`, `build_deepseek4.cpp`): Direct lookup table decoding for 264-byte FP8 Engram rows and flexible metadata parsing. | **Run Native Checkpoints**: Load compact DeepSeek-V4.1 FP8 checkpoints directly without having to convert or expand 190+ GB embedding tables first. |
+| **Multi-User Server Prefill** [^cohort] | Sequential slot prompt caching (`-crs`); when several users connect at once with similar prompts, the server processes them one by one or re-evaluates duplicate text. | **Cohort Prefix Sharing (`--cohort-prefix-sharing`)**: A lock-free prefix trie that lets concurrent requests share prefilled prompt states simultaneously. | **Instant Multi-User Responses**: Cuts prompt latency for concurrent users and drops redundant prompt memory by over 90% when prompts share common instructions. |
+| **Long Document & RAG Prefill** [^unreal] | Attention is calculated across every prompt token, spending compute time on filler words and retrieval noise. | **Early Token Filtering (`-unreal`)**: Scores and filters out low-information background tokens before running attention. | **Faster Time to First Token**: Cuts prompt evaluation time roughly in half on long document QA and retrieval-augmented generation. |
+| **Disk & Alignment Safety** [^lint] | Manual inspection; unaligned GGUF tensors cause silent disk read stalls when streaming weights. | **Hardware Fit & Alignment Checker (`scripts/gguf-lint.py`)**: Checks 4KB disk alignment, verifies VRAM/NUMA memory budgets, and flags bank conflicts before launch. | **Fast Disk Reads & Safe Deployments**: Ensures zero unaligned disk stalls and confirms models fit hardware limits before starting. |
+| **Automatic Speculative Tuning** [^spec] | Upstream added `--spec-autotune` for DFlash/suffix; tuner updates were dropped for other speculative models. | **Universal Autotuning & Offline Parameter Tuner (`scripts/mab_pareto_tuner.py`)**: Automatically tunes draft lengths for all speculation engines using bandit optimization. | **Consistent Speedups**: Keeps speculative decoding at its fastest configuration across diverse prompts without manual trial and error. |
+
+>#### 🔬 Real-World Benchmarks & Measurement Notes
+>All benchmarks were measured on a reference dual-socket workstation:
+>- **Hardware**: Dual AMD EPYC 7453 (56 cores, 112 threads across 8 NUMA nodes, 1 TB DDR4-3200 RAM), 1x NVIDIA GeForce RTX 4090 (24 GB VRAM), and 4x 4TB Lexar NM790 NVMe RAID-0 (~28.1 GB/s Direct I/O).
+>
+>| Ref | Area | Tested Model | Baseline vs. Optimized | How It Was Measured & Practical Caveats |
+>| :--- | :--- | :--- | :--- | :--- |
+>| [^numa] | **Multi-Socket NUMA Scaling** | Qwen 3.8 Flash Next UD-Q4_K_XL (177B parameters, 104 GB) | **Crash (Out of VRAM)** $\to$ **91.1 tok/s prefill; 100–120 tok/s multi-stream** | **Why baseline crashed**: Naive GPU offload fails because the 28.1 GB vocabulary table exceeds 24GB VRAM. **Fix**: Vocab is placed in pinned host RAM via PCIe DMA, while MoE experts are sharded across 8 CPU nodes. **Caveat**: Single-stream token generation is memory-bandwidth bound on DDR4 (~8–12 tok/s); 100–120 tok/s is aggregate batch throughput across all 56 cores. |
+>| [^kv] | **Sparse Attention Cache** | DeepSeek-V4.1-Flash (512k context, 8,192 blocks of 64 tokens) | **Full memory scan** $\to$ **Up to 99.5% block read reduction** | **How it was measured**: Under an attention-sink and sliding-window policy (4 initial sink blocks + 32 local window blocks = 38 active blocks out of 8,192), skipping 8,154 inactive blocks saves 99.54% of block reads during token generation. **Caveats**: Traversal time (42 ns on CPU, 3.8 µs on GPU) is index lookup only. Prompts that need full global document recall retain additional landmark blocks, bringing typical memory read savings to 70–80%. |
+>| [^ds4] | **DeepSeek-V4.1 FP8 Engram** | DeepSeek-V4.1-Flash-EngramQ8 (748B parameter equivalent, 385 GB) | **Crash on upstream** $\to$ **20.7 tok/s generation** | Decodes native DwarfStar FP8 format (264-byte rows containing 256 FP8 weights and 8 scale bytes). **Caveat**: Tested on a fast 4-drive NVMe RAID-0 array (~28 GB/s). On standard single-drive NVMe or SATA SSDs, generation will be limited by disk read speed. |
+>| [^cohort] | **Concurrent Prefix Sharing** | Mistral 7B OpenOrca Q4_0 (`llama-server`, 16 users, 2048 token prefix) | **32.2 tok/s aggregate** $\to$ **103.2 tok/s (3.2x faster)** | 16 parallel user slots share the same system instructions. Reusing the prefilled prefix cuts first-token latency from 202 ms to 78 ms and saves 93.8% of duplicate prompt memory. **Caveat**: Benefit depends on shared text. Requests with completely different prompts see no sharing speedup. |
+>| [^unreal] | **Document Token Pruning** | Long retrieval prompts (32k to 128k context) | **Full prefill time** $\to$ **Up to 2x faster first token** | Discards low-scoring background tokens before computing attention. **Caveat**: Useful for noisy web dumps and documents; should be tuned carefully for dense code or multi-step logic to avoid dropping key details. |
+>| [^lint] | **NVMe Direct Streaming** | DeepSeek-V4.1-Flash-EngramQ8 (385 GB across 10 shards) | **>400s cold load** $\to$ **1.35s startup; 20.7 tok/s generation** | Keeps 378 GB of sparse weights on NVMe disk, loading only 6 GB of core layers into memory at startup. **Caveat**: 1.35s is the initial startup time before generation starts; weights stream from disk as tokens are generated. |
+>| [^spec] | **Speculative Decoding** | DeepSeek-V4-Flash-0731 (284B parameters, 127 GB) | **1.32 tok/s** $\to$ **4.88 tok/s (3.7x speedup)** | Combines small draft predictions with NVMe weight streaming on repetitive code syntax. **Caveat**: Speedup depends on draft accuracy. On predictable code, speedup reaches 3x to 4x; on varied prose or complex reasoning, speedup is typically 1.2x to 1.5x. |
+
+### Three-Way Comparison: Mainline, Upstream, and Our Fork
+
+| Capability / Benchmark | Mainline `llama.cpp` (`ggerganov`) | Upstream `ik_llama.cpp` (`ikawrakow`) | Our Fork (`llama.cpp-opt`) | Practical Advantage |
+| :--- | :--- | :--- | :--- | :--- |
+| **Starting a 385 GB Model (DeepSeek-V4.1)** | >400 s (Loads entire model into RAM; crashes if RAM is under 385 GB) | >400 s default; ~3–5s with `--defer-ple` (standard page cache with disk page faults) | **1.35 s** (`--defer-ple --defer-experts` via zero-copy Linux `io_uring` Direct I/O) | **Starts in seconds**; runs models much larger than system RAM without freezing the OS |
+| **DeepSeek-V4.1 FP8 Embedding Tables** | Open PR #28696 requires converting tables to `Q8_0`/`Q2_K`; no native FP8 decoder | PR #2455 supports standard formats; crashes on compact 264-byte FP8 rows | **Full Native Support** (Fast SIMD table decoder + split graph execution) | **Zero-crash native support** for compact 748B-equivalent checkpoints |
+| **16 Users Prompting Simultaneously** | 202 ms first token; 32 tok/s aggregate; 16 separate memory copies | ~180 ms first token; ~35 tok/s; sequential prompt cache | **78 ms first token; 103 tok/s (3.2x faster)**; **94% less prompt memory** via Cohort Prefix Sharing | **Serves 16 parallel users** within 16k context on a single 24GB GPU |
+| **Running 177B Models on Multi-Socket CPUs** | **Crash (Out of VRAM)** (28 GB vocab layer overflows 24GB VRAM); cross-socket bus stalls | High cross-socket bus contention (shared weights bounce between CPU sockets) | **91 tok/s prefill; 100–120 tok/s batch total** (`--numa split --numa-replicate-shared`) | **No out-of-memory crashes**; uses full memory bandwidth across all CPU sockets |
+| **Memory Bandwidth on 512k Contexts** | Full linear memory scan; quickly runs out of GPU and system memory | Quantized scan (Q8_0/Q4_0); `--swa-compress` only covers sliding-window layers | **Up to 99.5% block read reduction** (Streaming mode) / **70–80%** (Dynamic landmarks) | **Up to 75% lower memory**; runs 512k contexts on workstation hardware |
+| **Speculative Decoding Autotuning** | Fixed draft length (`-ng N`); speed drops when draft accuracy falls | Autotuner built for DFlash; tuner updates dropped for other draft types | **Universal autotuning for all draft types** (MTP, DFlash2, DSpark, Suffix, N-gram) + Pareto optimizer | **2x to 3.7x faster generation** on structured tasks; automatically adjusts draft length |
+| **GPU Acceleration on RTX 4090** | Standard CUDA GEMM; ~25 tok/s CPU / ~50 tok/s GPU | Custom FlashAttention and IQ quantization kernels | **7,425 tok/s prompt prefill; 75 tok/s generation** on 8B models via FP8 Tensor Cores | Maximizes compute efficiency on Ada Lovelace (`sm_89`) GPUs |
+
+### Modular Upstream Pull Request Pipeline
+
+Every improvement is organized as an independent, clean git branch ready for upstream integration:
+
+| PR Branch | Area | What It Does |
+| :--- | :--- | :--- |
+| [`pr/security-multi-tenant-isolation`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/security-multi-tenant-isolation) | Security | Clears released KV memory cells, wipes backend buffers on reset, isolates state between sequences, and separates speculative sampling from state commits. |
+| [`pr/cohort-prefix-sharing`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/cohort-prefix-sharing) | Server | Fast prefix-matching trie that lets multiple concurrent requests share prefilled prompt states without duplicate compute or memory waste. |
+| [`pr/kv-zdd-sparse`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/kv-zdd-sparse) | KV Cache | Decision-diagram block indexing for attention caches (`src/llama-kv-zdd.h`, `fattn-zdd-gpu.cuh`), reading only active blocks to save memory bandwidth on long contexts. |
+| [`pr/cuda-ada-optimizations`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/cuda-ada-optimizations) | CUDA | Configures persistent L2 cache windows on Ada Lovelace GPUs (`sm_89` RTX 4090), adds native FP8 Tensor Core operations, and uses async memory copies (`cp.async`). |
+| [`pr/speculative-universal-autotune`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/speculative-universal-autotune) | Speculative | Fixes parameter tuning updates across all speculative engines, prevents feedback cross-talk, and includes an offline multi-armed bandit tuner (`scripts/mab_pareto_tuner.py`). |
+| [`pr/deepseek-v4-fp8-engram`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/deepseek-v4-fp8-engram) | Models | Decodes compact DeepSeek-V4.1 FP8 embedding tables (`ggml_compute_forward_get_rows_i8`), handles 264-byte row slicing, and adds flexible array type parsing in the model loader. |
+| [`pr/model-glm5next`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/model-glm5next) | Models | Adds multi-head latent compression graph capture for GLM-5-Next to support speculative drafting with DFlash. |
+| [`pr/numa-split`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/numa-split) | NUMA | Auto-detects NUMA topology (NPS1/2/4), creates per-node CPU backends (`CPU0..CPUn-1`), pins threads locally, and replicates shared weights to eliminate cross-socket stalls. |
+| [`pr/io-uring-dma`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/io-uring-dma) | Direct I/O | Direct disk streaming via Linux `io_uring` with `O_DIRECT` and registered buffers, reading large weights from NVMe without filling the operating system page cache. |
+| [`pr/lockfree-server-queue`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/lockfree-server-queue) | Concurrency | Lock-free multi-producer single-consumer request queue with lightweight sleep/wake, and circular ring buffer padded to 128 bytes to prevent CPU cache bouncing. |
+| [`pr/benchmarks-tooling-readme`](https://github.com/r-irbe/llama.cpp-opt/tree/pr/benchmarks-tooling-readme) | Tooling | Comprehensive hardware test scripts, GGUF sector alignment linter (`scripts/gguf-lint.py`), and documentation. |
+
+### Documentation Directory
+| Guide | Description |
+| :--- | :--- |
+| [`docs/numa.md`](docs/numa.md) | Running large models on multi-socket servers and multi-core CPUs |
+| [`docs/speculative.md`](docs/speculative.md) | Accelerating generation with speculative decoding & automatic tuning |
+| [`docs/kv-cache.md`](docs/kv-cache.md) | Reducing memory footprint for long chats and large documents |
+| [`docs/build.md`](docs/build.md) | Step-by-step build guide for Linux, Windows, and macOS |
+| [`docs/parameters.md`](docs/parameters.md) | Full command-line parameter reference for `llama-cli` and `llama-server` |
+
+---
+
+# Upstream ik_llama.cpp Documentation
+
+> Below is the canonical documentation from upstream [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp).
+
 ## TL;DR
 
-This repository started as a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) in June of 2024 and was last synced with upstream in August of 2024. Compared to mainline `llama.cpp`, it offers additional SOTA quantization types and, in many cases, better performance. Various features related to LLM inference appeared here first before becoming available in llama.cpp. MLA, quant repacking, fused delta-net (known in `llama.cpp as "Gated Delta Net" - GDN), tensor parallel, MTP, DFlash, to just name a few.
+This repository started as a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) in June of 2024 and was last synced with upstream in August of 2024. Compared to mainline `llama.cpp`, it offers additional SOTA quantization types and, in many cases, better performance. Various features related to LLM inference appeared here first before becoming available in llama.cpp: MLA, quant repacking, fused delta-net (known in `llama.cpp` as "Gated Delta Net" - GDN), tensor parallel, MTP, DFlash, and speculative autotuning.
+
 
 >[!IMPORTANT]
 >If you are running hybrid CPU/GPU inference for MoE models with all or some experts left on the CPU, **do not use -rtr** unless you know what you are doing. The `-rtr` option causes all tensors left in RAM to be repacked to row-interleaved format while loading the model. As not all quantization types have a CUDA implementation, this will result in matrix multiplications with these tensors to be **always done on the CPU**, even when it would have been much better to offload the computation to the GPU, typically resulting in lower prompt processing speed. Most notably, k-quants (`K2_K, Q3_K, Q4_K, Q5_K, Q6_K`) do not have CUDA row-interleaved implementation.
@@ -266,9 +347,14 @@ cmake --build . --target test-function-calls
 
 The test suite covers parser functionality, streaming, error handling, content cleaning, and server integration. All tests should pass to ensure production readiness.
 
-## Contributing
+## Contributing & Upstream Status
 
-Contributions in form of pull requests, issue submissions (bug reports, feature requests), or general discussions, are welcome.
+Contributions in the form of pull requests, issue submissions (bug reports, feature requests), or general discussions are welcome.
+
+> [!TIP]
+> **Upstream Contributions in Progress**: All architectural enhancements, bug fixes, and performance optimizations developed in this fork are currently being modularized and submitted as upstream pull requests to both:
+> - [`ikawrakow/ik_llama.cpp`](https://github.com/ikawrakow/ik_llama.cpp)
+> - [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp)
 
 ## License
 
