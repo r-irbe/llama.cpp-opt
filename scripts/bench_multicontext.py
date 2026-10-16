@@ -179,6 +179,17 @@ def parse_arguments():
         help="Number of worker threads dedicated to NVMe prefetch"
     )
     parser.add_argument(
+        "--rope-scaling",
+        default=None,
+        help="RoPE scaling method (e.g. none, linear, yarn)"
+    )
+    parser.add_argument(
+        "--yarn-orig-ctx",
+        type=int,
+        default=None,
+        help="Original context size for YaRN calculation (e.g. 262144, 65536)"
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulate execution without running binary"
@@ -473,6 +484,10 @@ def main():
             if args.prefetch_experts:
                 cmd.append("-prexp")
                 cmd.extend(["-prexp-t", str(args.prefetch_threads)])
+            if args.rope_scaling:
+                cmd.extend(["--rope-scaling", args.rope_scaling])
+            if args.yarn_orig_ctx is not None:
+                cmd.extend(["--yarn-orig-ctx", str(args.yarn_orig_ctx)])
 
             env = os.environ.copy()
             env["GGML_CUDA_NO_PINNED"] = "1"
