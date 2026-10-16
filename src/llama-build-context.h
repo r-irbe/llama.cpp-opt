@@ -660,7 +660,8 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * prev_embeddings,
         int64_t n_embd_head,
         struct ggml_cgraph * gf,
-        struct ggml_tensor * inp_pos
+        struct ggml_tensor * inp_pos,
+        bool emit_logits
     );
 
     struct ggml_tensor * build_qwen35moe_mtp(
@@ -668,7 +669,8 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * prev_embeddings,
         int64_t n_embd_head,
         struct ggml_cgraph * gf,
-        struct ggml_tensor * inp_pos
+        struct ggml_tensor * inp_pos,
+        bool emit_logits
     );
 
     static bool llama_graph_build_zdd_skip_mask(llama_context & lctx, const llama_kv_cache & kv, int32_t n_kv, std::vector<uint8_t> & out_skip_mask);
