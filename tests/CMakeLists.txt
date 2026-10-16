@@ -217,6 +217,9 @@ target_include_directories(test-cohort-prefix-sharing PRIVATE ${PROJECT_SOURCE_D
 
 llama_build_and_test(test-numa.cpp)
 target_include_directories(test-numa PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/common)
+
+llama_build_and_test(test-io-uring.cpp)
+target_include_directories(test-io-uring PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
