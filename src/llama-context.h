@@ -216,7 +216,7 @@ struct llama_kv_cache {
         int32_t fixed_max_tokens = 0;
 
         // Serialised sequence state for CPU mode
-        std::vector<uint8_t> cpu_state_data;
+        std::unordered_map<llama_seq_id, std::vector<uint8_t>> cpu_state_data;
 
         // Private DSV4 state snapshot used by GPU/CPU fallback modes.
         std::vector<std::vector<uint8_t>> dsv4_state_data;
