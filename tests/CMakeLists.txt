@@ -224,3 +224,8 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
 target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
+
+if (GGML_CUDA)
+    llama_build_and_test(test-cuda-l2-persistence.cpp)
+    target_include_directories(test-cuda-l2-persistence PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()

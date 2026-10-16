@@ -166,6 +166,10 @@ typedef float2 dfloat2;
 #define CP_ASYNC_AVAILABLE
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_AMPERE
 
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_ADA_LOVELACE
+#define FP8_MMA_AVAILABLE
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_ADA_LOVELACE
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -215,6 +219,10 @@ static constexpr bool fp16_mma_available(const int cc) {
 
 static constexpr bool int8_mma_available(const int cc) {
     return cc < CC_OFFSET_AMD && cc >= CC_TURING;
+}
+
+static bool fp8_mma_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= CC_ADA_LOVELACE;
 }
 
 // Volta technically had FP16 tensor cores but they work very differently compared to Turing and later.
@@ -804,6 +812,9 @@ struct ggml_cuda_device_info {
         bool    vmm;                // virtual memory support
         size_t  vmm_granularity;    // granularity of virtual memory
         size_t  total_vram;
+        size_t  l2_cache_size = 0;              // Total L2 cache size in bytes (e.g. 72 MiB on RTX 4090)
+        size_t  persisting_l2_cache_max_size = 0; // Maximum allocatable persisting L2 size (e.g. 49.5 MiB on RTX 4090)
+        size_t  persisting_l2_cache_cur_limit = 0; // Current limit set via cudaDeviceSetLimit
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
@@ -828,6 +839,9 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual void * get_base_ptr() const { return nullptr; }
+    virtual size_t get_size() const { return 0; }
+    virtual size_t get_used() const { return 0; }
 };
 
 template<typename T>
@@ -917,6 +931,15 @@ struct ggml_backend_cuda_context {
     const void * model;
     void * copy_buffer = nullptr;
     size_t copy_size   = 0;
+
+    // L2 cache residency control (Ada Lovelace sm_89 / Ampere sm_80)
+    void *  persisting_base_ptr  = nullptr;
+    size_t  persisting_num_bytes = 0;
+    float   persisting_hit_ratio = 0.0f;
+
+    void set_l2_persistence_window(cudaStream_t stream, void * base_ptr, size_t num_bytes, float hit_ratio = 1.0f);
+    void clear_l2_persistence_window(cudaStream_t stream);
+    void apply_l2_persistence_window(cudaStream_t stream);
 
     explicit ggml_backend_cuda_context(int device, const void * model);
 

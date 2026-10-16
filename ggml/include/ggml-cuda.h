@@ -37,6 +37,7 @@ GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type
 GGML_API GGML_CALL int  ggml_backend_cuda_get_device_count(void);
 GGML_API GGML_CALL void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+GGML_API GGML_CALL int  ggml_backend_cuda_get_device_numa_node(int device);
 
 GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
@@ -44,6 +45,13 @@ GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 GGML_API GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
 
 GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
+
+// L2 cache residency control (Ada Lovelace sm_89 / Ampere sm_80)
+GGML_API GGML_CALL void ggml_backend_cuda_set_l2_persistence_window(ggml_backend_t backend, void * base_ptr, size_t num_bytes, float hit_ratio);
+GGML_API GGML_CALL void ggml_backend_cuda_get_l2_cache_info(int device, size_t * l2_size, size_t * max_persisting_size, size_t * cur_persisting_limit);
+
+// GPU SIMT & Cache Hierarchy KV Block Selector (Ada Lovelace sm_89)
+GGML_API GGML_CALL bool ggml_backend_cuda_eval_sparse_kv_blocks(int device, uint32_t num_blocks, uint32_t n_sinks, uint32_t n_window, uint32_t * out_active_count, float * out_latency_us);
 
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
 #ifdef  __cplusplus

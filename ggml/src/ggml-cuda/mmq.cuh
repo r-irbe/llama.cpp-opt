@@ -11,6 +11,8 @@
 #include "vecdotq.cuh"
 #include "mma.cuh"
 #include "iqk_cuda_common.h"
+#include "cp-async.cuh"
+#include "mma_new.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -4368,6 +4370,27 @@ struct mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, GGML_TYPE_IQ5_KS_R4> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y, nwarps>;
 };
 
+template <int nwarps>
+static __device__ __forceinline__ void load_y_async(
+    int * __restrict__ dst_tile, const int * __restrict__ src_y, const int mmq_x) {
+#ifdef CP_ASYNC_AVAILABLE
+    const unsigned int dst_u32 = ggml_cuda_cvta_generic_to_shared(dst_tile);
+    const int total_16b = (mmq_x * MMQ_TILE_Y_K) / 4;
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int nthreads = nwarps * WARP_SIZE;
+
+#pragma unroll
+    for (int idx = tid; idx < total_16b; idx += nthreads) {
+        cp_async_cg_16<128>(dst_u32 + idx * 16, src_y + idx * 4);
+    }
+#else
+    GGML_UNUSED(dst_tile);
+    GGML_UNUSED(src_y);
+    GGML_UNUSED(mmq_x);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 template <ggml_type type, int mmq_x, int nwarps, bool need_check, bool fixup, bool has_tail>
 static __device__ void mul_mat_q_process_tile(
     const char * __restrict__ x, const char * __restrict__ yc, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -4382,7 +4405,12 @@ static __device__ void mul_mat_q_process_tile(
 
     extern __shared__ char data_mul_mat_q[];
     int * tile_y = (int *) data_mul_mat_q;
-    int * tile_x = tile_y + GGML_PAD(mmq_x*(WARP_SIZE + WARP_SIZE/QI8_1), nwarps*WARP_SIZE);
+    constexpr int shmem_y_stride = GGML_PAD(mmq_x*(WARP_SIZE + WARP_SIZE/QI8_1), nwarps*WARP_SIZE);
+#ifdef CP_ASYNC_AVAILABLE
+    int * tile_x = tile_y + 2 * shmem_y_stride;
+#else
+    int * tile_x = tile_y + shmem_y_stride;
+#endif
 
 #ifdef INT8_MMA_AVAILABLE
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_mma;
@@ -4403,6 +4431,53 @@ static __device__ void mul_mat_q_process_tile(
 
     const int kb0_full_stop = has_tail ? min(kb0_stop, ne00/qk) : kb0_stop;
     int kb0 = kb0_start;
+
+#ifdef CP_ASYNC_AVAILABLE
+    int * tile_y_0 = tile_y;
+    int * tile_y_1 = tile_y + shmem_y_stride;
+
+    // Pre-fetch sub-block 0 for first iteration directly to SMEM via cp.async
+    if (kb0 < kb0_full_stop) {
+        const int * by0 = y + stride11*(kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 0*sizeof(block_q8_1_mmq)/sizeof(int));
+        load_y_async<nwarps>(tile_y_0, by0, mmq_x);
+        cp_async_commit_group();
+    }
+
+    for (; kb0 < kb0_full_stop; kb0 += blocks_per_iter) {
+        load_tiles(x + int64_t(stride01)*it*mmq_y, tile_x, kb0, tile_x_max_i, stride01, blocks_per_ne00);
+
+        // Wait for sub-block 0 async copy to complete
+        cp_async_wait_group<0>();
+        __syncthreads();
+
+        // Pre-fetch sub-block 1
+        {
+            const int * by1 = y + stride11*(kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 1*sizeof(block_q8_1_mmq)/sizeof(int));
+            load_y_async<nwarps>(tile_y_1, by1, mmq_x);
+            cp_async_commit_group();
+        }
+
+        // Tensor Core computation on sub-block 0 overlaps with background copy of sub-block 1
+        vec_dot(tile_x, tile_y_0, sum, 0);
+
+        // Wait for sub-block 1 async copy to complete
+        cp_async_wait_group<0>();
+        __syncthreads();
+
+        // Pre-fetch next iteration's sub-block 0 if more iterations remain
+        const int next_kb0 = kb0 + blocks_per_iter;
+        if (next_kb0 < kb0_full_stop) {
+            const int * next_by0 = y + stride11*(next_kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 0*sizeof(block_q8_1_mmq)/sizeof(int));
+            load_y_async<nwarps>(tile_y_0, next_by0, mmq_x);
+            cp_async_commit_group();
+        }
+
+        // Tensor Core computation on sub-block 1 overlaps with background copy of next sub-block 0
+        vec_dot(tile_x, tile_y_1, sum, WARP_SIZE);
+
+        __syncthreads();
+    }
+#else
     for (; kb0 < kb0_full_stop; kb0 += blocks_per_iter) {
         load_tiles(x + int64_t(stride01)*it*mmq_y, tile_x, kb0, tile_x_max_i, stride01, blocks_per_ne00);
 
@@ -4438,6 +4513,7 @@ static __device__ void mul_mat_q_process_tile(
 
         __syncthreads();
     }
+#endif // CP_ASYNC_AVAILABLE
 
     if constexpr (has_tail) {
         if (kb0 < kb0_stop) {
@@ -4655,7 +4731,9 @@ static int mmq_get_shmem(const int mmq_x, const int mmq_y, const int cc) {
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
     const int shmem_x = int8_mma_available(cc) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const int shmem_y = mmq_x*sizeof(block_q8_1_mmq);
-    return shmem_x + GGML_PAD(shmem_y, MMQ_NWARPS*WARP_SIZE*sizeof(int));
+    const int shmem_y_stride = GGML_PAD(shmem_y, MMQ_NWARPS*WARP_SIZE*sizeof(int));
+    const int n_stages = cp_async_available(cc) ? 2 : 1;
+    return shmem_x + n_stages * shmem_y_stride;
 }
 
 template <ggml_type type, int mmq_x, bool has_tail>
