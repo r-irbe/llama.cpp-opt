@@ -1625,8 +1625,13 @@ llama_tokens common_speculative_draft(
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
         impl_params.draft_temperature = spec->draft_temperature;
         impl_params.draft_seed = spec->draft_seed;
-        if (spec->tuner && spec->tuner->enabled && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (spec->tuner && spec->tuner->enabled && impl->type == spec->tuner->spec_type) {
             impl_params.n_max = params.n_max;
+            impl_params.p_min = params.p_min;
+            impl_params.n_min = params.n_min;
+            if (impl->type == COMMON_SPECULATIVE_TYPE_SUFFIX) {
+                impl_params.suffix_min_match_len = params.suffix_min_match_len;
+            }
         }
         result.clear();
 
@@ -1680,11 +1685,15 @@ llama_tokens common_speculative_draft(
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
     if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
-        int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
-        double step_tps = (step_time_us > 100)
-            ? (n_accepted + 1.0) * 1e6 / (double)step_time_us
-            : 0.0;
-        spec->tuner->accept_feedback(n_accepted, spec->last_n_drafted, step_tps);
+        const bool is_tuned_impl = (spec->curr_impl && spec->curr_impl->type == spec->tuner->spec_type) ||
+                                   spec->last_step_target_only;
+        if (is_tuned_impl) {
+            int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
+            double step_tps = (step_time_us > 100)
+                ? (n_accepted + 1.0) * 1e6 / (double)step_time_us
+                : 0.0;
+            spec->tuner->accept_feedback(n_accepted, spec->last_n_drafted, step_tps);
+        }
         spec->t_step_start_us = 0;
     }
 

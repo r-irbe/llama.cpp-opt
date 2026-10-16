@@ -13,6 +13,15 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### Multi-Token Prediction (`mtp`)
+
+Models with pre-trained multi-token prediction heads (e.g. DeepSeek-V3, GLM-4/5 with `blk.nextn.*` tensors) predict future tokens directly using auxiliary prediction layers without requiring an external draft model.
+Multiple MTP heads (`heads=k`) can predict up to $k$ tokens ahead concurrently.
+
+### DFlash / DFlash2 / DSpark (`dflash`)
+
+DFlash performs speculative drafting using feature-level hyper-connections and dynamic drafting masks, generating multi-token proposals in a single forward pass without sequential autoregressive unrolling.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -113,7 +122,8 @@ Each `--spec-type` entry defines one speculative stage. Repeat it to configure t
 |------|-------------|
 | `none` | No speculative decoding |
 | `draft` | Draft-model speculative decoding; pair with `-md/--model-draft` |
-| `mtp` | Embedded or assistant-backed MTP |
+| `mtp` | Embedded or assistant-backed MTP (e.g. DeepSeek-V3, GLM-4/5) |
+| `dflash` | DFlash / DFlash2 / DSpark feature-level dynamic speculative drafting |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
 | `ngram-map-k` | Use n-gram pattern matching with n-gram keys |
@@ -175,7 +185,16 @@ Examples:
 
 ### `--spec-autotune`
 
-Autotunes the active stage parameters and reports the best configuration back as a canonical `--spec-type ...` snippet.
+Autotunes the active speculative stage parameters (`n_max`, `n_min`, `p_min`, `heads`) dynamically at runtime using multi-armed bandit (MAB) exploration and Pareto frontier tracking.
+
+- Continuously measures draft acceptance rate versus verification overhead.
+- Converges to optimal draft lengths based on the current prompt domain and token generation dynamics.
+- Emits the optimal configuration as a reproducible `--spec-type ...` snippet upon completion.
+
+Usage:
+```bash
+./llama-server -m model.gguf --spec-type ngram-mod --spec-autotune
+```
 
 ## Statistics
 Each speculative decoding implementation prints statistics.
