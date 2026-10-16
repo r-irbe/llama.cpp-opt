@@ -48,6 +48,8 @@ add_library(llama
             llama-grammar.cpp
             llama-sampling.cpp
             llama-mmap.cpp
+            llama-io-uring.h
+            llama-io-uring.cpp
             llama-model-loader.cpp
             llama-load-tensors.cpp
             llama-build-context.h
