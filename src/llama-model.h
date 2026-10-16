@@ -670,7 +670,7 @@ struct llama_model {
         auto n_tensors = tensors_by_name.size();
         if (split_mode == LLAMA_SPLIT_MODE_GRAPH && !devices.empty()) n_tensors *= devices.size();
         if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5NEXT) {
-            return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
+            return std::max<size_t>({(size_t)n_tokens * 64 + 32768, (size_t)64u * n_tensors + 32768, (size_t)131072});
         }
         //return std::max<size_t>(1024, 8*n_tensors);
         return 65536;

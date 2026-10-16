@@ -28,6 +28,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstring>
+#include <cinttypes>
 
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
@@ -103,6 +104,35 @@ namespace GGUFMeta {
             const enum gguf_type kt = gguf_get_kv_type(ctx, k);
 
             if (kt != GKV::gt) {
+                if constexpr (std::is_floating_point<T>::value) {
+                    switch (kt) {
+                        case GGUF_TYPE_UINT8:   return static_cast<T>(gguf_get_val_u8(ctx, k));
+                        case GGUF_TYPE_INT8:    return static_cast<T>(gguf_get_val_i8(ctx, k));
+                        case GGUF_TYPE_UINT16:  return static_cast<T>(gguf_get_val_u16(ctx, k));
+                        case GGUF_TYPE_INT16:   return static_cast<T>(gguf_get_val_i16(ctx, k));
+                        case GGUF_TYPE_UINT32:  return static_cast<T>(gguf_get_val_u32(ctx, k));
+                        case GGUF_TYPE_INT32:   return static_cast<T>(gguf_get_val_i32(ctx, k));
+                        case GGUF_TYPE_UINT64:  return static_cast<T>(gguf_get_val_u64(ctx, k));
+                        case GGUF_TYPE_INT64:   return static_cast<T>(gguf_get_val_i64(ctx, k));
+                        case GGUF_TYPE_FLOAT32: return static_cast<T>(gguf_get_val_f32(ctx, k));
+                        case GGUF_TYPE_FLOAT64: return static_cast<T>(gguf_get_val_f64(ctx, k));
+                        default: break;
+                    }
+                } else if constexpr (std::is_integral<T>::value && !std::is_same<T, bool>::value) {
+                    switch (kt) {
+                        case GGUF_TYPE_UINT8:   return static_cast<T>(gguf_get_val_u8(ctx, k));
+                        case GGUF_TYPE_INT8:    return static_cast<T>(gguf_get_val_i8(ctx, k));
+                        case GGUF_TYPE_UINT16:  return static_cast<T>(gguf_get_val_u16(ctx, k));
+                        case GGUF_TYPE_INT16:   return static_cast<T>(gguf_get_val_i16(ctx, k));
+                        case GGUF_TYPE_UINT32:  return static_cast<T>(gguf_get_val_u32(ctx, k));
+                        case GGUF_TYPE_INT32:   return static_cast<T>(gguf_get_val_i32(ctx, k));
+                        case GGUF_TYPE_UINT64:  return static_cast<T>(gguf_get_val_u64(ctx, k));
+                        case GGUF_TYPE_INT64:   return static_cast<T>(gguf_get_val_i64(ctx, k));
+                        case GGUF_TYPE_FLOAT32: return static_cast<T>(gguf_get_val_f32(ctx, k));
+                        case GGUF_TYPE_FLOAT64: return static_cast<T>(gguf_get_val_f64(ctx, k));
+                        default: break;
+                    }
+                }
                 throw std::runtime_error(format("key %s has wrong type %s but expected type %s",
                     gguf_get_key(ctx, k), gguf_type_name(kt), gguf_type_name(GKV::gt)));
             }
@@ -420,6 +450,33 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     n_tensors = weights.size();
 
     fver = (enum llama_fver) gguf_get_version(meta);
+
+    // Scan GGUF metadata for GGUF-X / NPMC unpadded tensor dimensions (breaking DRAM bank aliasing)
+    {
+        const std::string unpad_prefix = "npmc.unpadded_dim0.";
+        for (int i = 0; i < n_kv; ++i) {
+            const char * key = gguf_get_key(meta, i);
+            if (strncmp(key, unpad_prefix.c_str(), unpad_prefix.size()) == 0) {
+                std::string tensor_name = key + unpad_prefix.size();
+                int64_t val = 0;
+                enum gguf_type type = gguf_get_kv_type(meta, i);
+                if (type == GGUF_TYPE_UINT64) {
+                    val = (int64_t) gguf_get_val_u64(meta, i);
+                } else if (type == GGUF_TYPE_INT64) {
+                    val = gguf_get_val_i64(meta, i);
+                } else if (type == GGUF_TYPE_UINT32) {
+                    val = (int64_t) gguf_get_val_u32(meta, i);
+                } else if (type == GGUF_TYPE_INT32) {
+                    val = (int64_t) gguf_get_val_i32(meta, i);
+                }
+                if (val > 0) {
+                    unpadded_dim0[tensor_name] = val;
+                    LLAMA_LOG_INFO("%s: GGUF-X bank-aliasing padding detected for '%s': unpadded dim0 = %" PRId64 "\n",
+                                   __func__, tensor_name.c_str(), val);
+                }
+            }
+        }
+    }
 
     std::set<std::string> tensor_names;
     for (auto & w : weights) {
@@ -795,7 +852,27 @@ llama_model_loader::get_arr_n(const std::string & key, T & result, const bool re
 template<typename T>
 typename std::enable_if<std::is_integral<T>::value, bool>::type
 llama_model_loader::get_arr_n(const enum llm_kv kid, T & result, const bool required) {
-    return get_arr_n(llm_kv(kid), result, required);
+    if (get_arr_n(llm_kv(kid), result, false)) {
+        return true;
+    }
+
+    bool found = false;
+    switch (kid) {
+        case LLM_KV_ATTENTION_COMPRESS_RATIOS:
+            found = get_arr_n(arch_name + ".compress_ratios", result, false);
+            break;
+        default:
+            break;
+    }
+
+    if (found) {
+        return true;
+    }
+
+    if (required) {
+        throw std::runtime_error(format("array key not found in model: %s", llm_kv(kid).c_str()));
+    }
+    return false;
 }
 
 template<typename T>
@@ -812,24 +889,90 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
     struct GGUFMeta::ArrayInfo arr_info =
         GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(meta, kid);
 
-    switch (arr_info.gt) {
-        case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T, float>::value)); break;
-        case GGUF_TYPE_UINT32:
-        case GGUF_TYPE_BOOL:
-        case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
-        case GGUF_TYPE_UINT64:
-        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>) || (std::is_same_v<T, uint64_t>));  break;
-        default:
-            throw std::runtime_error(format("%s is not a float32, int32, uint32, int64, uint64 or bool array", key.c_str()));
-    }
-
     result.resize(arr_info.length);
-    if (arr_info.gt == GGUF_TYPE_BOOL) {
-        std::transform((const int8_t *)arr_info.data, (const int8_t *)arr_info.data + arr_info.length, result.begin(),
-                [] (int8_t x) { return static_cast<T>(x != 0); });
 
-    } else {
-        result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+    switch (arr_info.gt) {
+        case GGUF_TYPE_UINT8: {
+            const auto * p = static_cast<const uint8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT8: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT16: {
+            const auto * p = static_cast<const uint16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT16: {
+            const auto * p = static_cast<const int16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT32: {
+            if constexpr (std::is_same_v<T, uint32_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const uint32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT32: {
+            if constexpr (std::is_same_v<T, int32_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const int32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_UINT64: {
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const uint64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT64: {
+            if constexpr (std::is_same_v<T, int64_t>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const int64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT32: {
+            if constexpr (std::is_same_v<T, float>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const float *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT64: {
+            if constexpr (std::is_same_v<T, double>) {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+            } else {
+                const auto * p = static_cast<const double *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_BOOL: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i] != 0);
+            break;
+        }
+        default:
+            throw std::runtime_error(format("%s is not a numeric or bool array", key.c_str()));
     }
 
     return true;
@@ -849,24 +992,92 @@ bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> &
     struct GGUFMeta::ArrayInfo arr_info =
         GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(meta, kid);
 
-    switch (arr_info.gt) {
-        case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same_v<T, float>)); break;
-        case GGUF_TYPE_UINT32:
-        case GGUF_TYPE_BOOL:
-        case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
-        default:
-            throw std::runtime_error(format("%s is not a float32, int32 array", key.c_str()));
-    }
-
     if (arr_info.length > N_MAX) {
         throw std::runtime_error(format("array length %u for key %s exceeds max %u", (uint32_t) arr_info.length, key.c_str(), (uint32_t) N_MAX));
     }
 
-    if (arr_info.gt == GGUF_TYPE_BOOL) {
-        std::transform((const int8_t *)arr_info.data, (const int8_t *)arr_info.data + arr_info.length, result.begin(),
-                [] (int8_t x) { return static_cast<T>(x != 0); });
-    } else {
-        std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+    switch (arr_info.gt) {
+        case GGUF_TYPE_UINT8: {
+            const auto * p = static_cast<const uint8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT8: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT16: {
+            const auto * p = static_cast<const uint16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_INT16: {
+            const auto * p = static_cast<const int16_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            break;
+        }
+        case GGUF_TYPE_UINT32: {
+            if constexpr (std::is_same_v<T, uint32_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const uint32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT32: {
+            if constexpr (std::is_same_v<T, int32_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const int32_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_UINT64: {
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const uint64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_INT64: {
+            if constexpr (std::is_same_v<T, int64_t>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const int64_t *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT32: {
+            if constexpr (std::is_same_v<T, float>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const float *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_FLOAT64: {
+            if constexpr (std::is_same_v<T, double>) {
+                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+            } else {
+                const auto * p = static_cast<const double *>(arr_info.data);
+                for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i]);
+            }
+            break;
+        }
+        case GGUF_TYPE_BOOL: {
+            const auto * p = static_cast<const int8_t *>(arr_info.data);
+            for (size_t i = 0; i < arr_info.length; ++i) result[i] = static_cast<T>(p[i] != 0);
+            break;
+        }
+        default:
+            throw std::runtime_error(format("%s is not a numeric or bool array", key.c_str()));
     }
 
     return true;
@@ -874,7 +1085,27 @@ bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> &
 
 template<typename T>
 bool llama_model_loader::get_arr(const enum llm_kv kid, T & result, const bool required) {
-    return get_arr(llm_kv(kid), result, required);
+    if (get_arr(llm_kv(kid), result, false)) {
+        return true;
+    }
+
+    bool found = false;
+    switch (kid) {
+        case LLM_KV_ATTENTION_COMPRESS_RATIOS:
+            found = get_arr(arch_name + ".compress_ratios", result, false);
+            break;
+        default:
+            break;
+    }
+
+    if (found) {
+        return true;
+    }
+
+    if (required) {
+        throw std::runtime_error(format("array key not found in model: %s", llm_kv(kid).c_str()));
+    }
+    return false;
 }
 
 template<typename T>
@@ -895,7 +1126,129 @@ bool llama_model_loader::get_key(const std::string & key, T & result, const bool
 
 template<typename T>
 bool llama_model_loader::get_key(const enum llm_kv kid, T & result, const bool required) {
-    return get_key(llm_kv(kid), result, required);
+    if (get_key(llm_kv(kid), result, false)) {
+        return true;
+    }
+
+    bool found = false;
+    switch (kid) {
+        case LLM_KV_BLOCK_COUNT:
+            found = get_key(arch_name + ".num_hidden_layers", result, false) ||
+                    get_key(arch_name + ".n_layer", result, false);
+            break;
+        case LLM_KV_CONTEXT_LENGTH:
+            found = get_key(arch_name + ".max_position_embeddings", result, false);
+            break;
+        case LLM_KV_EMBEDDING_LENGTH:
+            found = get_key(arch_name + ".hidden_size", result, false);
+            break;
+        case LLM_KV_FEED_FORWARD_LENGTH:
+            found = get_key(arch_name + ".intermediate_size", result, false);
+            break;
+        case LLM_KV_EXPERT_FEED_FORWARD_LENGTH:
+            found = get_key(arch_name + ".moe_intermediate_size", result, false) ||
+                    get_key(arch_name + ".intermediate_size", result, false);
+            break;
+        case LLM_KV_ATTENTION_HEAD_COUNT:
+            found = get_key(arch_name + ".num_attention_heads", result, false);
+            break;
+        case LLM_KV_ATTENTION_HEAD_COUNT_KV:
+            found = get_key(arch_name + ".num_key_value_heads", result, false);
+            break;
+        case LLM_KV_ATTENTION_KEY_LENGTH:
+        case LLM_KV_ATTENTION_VALUE_LENGTH:
+            found = get_key(arch_name + ".head_dim", result, false);
+            break;
+        case LLM_KV_ROPE_DIMENSION_COUNT:
+            found = get_key(arch_name + ".qk_rope_head_dim", result, false);
+            break;
+        case LLM_KV_EXPERT_COUNT:
+            found = get_key(arch_name + ".n_routed_experts", result, false);
+            break;
+        case LLM_KV_EXPERT_USED_COUNT:
+            found = get_key(arch_name + ".num_experts_per_tok", result, false);
+            break;
+        case LLM_KV_EXPERT_SHARED_COUNT:
+            found = get_key(arch_name + ".n_shared_experts", result, false);
+            break;
+        case LLM_KV_EXPERT_WEIGHTS_SCALE:
+            found = get_key(arch_name + ".routed_scaling_factor", result, false);
+            break;
+        case LLM_KV_EXPERT_WEIGHTS_NORM:
+            found = get_key(arch_name + ".norm_topk_prob", result, false);
+            break;
+        case LLM_KV_ROPE_FREQ_BASE:
+            found = get_key(arch_name + ".rope_theta", result, false);
+            break;
+        case LLM_KV_ATTENTION_LAYERNORM_RMS_EPS:
+            found = get_key(arch_name + ".rms_norm_eps", result, false);
+            break;
+        case LLM_KV_ATTENTION_SLIDING_WINDOW:
+            found = get_key(arch_name + ".sliding_window", result, false);
+            break;
+        case LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT:
+            found = get_key(arch_name + ".o_groups", result, false);
+            break;
+        case LLM_KV_ATTENTION_OUTPUT_LORA_RANK:
+            found = get_key(arch_name + ".o_lora_rank", result, false);
+            break;
+        case LLM_KV_ATTENTION_Q_LORA_RANK:
+            found = get_key(arch_name + ".q_lora_rank", result, false);
+            break;
+        case LLM_KV_ATTENTION_KV_LORA_RANK:
+            found = get_key(arch_name + ".kv_lora_rank", result, false);
+            break;
+        case LLM_KV_ATTENTION_INDEXER_HEAD_COUNT:
+            found = get_key(arch_name + ".index_n_heads", result, false);
+            break;
+        case LLM_KV_ATTENTION_INDEXER_KEY_LENGTH:
+            found = get_key(arch_name + ".index_head_dim", result, false);
+            break;
+        case LLM_KV_ATTENTION_INDEXER_TOP_K:
+            found = get_key(arch_name + ".index_topk", result, false);
+            break;
+        case LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE:
+            found = get_key(arch_name + ".compress_rope_theta", result, false);
+            break;
+        case LLM_KV_HYPER_CONNECTION_COUNT:
+            found = get_key(arch_name + ".hc_mult", result, false);
+            break;
+        case LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS:
+            found = get_key(arch_name + ".hc_sinkhorn_iters", result, false);
+            break;
+        case LLM_KV_HYPER_CONNECTION_EPSILON:
+            found = get_key(arch_name + ".hc_eps", result, false);
+            break;
+        case LLM_KV_CANDIDATE_SOURCE_LAYER:
+            found = get_key(arch_name + ".candidate_source_layer_id", result, false);
+            break;
+        case LLM_KV_CANDIDATE_BLOCK_SIZE:
+            found = get_key(arch_name + ".candidate_block_size", result, false);
+            break;
+        case LLM_KV_CANDIDATE_TOPK_BLOCKS:
+            found = get_key(arch_name + ".candidate_topk_blocks", result, false);
+            break;
+        case LLM_KV_ROPE_SCALING_FACTOR:
+            found = get_key(arch_name + ".rope_scaling.factor", result, false);
+            break;
+        case LLM_KV_ROPE_SCALING_YARN_BETA_FAST:
+            found = get_key(arch_name + ".rope_scaling.beta_fast", result, false);
+            break;
+        case LLM_KV_ROPE_SCALING_YARN_BETA_SLOW:
+            found = get_key(arch_name + ".rope_scaling.beta_slow", result, false);
+            break;
+        default:
+            break;
+    }
+
+    if (found) {
+        return true;
+    }
+
+    if (required) {
+        throw std::runtime_error(format("key not found in model: %s", llm_kv(kid).c_str()));
+    }
+    return false;
 }
 
 // get array of n <= N_MAX elements, or a single element repeated n times
@@ -941,13 +1294,87 @@ bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N
 
 template<typename T>
 bool llama_model_loader::get_key_or_arr(const enum llm_kv kid, T & result, uint32_t n, const bool required) {
-    return get_key_or_arr(llm_kv(kid), result, n, required);
+    if (get_key_or_arr(llm_kv(kid), result, n, false)) {
+        return true;
+    }
+
+    bool found = false;
+    switch (kid) {
+        case LLM_KV_ATTENTION_HEAD_COUNT:
+            found = get_key_or_arr(arch_name + ".num_attention_heads", result, n, false);
+            break;
+        case LLM_KV_ATTENTION_HEAD_COUNT_KV:
+            found = get_key_or_arr(arch_name + ".num_key_value_heads", result, n, false);
+            break;
+        case LLM_KV_FEED_FORWARD_LENGTH:
+            found = get_key_or_arr(arch_name + ".intermediate_size", result, n, false);
+            break;
+        case LLM_KV_EXPERT_FEED_FORWARD_LENGTH:
+            found = get_key_or_arr(arch_name + ".moe_intermediate_size", result, n, false) ||
+                    get_key_or_arr(arch_name + ".intermediate_size", result, n, false);
+            break;
+        case LLM_KV_ATTENTION_SLIDING_WINDOW:
+            found = get_key_or_arr(arch_name + ".sliding_window", result, n, false);
+            break;
+        default:
+            break;
+    }
+
+    if (found) {
+        return true;
+    }
+
+    if (required) {
+        throw std::runtime_error(format("key not found in model: %s", llm_kv(kid).c_str()));
+    }
+    return false;
 }
 
 bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
-    const std::string key = llm_kv(kid);
+    std::string key = llm_kv(kid);
 
-    const int id = gguf_find_key(meta, key.c_str());
+    int id = gguf_find_key(meta, key.c_str());
+
+    if (id < 0) {
+        switch (kid) {
+            case LLM_KV_ATTENTION_HEAD_COUNT: {
+                std::string alt = arch_name + ".num_attention_heads";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_ATTENTION_HEAD_COUNT_KV: {
+                std::string alt = arch_name + ".num_key_value_heads";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_FEED_FORWARD_LENGTH: {
+                std::string alt = arch_name + ".intermediate_size";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_EXPERT_FEED_FORWARD_LENGTH: {
+                std::string alt = arch_name + ".moe_intermediate_size";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id < 0) {
+                    alt = arch_name + ".intermediate_size";
+                    id = gguf_find_key(meta, alt.c_str());
+                }
+                if (id >= 0) key = alt;
+                break;
+            }
+            case LLM_KV_ATTENTION_SLIDING_WINDOW: {
+                std::string alt = arch_name + ".sliding_window";
+                id = gguf_find_key(meta, alt.c_str());
+                if (id >= 0) key = alt;
+                break;
+            }
+            default:
+                break;
+        }
+    }
 
     if (id < 0) {
         if (required) {
@@ -1009,6 +1436,12 @@ struct ggml_tensor * llama_model_loader::create_tensor_for(struct ggml_context *
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
 
+    auto it_unpad = unpadded_dim0.find(tensor->name);
+    if (it_unpad != unpadded_dim0.end()) {
+        // Restore logical unpadded dimension 0 while preserving the padded row stride in nb[1]
+        tensor->ne[0] = it_unpad->second;
+    }
+
     if (duplicated) {
         size_data += ggml_nbytes(cur);
     } else {
@@ -1030,8 +1463,13 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
 
     {
         bool is_ok = true;
+        auto it_unpad = unpadded_dim0.find(name);
         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
-            if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
+            int64_t cur_ne = cur->ne[i];
+            if (i == 0 && it_unpad != unpadded_dim0.end()) {
+                cur_ne = it_unpad->second;
+            }
+            if ((i < ne.size() && ne[i] != cur_ne) || (i >= ne.size() && cur_ne != 1)) {
                 is_ok = false;
                 break;
             }
@@ -1209,7 +1647,8 @@ bool llama_model_loader::load_all_data(
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // Number of worker threads for cuda and host tensor loading.
-    const int n_workers = 8;
+    // Scales dynamically with available cores (up to 32) to drive queue depth across NVMe RAID0 arrays.
+    const int n_workers = std::min(32, std::max(8, (int)std::thread::hardware_concurrency() / 2));
 
     std::vector<std::vector<no_init<uint8_t>>> read_bufs(n_workers);
 
@@ -1614,6 +2053,11 @@ template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::ve
 template bool llama_model_loader::get_arr<uint64_t>(const std::string &, std::vector<uint64_t> &, bool);
 template bool llama_model_loader::get_arr<int32_t, 8>(const std::string &, std::array<int32_t, 8> &, bool);
 template bool llama_model_loader::get_arr<uint32_t, 8>(const std::string &, std::array<uint32_t, 8> &, bool);
+
+template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv, std::vector<uint64_t> &, bool);
+template bool llama_model_loader::get_arr<std::array<int32_t, 8>>(enum llm_kv, std::array<int32_t, 8> &, bool);
+template bool llama_model_loader::get_arr<std::array<uint32_t, 8>>(enum llm_kv, std::array<uint32_t, 8> &, bool);
 
 // Prism ternary Hadamard rotations (weights are stored pre-rotated in the GGUF)
 void llm_load_hadamard(llama_model_loader & ml, llama_model & model) {
