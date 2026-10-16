@@ -1746,6 +1746,23 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    [GGML_TYPE_Q1_0] = {
+        .type_name                = "q1_0",
+        .blck_size                = QK1_0_G128,
+        .type_size                = sizeof(block_q1_0_g128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q1_0_g128,
+        .from_float               = quantize_row_q1_0_g128,
+        .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_ref,
+        .vec_dot                  = vec_dot_q1_0_g128_q8_0,
+#if defined __AVX2__
+        .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+#else
+        .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+#endif
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_Q1_0_G128_R8] = {
         .type_name                = "q1_0_g128_r8",
         .blck_size                = QK1_0_G128,
@@ -2152,6 +2169,7 @@ static float fudge_factors[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ3_KT]     = 1.0f, // Note: we apply 1.01f at run time!
     [GGML_TYPE_IQ4_KT]     = 1.0f,
     [GGML_TYPE_Q1_0_G128]  = 1.0f,
+    [GGML_TYPE_Q1_0]       = 1.0f,
     [GGML_TYPE_IQ3_K]      = 1.01f,
     [GGML_TYPE_IQ3_KS]     = 1.0f,
     [GGML_TYPE_IQ2_KL]     = 1.025f,
@@ -13901,6 +13919,7 @@ static void ggml_compute_forward_add(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
@@ -14459,6 +14478,7 @@ static void ggml_compute_forward_add1(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
@@ -14643,6 +14663,7 @@ static void ggml_compute_forward_acc(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
@@ -19555,6 +19576,7 @@ static void ggml_compute_forward_out_prod(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
@@ -19983,6 +20005,7 @@ static void ggml_compute_forward_set(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
@@ -20513,6 +20536,7 @@ static void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
@@ -21290,6 +21314,7 @@ static void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q1_0_G128_R8:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:

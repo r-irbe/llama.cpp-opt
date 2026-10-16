@@ -1,5 +1,12 @@
 #pragma once
 
+//
+// Copyright (C) 2026 r-irbe
+//
+// MIT license
+// SPDX-License-Identifier: MIT
+//
+
 #include "llama.h"
 
 #include <vector>

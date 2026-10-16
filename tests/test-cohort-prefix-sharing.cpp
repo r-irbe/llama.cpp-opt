@@ -1,3 +1,10 @@
+//
+// Copyright (C) 2026 r-irbe
+//
+// MIT license
+// SPDX-License-Identifier: MIT
+//
+
 // Unit tests for Cohort Prefix Sharing (PPS):
 // 1. Cohort ID extraction and resolution from headers & JSON payloads
 // 2. Cohort-aware slot selection & warm cache affinity

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+#
+# Copyright (C) 2026 r-irbe
+#
+# MIT license
+# SPDX-License-Identifier: MIT
+#
 """
 GGUF Hardware Constraint Linter & Performance Scorer
 Analyzes GGUF model files against local host hardware constraints (VRAM, NUMA, DDR/PCIe bandwidth, Direct I/O)
@@ -524,8 +530,9 @@ def analyze_and_lint_gguf(gguf_info, hw):
     primary_filename = os.path.basename(gguf_info.get("primary_file", "")).lower()
     has_embeddings = any("token_embd" in t["name"] or "tok_embd" in t["name"] for t in tensors)
     is_dflash = (arch in ["dflash", "dflash2", "dflash-draft"] or any(t["name"].startswith("dflash") for t in tensors) or "dspark" in primary_filename or "dflash" in primary_filename)
-    is_mtp = (arch in ["mtp", "gemma4_mtp"] or any("nextn" in t["name"] or "mtp" in t["name"] for t in tensors) or "mtp-" in primary_filename or "-mtp" in primary_filename)
-    is_draft_companion = is_dflash or is_mtp or (not has_embeddings and len(tensors) < 80)
+    is_mtp = (arch in ["mtp", "gemma4_mtp"] or "mtp-" in primary_filename or "-mtp" in primary_filename) and (len(tensors) < 120 or file_size < 20 * 1024**3)
+    has_builtin_mtp = any("nextn" in t["name"] or "mtp" in t["name"] for t in tensors) and len(tensors) >= 120
+    is_draft_companion = (is_dflash or is_mtp or (not has_embeddings and len(tensors) < 80)) and (len(tensors) < 200 or file_size < 25 * 1024**3)
 
     for t in tensors:
         name = t["name"]
@@ -868,14 +875,16 @@ def analyze_and_lint_gguf(gguf_info, hw):
     # 13. Multi-Context KV Cache Scaling (up to 256k / 262,144 tokens)
     n_layer = int(meta.get(f"{arch}.block_count", meta.get("block_count", 61 if is_deepseek4 else 32)))
     kv_lora_rank = int(meta.get(f"{arch}.attention.kv_lora_rank", 512 if is_deepseek4 else 0))
-    qk_rope_dim = int(meta.get(f"{arch}.attention.qk_rope_head_dim", 64 if is_deepseek4 else 0))
-    is_mla = (kv_lora_rank > 0 and (is_deepseek4 or "deepseek" in arch))
+    qk_rope_dim = int(meta.get(f"{arch}.attention.qk_rope_head_dim", 64 if is_deepseek4 else (meta.get(f"{arch}.attention.key_length_mla", 0))))
+    is_mla = (kv_lora_rank > 0)
 
     if is_mla:
         bytes_per_tok = n_layer * (kv_lora_rank + qk_rope_dim) * 2
     else:
-        n_head_kv = int(meta.get(f"{arch}.attention.head_count_kv", 8))
-        head_dim = int(meta.get(f"{arch}.attention.key_length", 128))
+        raw_head_kv = meta.get(f"{arch}.attention.head_count_kv", 8)
+        n_head_kv = max(raw_head_kv) if isinstance(raw_head_kv, list) else int(raw_head_kv)
+        raw_head_dim = meta.get(f"{arch}.attention.key_length", 128)
+        head_dim = max(raw_head_dim) if isinstance(raw_head_dim, list) else int(raw_head_dim)
         bytes_per_tok = 2 * n_layer * n_head_kv * head_dim * 2
 
     ctx_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
@@ -922,6 +931,16 @@ def analyze_and_lint_gguf(gguf_info, hw):
                       f"Designed for high-speed multi-token proposal running in tandem with a base model. Embeddings are shared with base model.",
             "recommendation": f"Pair with compatible base model: `./build/bin/llama-cli -m <base.gguf> -md {os.path.basename(gguf_info.get('primary_file', 'draft.gguf'))} --spec-type {'dflash' if is_dflash else 'mtp'} -fa 1`."
         })
+    elif has_builtin_mtp:
+        findings.append({
+            "code": "LINT014_BUILTIN_MTP_HEADS",
+            "severity": "PASS",
+            "penalty": 0,
+            "title": "Native Multi-Token Prediction (MTP) Speculation Layers Verified",
+            "detail": f"Model includes built-in next-n speculative prediction layers (blk.nextn.*, {len(tensors)} total tensors, {file_size / (1024**3):.2f} GiB). "
+                      f"Capable of self-speculative draft decoding without requiring an external companion draft model.",
+            "recommendation": f"Launch with native MTP speculative decoding: `./build/bin/llama-cli -m {os.path.basename(gguf_info.get('primary_file', 'model.gguf'))} --spec-type mtp --draft 2 -fa 1`."
+        })
 
     score = max(0, min(100, score))
 
@@ -931,6 +950,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
         "is_deepseek4": is_deepseek4,
         "is_mla": is_mla,
         "is_draft_companion": is_draft_companion,
+        "has_builtin_mtp": has_builtin_mtp,
         "is_dflash": is_dflash,
         "is_mtp": is_mtp,
         "file_size_gb": round(file_size / (1024**3), 2),

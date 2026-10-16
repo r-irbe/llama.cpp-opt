@@ -2297,6 +2297,7 @@ bool iqk_set_kernels_1bit(int ne00, int typeA, int typeB, std::array<mul_mat_t, 
             expected_typeB = GGML_TYPE_Q8_K16;
             break;
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
             if (ne00 % QK1_0_G128 != 0) return false;
             expected_typeB = GGML_TYPE_Q8_2_X4;
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q1_0_g128_q8_0, funcs);
@@ -3477,6 +3478,7 @@ bool iqk_set_kernels_1bit(int ne00, int typeA, int typeB, std::array<mul_mat_t, 
             expected_Btype = GGML_TYPE_Q8_K128;
             break;
         case GGML_TYPE_Q1_0_G128:
+        case GGML_TYPE_Q1_0:
             if (ne00 % QK1_0_G128 != 0) return false;
             expected_Btype = GGML_TYPE_Q8_0_X4;
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q1_0_g128_q8_0, funcs);

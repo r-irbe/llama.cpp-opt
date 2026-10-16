@@ -23,15 +23,11 @@ Overview of the most common command-line parameters in `ik_llama.cpp` and some i
 - [Multi-modality](#multi-modality)
 
 - [GPU Offload](#gpu-offload)
-
+- [NUMA & Multi-Socket Optimization](#numa--multi-socket-optimization)
 - [Model Options](#model-options)
-
-- [Server Options](#server-options)
-
+- [Server Options & Cohort Prefix Sharing](#server-options)
 - [Other Tools](#other-tools)
-
 - [Unique parameters](#unique-parameters)
-
 - [Graph parallel models](#graph-parallel-models)
 
 ## LLM Jargon
@@ -216,11 +212,25 @@ MLA models already have the cache compressed, it doesn't really makes sense to c
 | - | - | - | - |
 | `-dkvc, --dump-kv-cache` | Verbose print of the KV cache | - |  |
 | `-nkvo, --no-kv-offload` | Disable KV offload | - | Keep KV on CPU. |
-| `-ctk, --cache-type-k TYPE` | KV cache data type for K | f16 | Reduces K size in KV which improves speed and reduces memory requirements, but may reduce output quality. |
-| `-ictk, --indexer-cache-type-k TYPE` | Indexer K-cache data type | f16 | [PR 2075](https://github.com/ikawrakow/ik_llama.cpp/pull/2075) |
+| `-ctk, --cache-type-k TYPE` | KV cache data type for K | f16 | Reduces K size in KV which improves speed and reduces memory requirements (`f16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`). See [`docs/kv-cache.md`](./kv-cache.md). |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V | f16 | See: `-ctk` |
-| `-mtprot, --mtp-requantize-output-tensor type` | Use output requantized to type for MTP | - |  Improves TG performance for when using MTP. It requantize the tensor on-the-fly while loading the model, see [PR 1809](https://github.com/ikawrakow/ik_llama.cpp/pull/1809) for details and [PR 1810](https://github.com/ikawrakow/ik_llama.cpp/pull/1810) `--extra-output-tensor` as offline requantize alternative. |
-| `--mtmd-kq-type type` | Define the type used for the `K*Q` matrix multiplication | - | Use one of `f16`/`bf16` instead of `f32` to improve speed up multimodal |
+| `-ctk-first, -ctk-last TYPE,N` | Heterogeneous K cache type for first/last N layers | - | Allows keeping initial attention sink layers at full precision (`f16`) while quantizing deep layers to `q4_0` or `q8_0`. |
+| `-ctv-first, -ctv-last TYPE,N` | Heterogeneous V cache type for first/last N layers | - | Allows keeping initial attention sink layers at full precision (`f16`) while quantizing deep layers to `q4_0` or `q8_0`. |
+| `-ictk, --indexer-cache-type-k TYPE` | Indexer K-cache data type | f16 | [PR 2075](https://github.com/ikawrakow/ik_llama.cpp/pull/2075) |
+| `-mtprot, --mtp-requantize-output-tensor type` | Use output requantized to type for MTP | - | Improves TG performance when using MTP. It requantizes the tensor on-the-fly while loading the model. |
+| `--mtmd-kq-type type` | Define the type used for the `K*Q` matrix multiplication | - | Use one of `f16`/`bf16` instead of `f32` to speed up multimodal |
+| `--rope-scaling {none,linear,yarn}` | RoPE context scaling mode | none | Scale RoPE frequencies to expand model context window beyond original training limit. |
+| `--rope-scale N` | Context scaling factor | 1.0 | Context expansion multiplier (e.g. `8.0` for 8x context length). |
+| `--rope-freq-base N` | RoPE base frequency override | loaded from model | Useful for NTK-aware scaling (e.g. `500000.0` or `1000000.0`). |
+| `--rope-freq-scale N` | RoPE frequency scaling factor | 1.0 | Scales frequencies by factor of 1/N. |
+| `--yarn-orig-ctx N` | Original training context limit for YaRN | loaded from model | Base pre-trained context size (e.g. `4096`, `8192`, `32768`). |
+| `--yarn-ext-factor N` | YaRN extrapolation mix factor | -1.0 | Controls blending between interpolation and extrapolation (0.0 = full interpolation). |
+| `--yarn-attn-factor N` | YaRN attention temperature scale factor | -1.0 | Scales attention scores to prevent entropy collapse at high context. |
+| `-unreal, --unreal-filter` | Enable UNREAL model-internal evidence selection | disabled | Dynamically identifies and filters distractor tokens in long-context prompts (arXiv:2610.08463). |
+| `--no-unreal-filter` | Disable UNREAL evidence filtering | enabled | Default behavior. |
+| `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Size of text chunks evaluated for relevance. |
+| `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Keeps the N most relevant chunks while suppressing noise. |
+| `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Prompts shorter than this bypass UNREAL filtering. |
 | `--no-context-shift` | Disable context-shift | - |  |
 | `--context-shift` | Set context-shift | on | auto / on / off / 0 / 1 [PR 973](https://github.com/ikawrakow/ik_llama.cpp/pull/973) |
 
@@ -390,6 +400,24 @@ WIP
 | `--max-gpu N` | Define (and use) a maximum number of GPUs per layer with split mode "graph" |  | This is of interest when there are more than 2 GPUs available, but using all of them leads to a lower performance than using just 2 (or using the default split mode "layer") [PR 1051](https://github.com/ikawrakow/ik_llama.cpp/pull/1051) |
 | `-cuda, --cuda-params` | Comma-separated list of cuda parameters | - | Powerful way to tweak Fusion, GPU offload threshold, and MMQ-ID threshold. [PR 910](https://github.com/ikawrakow/ik_llama.cpp/pull/910) [PR 1813](https://github.com/ikawrakow/ik_llama.cpp/pull/1813) |
 
+## NUMA & Multi-Socket Optimization
+
+Optimizations for multi-socket servers (AMD EPYC, Intel Xeon) and multi-CCX desktop processors (AMD Ryzen).
+
+Check the full architectural guide in [`docs/numa.md`](./numa.md).
+
+| Parameter | Description | Default | Notes/Examples |
+| - | - | - | - |
+| `--numa TYPE` | NUMA optimization mode | none | Options: `none`, `distribute`, `isolate`, `numactl`, `split`, `expert`. <br>• `split`: Partitions workload and memory buffers symmetrically across NUMA domains.<br>• `expert`: Pins MoE expert groups to dedicated NUMA nodes for local memory execution.<br>Example: `--numa split` or `--numa expert` |
+| `--numa-replicate-shared` | Replicate shared layers across NUMA nodes | off | Duplicates dense shared weights (attention QKV, output projection, RMSNorm, embeddings) into each NUMA node's local memory to eliminate cross-socket interconnect bus saturation. |
+| `-nnd, --numa-node-draft N` | Draft model NUMA affinity | -1 (auto) | Pins the draft model to a specific NUMA node or socket, preventing resource contention with the main model. |
+| `-ot, --override-tensor NAME` | Override tensor memory buffer type | - | Direct model tensors to specific NUMA memory domains (e.g. `\.ffn_.*_exps\.=CPU0`). |
+| `-cmoe, --cpu-moe` | Keep all MoE weights in CPU memory | off | Pins all MoE expert weights to system RAM while running attention layers on GPU. |
+| `-dexp, --defer-experts` | Defer expert mmap residency | false | Expert pages are faulted in on demand rather than eagerly loaded during startup, dramatically reducing cold-start latency. |
+| `-dple, --defer-ple` | Keep sparse tables (PLE, engram) on disk | false | Leaves large sparse embedding tables (e.g. DeepSeek-V4.1 engram tables) file-backed instead of resident in RAM. |
+| `-prexp, --prefetch-experts` | Asynchronous MoE expert prefetch | false | Streams mmap'd MoE expert weights into page cache ahead of computation. |
+| `-prexp-t, --prefetch-experts-threads N` | Threads for expert prefetching | 0 (auto) | Number of worker threads dedicated to streaming deferred expert weights. |
+
 ## Model Options
 
 | Parameter | Description | Default | Notes/Examples |
@@ -424,7 +452,20 @@ Request-level `speculative.stages` is constrained:
 | `--port PORT` | Port to listen | 8080 |   |
 | `--webui NAME` | Controls which webui to server | auto | Flexibility in choosing the integrated powerful WebUIs:  - `none`: disable webui  - `auto`: default webui   - `llamacpp`: llamacpp webui |
 | `--api-key KEY` | API key to use for authentication | none | Add a custom API KEY. Clients will need to specify it when connecting. |
-| `-a, --alias` | set alias for model name (to be used by REST API) | none | Configure the server to serve and reply with specific model name. |
+| `-a, --alias` | Set alias for model name (to be used by REST API) | none | Configure the server to serve and reply with specific model name. |
+| `--cohort-prefix-sharing` | Enable Cohort Prompt Prefix Sharing (PPS) | enabled | Enables cross-slot zero-copy prompt prefix sharing across cohorts. Requests with matching system prompts or document prefixes reuse precomputed KV caches instantly via zero-copy sequence replication. |
+| `--no-cohort-prefix-sharing` | Disable Cohort Prompt Prefix Sharing | disabled | Forces every slot to process prompts independently. |
+| `--cohort-min-prefix N` | Minimum shared prefix tokens to trigger PPS | 16 | Prevents overhead for trivially short prefixes. |
+| `--cohort-max-idle-sec SEC` | Max idle seconds before reclaiming private cohort slot | 0 (disabled) | When set, automatically evicts idle cohort slots after SEC seconds to free memory. |
+| `-ctx-ckpt N, --ctx-checkpoints N` | Max context checkpoints per slot | 32 | Stores recurrent architecture checkpoints for fast speculative rollouts and prompt rewinds. |
+| `--ctx-ckpt-spill-dir DIR` | Spill evicted checkpoints to NVMe storage | disabled | When set, spills older checkpoints to fast disk instead of dropping them, saving RAM while preserving context rollback. |
+| `--ctx-ckpt-live-n N` | Max resident checkpoints in RAM when spill is active | 2 | Keeps only N newest checkpoints resident in memory; earlier ones are streamed to NVMe. |
+| `-ctx-ckpt-i N, --ctx-checkpoints-interval N` | Token interval between context checkpoints | 512 | Sets generation interval for periodic checkpoint saving. |
+| `-ctx-ckpt-e NAME, --ctx-checkpoints-eviction NAME` | Checkpoint eviction strategy | variance | Options: `variance`, `fifo`, `auto`. `variance` preserves uniform coverage across long dialogues. |
+| `-spf, --system-prompt-file FNAME` | Preloaded system prompt file | none | Loads a common system prompt into all server slots on startup. |
+| `-sps, --slot-prompt-similarity N` | Slot prompt similarity threshold | 0.10 | Reuses an idle slot if incoming prompt matches at least fraction N of the slot's current prefix (0.0 = disabled). |
+| `--slot-save-path PATH` | Path to save slot KV cache state | disabled | Persists slot cache state to disk across restarts. |
+| `--metrics` | Enable Prometheus metrics endpoint | disabled | Exposes `/metrics` HTTP endpoint for server throughput, slot utilization, and cache hit ratios. |
 
 ## Other Tools
 

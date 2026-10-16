@@ -50,6 +50,9 @@ GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
 GGML_API GGML_CALL void ggml_backend_cuda_set_l2_persistence_window(ggml_backend_t backend, void * base_ptr, size_t num_bytes, float hit_ratio);
 GGML_API GGML_CALL void ggml_backend_cuda_get_l2_cache_info(int device, size_t * l2_size, size_t * max_persisting_size, size_t * cur_persisting_limit);
 
+// GPU SIMT & Cache Hierarchy KV Block Selector (Ada Lovelace sm_89)
+GGML_API GGML_CALL bool ggml_backend_cuda_eval_sparse_kv_blocks(int device, uint32_t num_blocks, uint32_t n_sinks, uint32_t n_window, uint32_t * out_active_count, float * out_latency_us);
+
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
 #ifdef  __cplusplus
 }

@@ -75,6 +75,13 @@ void set_storage_numa_node(int node);
 int  detect_dev_numa_node(uint64_t dev, const std::string & sysfs_root = "/sys");
 int  detect_path_numa_node(const char * path, const std::string & sysfs_root = "/sys");
 
+// NUMA Shared Tensor Interleaving and Replication
+bool is_numa_replicate_shared();
+void set_numa_replicate_shared(bool enable);
+bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_nodes);
+bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes);
+void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id);
+
 } // namespace ggml::cpu::numa
 #else
 #include <stdbool.h>
@@ -90,6 +97,13 @@ bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx);
 
 // C-compatible wrapper for binding expert tensor slices round-robin to NUMA nodes
 bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes);
+
+// C-compatible wrapper for interleaving shared tensor pages across NUMA nodes
+bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_nodes);
+
+// C-compatible wrapper for replicating shared tensors across NUMA nodes
+bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes);
+void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id);
 
 #ifdef __cplusplus
 }

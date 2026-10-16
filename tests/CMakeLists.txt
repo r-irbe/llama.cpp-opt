@@ -268,6 +268,9 @@ target_include_directories(test-unreal-selector PRIVATE ${PROJECT_SOURCE_DIR}/co
 if (GGML_CUDA)
     llama_build_and_test(test-cuda-l2-persistence.cpp)
     target_include_directories(test-cuda-l2-persistence PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    llama_build_and_test(test-gpu-kv-zdd.cpp)
+    target_include_directories(test-gpu-kv-zdd PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
@@ -282,3 +285,7 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
 target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
+
+add_executable(test-kv-zdd test-kv-zdd.cpp)
+target_include_directories(test-kv-zdd PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-kv-zdd COMMAND $<TARGET_FILE:test-kv-zdd>)

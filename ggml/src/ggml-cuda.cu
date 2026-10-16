@@ -4837,8 +4837,18 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
     // Loop over nodes in GGML graph to determine if CUDA graph update is required
     // and store properties to allow this comparison for the next token
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_noop(node)) {
+            // Fast-path no-op nodes (VIEW, RESHAPE, TRANSPOSE, PERMUTE, NONE).
+            // They do not emit GPU execution kernels; avoid expensive struct memset/memcmp every token.
+            if (graph->ggml_graph_properties[i].node_op != node->op) {
+                cuda_graph_update_required = true;
+                set_ggml_graph_node_properties(node, &graph->ggml_graph_properties[i]);
+            }
+            continue;
+        }
         ggml_graph_node_properties new_props;
-        set_ggml_graph_node_properties(cgraph->nodes[i], &new_props);
+        set_ggml_graph_node_properties(node, &new_props);
         if (memcmp(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props)) != 0) {
             cuda_graph_update_required = true;
             memcpy(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props));
@@ -5833,5 +5843,90 @@ extern "C" void ggml_backend_cuda_get_l2_cache_info(int device, size_t * l2_size
     if (l2_size) *l2_size = dev.l2_cache_size;
     if (max_persisting_size) *max_persisting_size = dev.persisting_l2_cache_max_size;
     if (cur_persisting_limit) *cur_persisting_limit = dev.persisting_l2_cache_cur_limit;
+}
+
+#include "ggml-cuda/fattn-zdd-gpu.cuh"
+
+extern "C" bool ggml_backend_cuda_eval_sparse_kv_blocks(
+    int device, uint32_t num_blocks, uint32_t n_sinks, uint32_t n_window,
+    uint32_t * out_active_count, float * out_latency_us
+) {
+    if (device < 0 || device >= ggml_cuda_info().device_count) {
+        return false;
+    }
+    ggml_cuda_set_device(device);
+
+    using namespace ggml::cuda::kv;
+
+    std::vector<GpuKvBlockDescriptor> h_blocks(num_blocks);
+    for (uint32_t i = 0; i < num_blocks; ++i) {
+        h_blocks[i].block_id = i;
+        h_blocks[i].token_start = i * GPU_KV_BLOCK_SIZE;
+        h_blocks[i].sink_flag = (i < n_sinks) ? 1 : 0;
+        h_blocks[i].window_flag = (i >= num_blocks - n_window) ? 1 : 0;
+        h_blocks[i].max_key_norm = 1.0f;
+        h_blocks[i].importance_score = (i == 100 || i == 500) ? 0.95f : 0.01f;
+    }
+
+    GpuKvBlockDescriptor* d_blocks = nullptr;
+    uint32_t* d_bitmasks = nullptr;
+    uint32_t* d_active_indices = nullptr;
+    uint32_t* d_active_count = nullptr;
+
+    const size_t blocks_bytes = num_blocks * sizeof(GpuKvBlockDescriptor);
+    CUDA_CHECK(cudaMalloc(&d_blocks, blocks_bytes));
+    CUDA_CHECK(cudaMalloc(&d_bitmasks, ((num_blocks + 31) / 32) * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_active_indices, num_blocks * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_active_count, sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaMemcpy(d_blocks, h_blocks.data(), blocks_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_active_count, 0, sizeof(uint32_t)));
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    set_gpu_kv_l2_persistence(stream, d_blocks, blocks_bytes, device);
+
+    dim3 block(128);
+    dim3 grid((num_blocks + 127) / 128);
+
+    evaluate_sparse_kv_blocks_simt_kernel<<<grid, block, 0, stream>>>(
+        nullptr, d_blocks, 0.5f, d_bitmasks, d_active_indices, d_active_count,
+        num_blocks, n_sinks, n_window
+    );
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    uint32_t h_active_count = 0;
+    CUDA_CHECK(cudaMemcpy(&h_active_count, d_active_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if (out_active_count) *out_active_count = h_active_count;
+
+    cudaEvent_t ev_start, ev_stop;
+    CUDA_CHECK(cudaEventCreate(&ev_start));
+    CUDA_CHECK(cudaEventCreate(&ev_stop));
+
+    const int N_ITERS = 1000;
+    CUDA_CHECK(cudaEventRecord(ev_start, stream));
+    for (int i = 0; i < N_ITERS; ++i) {
+        evaluate_sparse_kv_blocks_simt_kernel<<<grid, block, 0, stream>>>(
+            nullptr, d_blocks, 0.5f, d_bitmasks, d_active_indices, d_active_count,
+            num_blocks, n_sinks, n_window
+        );
+    }
+    CUDA_CHECK(cudaEventRecord(ev_stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop));
+    if (out_latency_us) *out_latency_us = (elapsed_ms * 1000.0f) / N_ITERS;
+
+    CUDA_CHECK(cudaEventDestroy(ev_start));
+    CUDA_CHECK(cudaEventDestroy(ev_stop));
+    CUDA_CHECK(cudaFree(d_blocks));
+    CUDA_CHECK(cudaFree(d_bitmasks));
+    CUDA_CHECK(cudaFree(d_active_indices));
+    CUDA_CHECK(cudaFree(d_active_count));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    return true;
 }
 

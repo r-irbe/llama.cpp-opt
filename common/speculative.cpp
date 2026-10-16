@@ -1599,8 +1599,7 @@ common_speculative * common_speculative_init(
         }
         auto actual_type = result->impls[tune_stage_idx]->type;
         if (actual_type != COMMON_SPECULATIVE_TYPE_NONE &&
-            actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3 &&
-            actual_type != COMMON_SPECULATIVE_TYPE_DSPARK) {
+            actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
             result->tuner = std::make_unique<spec_tuner>();
             result->tuner->init(actual_type, result->configs[tune_stage_idx].params, llama_get_model(ctx_tgt));
             LOG_INF("Autotune initialized for %s stage in speculative chain (tuning %zu parameters)\n",
@@ -2178,6 +2177,9 @@ bool common_speculative_load_draft_model(
     params_dft.cpu_affinity.clear();
     params_dft.cpu_affinity_auto = false;
     params_dft.cpu_affinity_configured = false;
+    // Companion draft models should remain memory-resident (RAM/VRAM) to avoid disk read overhead per draft step
+    params_dft.defer_experts = params.defer_draft;
+    params_dft.defer_ple     = params.defer_draft;
     if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
         params_dft.has_mtp = true;
     }

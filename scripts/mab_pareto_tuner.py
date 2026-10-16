@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+#
+# Copyright (C) 2026 r-irbe
+#
+# MIT license
+# SPDX-License-Identifier: MIT
+#
 """
 scripts/mab_pareto_tuner.py - Multi-Armed Bandit (MAB) Pareto Frontier Hyperparameter Optimization Engine
 
@@ -895,12 +901,27 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
     pp_tps = ((gpu_frac * gpu_pp_peak * fp8_bonus * fa_bonus * ubatch_bonus) +
               ((1.0 - gpu_frac) * cpu_pp_peak * cpu_thread_mult * numa_bonus * thp_bonus))
 
-    # 3. Compute Token Generation Throughput (TG tok/s)
+    # 3. Compute Token Generation Throughput (TG tok/s) with Physical Roofline Clamp
     eff_tg_params = prof["active_params_b"] if prof["is_moe"] else prof["params_b"]
     gpu_tg_peak = ((75.0 * 7.24) / eff_tg_params) * min(2.0, max(0.6, math.sqrt(gpu_scale))) if hw.has_gpu else 0.0
     cpu_tg_peak = min(40.0, (0.459 * hw.physical_cores * 7.24) / eff_tg_params)
 
+    # Theoretical compute-bound decode speed
     tg_tps = (gpu_frac * gpu_tg_peak) + ((1.0 - gpu_frac) * cpu_tg_peak * cpu_thread_mult * numa_bonus)
+
+    # Physical memory bandwidth roofline clamp:
+    # On CPU/hybrid MoE, active weights must be transferred every token.
+    # 16-channel DDR4-3200 provides ~220 GB/s practical bandwidth.
+    # NVMe direct streaming provides ~28 GB/s bandwidth.
+    bytes_per_param = prof.get("bpw", 4.0) / 8.0
+    active_weight_gb = eff_tg_params * bytes_per_param
+    if gpu_frac < 0.95 and active_weight_gb > 0:
+        # If model is deferred to NVMe, bandwidth is capped by NVMe read-ahead (~28 GB/s)
+        # If model is resident in host RAM, bandwidth is capped by DRAM (~220 GB/s)
+        is_deferred = config.get("defer_experts", 0) == 1
+        available_bw_gb_s = 28.1 if is_deferred else min(240.0, hw.numa_nodes * 28.0)
+        roofline_tg_tps = available_bw_gb_s / max(0.5, active_weight_gb)
+        tg_tps = min(tg_tps, roofline_tg_tps * 1.15) # 15% slack for cache locality
 
     spec_type = config.get("spec_type", "none")
     if spec_type != "none":

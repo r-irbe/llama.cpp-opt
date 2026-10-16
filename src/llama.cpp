@@ -5459,15 +5459,36 @@ static bool llm_load_tensors(
             const int n_numa = ggml_backend_cpu_numa_node_count();
             if (n_numa > 1) {
                 int n_bound = 0;
+                int n_shared = 0;
+                int n_replicated = 0;
+                const bool replicate = ggml::cpu::numa::is_numa_replicate_shared();
                 for (auto & pair : model.tensors_by_name) {
                     struct ggml_tensor * t = pair.second;
-                    if (t && t->ne[2] > 1 && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
-                        if (ggml::cpu::numa::bind_tensor_experts_round_robin(t, n_numa)) {
-                            n_bound++;
+                    if (t && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                        if (t->ne[2] > 1) {
+                            if (ggml::cpu::numa::bind_tensor_experts_round_robin(t, n_numa)) {
+                                n_bound++;
+                            }
+                        } else if (ggml_nbytes(t) >= 4096) {
+                            if (replicate) {
+                                if (ggml::cpu::numa::replicate_tensor_numa(t, n_numa)) {
+                                    n_replicated++;
+                                }
+                            } else {
+                                if (ggml::cpu::numa::bind_tensor_shared_interleaved(t, n_numa)) {
+                                    n_shared++;
+                                }
+                            }
                         }
                     }
                 }
-                LLAMA_LOG_INFO("%s: NUMA expert bound %d MoE tensors round-robin across %d nodes\n", __func__, n_bound, n_numa);
+                if (replicate) {
+                    LLAMA_LOG_INFO("%s: NUMA expert bound %d MoE tensors round-robin and replicated %d shared tensors across %d nodes\n",
+                        __func__, n_bound, n_replicated, n_numa);
+                } else {
+                    LLAMA_LOG_INFO("%s: NUMA expert bound %d MoE tensors round-robin and interleaved %d shared tensors across %d nodes\n",
+                        __func__, n_bound, n_shared, n_numa);
+                }
             }
         }
 

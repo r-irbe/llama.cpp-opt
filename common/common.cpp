@@ -2417,6 +2417,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.defer_ple = true;
         return true;
     }
+    if (arg == "--defer-draft") {
+        params.speculative.defer_draft = true;
+        return true;
+    }
+    if (arg == "--no-defer-draft") {
+        params.speculative.defer_draft = false;
+        return true;
+    }
     if (arg == "--cpu-mask" || arg == "-cm") {
         CHECK_ARG;
         if (!cpu_affinity_parse_mask(argv[i], params.cpu_affinity)) {
@@ -2542,8 +2550,17 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
         else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
         else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
-        else if (value == "expert") { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
+        else if (value == "expert" || value == "split") { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
         else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--numa-replicate-shared") {
+        params.numa_replicate_shared = true;
+#if defined(_WIN32)
+        _putenv_s("GGML_NUMA_REPLICATE_SHARED", "1");
+#else
+        setenv("GGML_NUMA_REPLICATE_SHARED", "1", 1);
+#endif
         return true;
     }
     if (arg == "-dev" || arg == "--device") {
@@ -3655,6 +3672,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
     options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});
+    options.push_back({ "*",           "       --no-defer-draft",        "keep speculative draft model resident in memory even when target model defers experts (default)"});
+    options.push_back({ "*",           "       --defer-draft",           "allow speculative draft model to also defer expert weights to disk"});
     options.push_back({ "*",           "-prexp, --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "-prexp-t, --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
@@ -3669,9 +3688,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - distribute: spread execution evenly over all nodes\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
-                                                                        "  - expert: expose NUMA nodes as separate devices with node-local memory and pinned threads\n"
+                                                                        "  - expert, split: expose NUMA nodes as separate devices with node-local memory and pinned threads\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
+    options.push_back({ "*",           "       --numa-replicate-shared", "replicate dense shared weights across local NUMA nodes when RAM permits (avoids xGMI bus contention)" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",

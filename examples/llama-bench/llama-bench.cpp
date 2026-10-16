@@ -700,7 +700,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 /**/ if (value == "distribute" || value == "" ) { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
                 else if (value == "isolate")                    { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
                 else if (value == "numactl")                    { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
-                else if (value == "expert")                     { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
+                else if (value == "expert" || value == "split") { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
                 else { invalid_param = true; break; }
             }
         } else if (arg == "-fa" || arg == "--flash-attn") {

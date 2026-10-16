@@ -8,6 +8,8 @@
 #include <atomic>
 #include <filesystem>
 #include <map>
+#include <mutex>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -37,8 +39,14 @@ namespace fs = std::filesystem;
 #ifndef MPOL_BIND
 #define MPOL_BIND 2
 #endif
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
 #ifndef MPOL_MF_MOVE
 #define MPOL_MF_MOVE 1
+#endif
+#ifndef MPOL_MF_STRICT
+#define MPOL_MF_STRICT 2
 #endif
 #endif
 
@@ -913,6 +921,110 @@ bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nod
 #endif
 }
 
+static std::atomic<bool> g_numa_replicate_shared{false};
+static std::mutex g_replica_mutex;
+static std::unordered_map<const struct ggml_tensor *, std::vector<void *>> g_tensor_replicas;
+
+bool is_numa_replicate_shared() {
+    static int env_checked = -1;
+    if (env_checked == -1) {
+        const char * env = getenv("GGML_NUMA_REPLICATE_SHARED");
+        if (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0)) {
+            g_numa_replicate_shared.store(true, std::memory_order_relaxed);
+        }
+        env_checked = 1;
+    }
+    return g_numa_replicate_shared.load(std::memory_order_relaxed);
+}
+
+void set_numa_replicate_shared(bool enable) {
+    g_numa_replicate_shared.store(enable, std::memory_order_relaxed);
+}
+
+bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_nodes) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data || n_numa_nodes <= 1) {
+        return false;
+    }
+
+    const uintptr_t page_mask = ~(4096ULL - 1);
+    uintptr_t start_addr = (uintptr_t)tensor->data;
+    size_t total_size = ggml_nbytes(tensor);
+    uintptr_t end_addr = start_addr + total_size;
+
+    uintptr_t page_start = start_addr & page_mask;
+    uintptr_t page_end   = (end_addr + 4095ULL) & page_mask;
+    size_t len           = page_end - page_start;
+    if (len < 4096) return false;
+
+    const size_t bits_per_word = 8 * sizeof(unsigned long);
+    std::vector<unsigned long> nodemask((n_numa_nodes + bits_per_word - 1) / bits_per_word, 0);
+    for (int i = 0; i < n_numa_nodes; ++i) {
+        nodemask[i / bits_per_word] |= (1UL << (i % bits_per_word));
+    }
+
+    long ret = syscall(__NR_mbind, (void *)page_start, len, MPOL_INTERLEAVE, nodemask.data(), nodemask.size() * bits_per_word, MPOL_MF_MOVE);
+    madvise((void *)page_start, len, MADV_HUGEPAGE);
+    return ret == 0;
+#else
+    (void)tensor;
+    (void)n_numa_nodes;
+    return false;
+#endif
+}
+
+bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data || n_numa_nodes <= 1) {
+        return false;
+    }
+    size_t size = ggml_nbytes(tensor);
+    if (size < 4096) return false;
+
+    std::lock_guard<std::mutex> lock(g_replica_mutex);
+    auto it = g_tensor_replicas.find(tensor);
+    if (it != g_tensor_replicas.end() && !it->second.empty()) {
+        return true;
+    }
+
+    std::vector<void *> replicas(n_numa_nodes, nullptr);
+    replicas[0] = tensor->data;
+
+    const size_t bits_per_word = 8 * sizeof(unsigned long);
+    for (int node = 1; node < n_numa_nodes; ++node) {
+        void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED) {
+            continue;
+        }
+
+        std::vector<unsigned long> nodemask((node / bits_per_word) + 1, 0);
+        nodemask[node / bits_per_word] = 1UL << (node % bits_per_word);
+        syscall(__NR_mbind, ptr, size, MPOL_BIND, nodemask.data(), nodemask.size() * bits_per_word, MPOL_MF_MOVE | MPOL_MF_STRICT);
+        madvise(ptr, size, MADV_HUGEPAGE);
+
+        memcpy(ptr, tensor->data, size);
+        replicas[node] = ptr;
+    }
+
+    g_tensor_replicas[tensor] = std::move(replicas);
+    return true;
+#else
+    (void)tensor;
+    (void)n_numa_nodes;
+    return false;
+#endif
+}
+
+void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id) {
+    if (!tensor || node_id < 0) return tensor ? tensor->data : nullptr;
+    std::lock_guard<std::mutex> lock(g_replica_mutex);
+    auto it = g_tensor_replicas.find(tensor);
+    if (it != g_tensor_replicas.end() && (size_t)node_id < it->second.size() && it->second[node_id] != nullptr) {
+        return it->second[node_id];
+    }
+    return tensor->data;
+}
+
 } // namespace ggml::cpu::numa
 
 #ifdef __cplusplus
@@ -925,6 +1037,18 @@ bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx) {
 
 bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes) {
     return ggml::cpu::numa::bind_tensor_experts_round_robin(tensor, n_numa_nodes);
+}
+
+bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_nodes) {
+    return ggml::cpu::numa::bind_tensor_shared_interleaved(tensor, n_numa_nodes);
+}
+
+bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes) {
+    return ggml::cpu::numa::replicate_tensor_numa(tensor, n_numa_nodes);
+}
+
+void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id) {
+    return ggml::cpu::numa::get_tensor_numa_replica(tensor, node_id);
 }
 
 #ifdef __cplusplus
