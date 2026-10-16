@@ -98,6 +98,18 @@ struct llama_model_loader {
     llama_expert_tensor_index expert_tensor_index;
     llama_expert_tensor_index ple_tensor_index;
 
+    // GGUF-X / NPMC unpadded tensor dimensions for DRAM bank aliasing transparency
+    std::unordered_map<std::string, int64_t> unpadded_dim0;
+
+    bool has_unpadded_dim0(const std::string & name) const {
+        return unpadded_dim0.find(name) != unpadded_dim0.end();
+    }
+
+    int64_t get_unpadded_dim0(const std::string & name) const {
+        auto it = unpadded_dim0.find(name);
+        return it != unpadded_dim0.end() ? it->second : -1;
+    }
+
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
             const llama_model_kv_override * param_overrides_p,
