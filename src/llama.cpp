@@ -35,6 +35,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu-numa.h"
 
 #include <cmath>
 
@@ -8982,10 +8983,58 @@ void llama_backend_init(void) {
     }
 }
 
-void llama_numa_init(enum ggml_numa_strategy numa) {
-    if (numa != GGML_NUMA_STRATEGY_DISABLED) {
-        ggml_numa_init(numa);
+enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
+    if (numa == GGML_NUMA_STRATEGY_DISABLED) {
+        return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
+
+    if (numa == GGML_NUMA_STRATEGY_EXPERT) {
+        const auto & topo = ggml::cpu::numa::topology();
+        if (topo.size() < 2) {
+            LLAMA_LOG_WARN("%s: --numa expert requires at least 2 usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
+                    __func__, topo.size());
+            return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
+        }
+
+        ggml::cpu::numa::set_numa_expert(true);
+        ggml_numa_init(numa);
+        LLAMA_LOG_INFO("%s: NUMA expert initialized with %zu nodes\n", __func__, topo.size());
+        return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+    }
+
+    ggml_numa_init(numa);
+    return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+}
+
+void llama_numa_init(enum ggml_numa_strategy numa) {
+    if (llama_numa_init_ex(numa) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+        GGML_ABORT("llama_numa_init: failed to initialize the requested NUMA strategy");
+    }
+}
+
+bool llama_numa_bind_current_thread(int node_id, int thread_idx) {
+    return ggml::cpu::numa::bind_current_thread_to_node(node_id, thread_idx);
+}
+
+int llama_numa_node_count(void) {
+    return (int) ggml::cpu::numa::topology().size();
+}
+
+int llama_numa_get_optimal_draft_node(int target_node) {
+    return ggml::cpu::numa::get_optimal_draft_node(target_node);
+}
+
+int llama_numa_get_gpu_node(int device) {
+#ifdef GGML_USE_CUDA
+    return ggml_backend_cuda_get_device_numa_node(device);
+#else
+    (void) device;
+    return -1;
+#endif
+}
+
+int llama_numa_get_storage_numa_node(void) {
+    return -1;
 }
 
 void llama_backend_free(void) {

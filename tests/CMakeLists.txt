@@ -215,6 +215,8 @@ target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/g
 llama_build_and_test(test-cohort-prefix-sharing.cpp)
 target_include_directories(test-cohort-prefix-sharing PRIVATE ${PROJECT_SOURCE_DIR}/examples/server)
 
+llama_build_and_test(test-numa.cpp)
+target_include_directories(test-numa PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/common)
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 

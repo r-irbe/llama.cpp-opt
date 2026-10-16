@@ -426,6 +426,7 @@ extern "C" {
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
+        GGML_TYPE_Q1_0      = 66,  // Unsloth 1-bit quants
         //
         //
         GGML_TYPE_Q8_0_X4 = 97,
@@ -858,6 +859,8 @@ extern "C" {
 
         // read-ahead selected MoE expert weights in the CPU matmul-id kernels
         bool moe_expert_prefetch;
+        // target NUMA node for thread affinity (-1 = unset / default)
+        int numa_node;
 
         // optional CPU affinity: pin worker ith to cpu_affinity[ith % n_cpu_affinity]
         const int32_t * cpu_affinity;
@@ -916,6 +919,7 @@ extern "C" {
         GGML_NUMA_STRATEGY_ISOLATE    = 2,
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
+        GGML_NUMA_STRATEGY_EXPERT     = 5,
         GGML_NUMA_STRATEGY_COUNT
     };
 

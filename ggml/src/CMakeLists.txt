@@ -1345,6 +1345,8 @@ add_library(ggml
             ggml.c
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-cpu-numa.h
+            ggml-cpu-numa.cpp
             ggml-moe-prefetch.cpp
             ggml-moe-prefetch.h
             ggml-quants.c

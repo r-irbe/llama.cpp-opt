@@ -17,8 +17,17 @@
 #include <chrono>
 #include <barrier>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <memory>
+#include <functional>
+#include "ggml-cpu-numa.h"
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
+#endif
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
 #endif
 
 #define IK_PRINT_TIMING 0
@@ -452,6 +461,7 @@ static struct ggml_backend_reg ggml_backend_registry[GGML_REG_MAX_BACKENDS];
 static size_t ggml_backend_registry_count = 0;
 
 GGML_CALL static ggml_backend_t ggml_backend_reg_cpu_init(const char * params, void * user_data);
+GGML_CALL static ggml_backend_t ggml_backend_reg_cpu_numa_init(const char * params, void * user_data);
 
 #ifdef GGML_USE_CUDA
 extern "C" GGML_CALL void ggml_backend_cuda_reg_devices(void);
@@ -483,6 +493,15 @@ GGML_CALL static void ggml_backend_registry_init(void) {
     initialized = true;
 
     ggml_backend_register("CPU", ggml_backend_reg_cpu_init, ggml_backend_cpu_buffer_type(), NULL);
+
+    const auto & topo = ggml::cpu::numa::topology();
+    if (topo.size() >= 2) {
+        for (const auto & node : topo) {
+            char name[16];
+            snprintf(name, sizeof(name), "CPU%d", node.id);
+            ggml_backend_register(name, ggml_backend_reg_cpu_numa_init, ggml_backend_cpu_numa_buffer_type(node.id), (void *)(intptr_t)node.id);
+        }
+    }
 
     // add forward decls here to avoid including the backend headers
 #ifdef GGML_USE_CUDA
@@ -741,6 +760,153 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type;
 }
 
+//
+// NUMA CPU buffer type
+//
+
+struct ggml_backend_cpu_numa_buffer_context {
+    void * data;
+    size_t size;
+    int node_id;
+};
+
+static const char * ggml_backend_cpu_numa_buffer_get_name(ggml_backend_buffer_t buffer) {
+    auto * ctx = (struct ggml_backend_cpu_numa_buffer_context *) buffer->context;
+    static thread_local char name[32];
+    snprintf(name, sizeof(name), "CPU%d", ctx->node_id);
+    return name;
+}
+
+static void ggml_backend_cpu_numa_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * ctx = (struct ggml_backend_cpu_numa_buffer_context *) buffer->context;
+    if (ctx->data && ctx->size > 0) {
+        ggml::cpu::numa::free_onnode(ctx->data, ctx->size);
+    }
+    delete ctx;
+}
+
+static void * ggml_backend_cpu_numa_buffer_get_base(ggml_backend_buffer_t buffer) {
+    auto * ctx = (struct ggml_backend_cpu_numa_buffer_context *) buffer->context;
+    return ctx->data;
+}
+
+static void ggml_backend_cpu_numa_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    memset((char *)tensor->data + offset, value, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_numa_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    memcpy((char *)tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_numa_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *)tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static bool ggml_backend_cpu_numa_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_numa_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = (struct ggml_backend_cpu_numa_buffer_context *) buffer->context;
+    if (ctx->data && buffer->size > 0) {
+        memset(ctx->data, value, buffer->size);
+    }
+}
+
+static struct ggml_backend_buffer_i cpu_numa_backend_buffer_i = {
+    /* .get_name        = */ ggml_backend_cpu_numa_buffer_get_name,
+    /* .free_buffer     = */ ggml_backend_cpu_numa_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cpu_numa_buffer_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_cpu_numa_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cpu_numa_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cpu_numa_buffer_get_tensor,
+    /* .cpy_tensor      = */ ggml_backend_cpu_numa_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cpu_numa_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+struct ggml_backend_cpu_numa_buft_context {
+    int node_id;
+    std::string name;
+};
+
+static const char * ggml_backend_cpu_numa_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    auto * ctx = (struct ggml_backend_cpu_numa_buft_context *) buft->context;
+    return ctx->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_cpu_numa_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * ctx = (struct ggml_backend_cpu_numa_buft_context *) buft->context;
+    if (size == 0) {
+        auto * buf_ctx = new ggml_backend_cpu_numa_buffer_context{ nullptr, 0, ctx->node_id };
+        return ggml_backend_buffer_init(buft, cpu_numa_backend_buffer_i, buf_ctx, 0);
+    }
+    std::string err;
+    void * data = ggml::cpu::numa::alloc_onnode(size, ctx->node_id, err);
+    if (!data) {
+        fprintf(stderr, "%s: node %d alloc_onnode(%zu) failed: %s\n", __func__, ctx->node_id, size, err.c_str());
+        return NULL;
+    }
+    auto * buf_ctx = new ggml_backend_cpu_numa_buffer_context{ data, size, ctx->node_id };
+    return ggml_backend_buffer_init(buft, cpu_numa_backend_buffer_i, buf_ctx, size);
+}
+
+static size_t ggml_backend_cpu_numa_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return TENSOR_ALIGNMENT;
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cpu_numa_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return true;
+    GGML_UNUSED(buft);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(int node_id) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::unique_ptr<ggml_backend_buffer_type>> bufts;
+    static std::unordered_map<int, std::unique_ptr<ggml_backend_cpu_numa_buft_context>> buft_ctxs;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = bufts.find(node_id);
+    if (it != bufts.end()) {
+        return it->second.get();
+    }
+
+    auto buft_ctx = std::make_unique<ggml_backend_cpu_numa_buft_context>();
+    buft_ctx->node_id = node_id;
+    buft_ctx->name = "CPU" + std::to_string(node_id);
+
+    auto buft = std::make_unique<ggml_backend_buffer_type>();
+    buft->iface.get_name       = ggml_backend_cpu_numa_buffer_type_get_name;
+    buft->iface.alloc_buffer   = ggml_backend_cpu_numa_buffer_type_alloc_buffer;
+    buft->iface.get_alignment  = ggml_backend_cpu_numa_buffer_type_get_alignment;
+    buft->iface.get_max_size   = NULL;
+    buft->iface.get_alloc_size = NULL;
+    buft->iface.is_host        = ggml_backend_cpu_numa_buffer_type_is_host;
+    buft->context              = buft_ctx.get();
+
+    ggml_backend_buffer_type_t res = buft.get();
+    buft_ctxs[node_id] = std::move(buft_ctx);
+    bufts[node_id] = std::move(buft);
+    return res;
+}
+
+bool ggml_backend_buft_is_cpu_numa(ggml_backend_buffer_type_t buft) {
+    if (!buft) return false;
+    return buft->iface.get_name == ggml_backend_cpu_numa_buffer_type_get_name;
+}
+
+
+
 #ifdef GGML_USE_CPU_HBM
 
 // buffer type HBM
@@ -994,12 +1160,250 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     return cpu_backend;
 }
 
+//
+// NUMA CPU backend
+//
+
+struct ggml_backend_cpu_numa_context {
+    int node_id;
+    int n_threads;
+    std::string name;
+    std::vector<int> cpus;
+    int n_cores;
+
+    void * work_data = nullptr;
+    size_t work_size = 0;
+
+    ggml_abort_callback abort_callback = nullptr;
+    void * abort_callback_data = nullptr;
+    bool moe_expert_prefetch = false;
+
+    // Worker thread for async computation & node-pinned execution
+    std::thread worker_thread;
+    std::mutex mutex;
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+    struct ggml_cgraph * graph = nullptr;
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+    bool stop = false;
+};
+
+static const char * ggml_backend_cpu_numa_name(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    return ctx->name.c_str();
+}
+
+static void ggml_backend_cpu_numa_free(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->stop = true;
+        ctx->cv_work.notify_all();
+    }
+    if (ctx->worker_thread.joinable()) {
+        ctx->worker_thread.join();
+    }
+    if (ctx->work_data) {
+        ggml::cpu::numa::free_onnode(ctx->work_data, ctx->work_size);
+        ctx->work_data = nullptr;
+        ctx->work_size = 0;
+    }
+    delete ctx;
+    free(backend);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cpu_numa_get_default_buffer_type(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    return ggml_backend_cpu_numa_buffer_type(ctx->node_id);
+}
+
+static void ggml_backend_cpu_numa_worker_loop(struct ggml_backend_cpu_numa_context * ctx) {
+    ggml::cpu::numa::bind_current_thread(ctx->cpus);
+
+    while (true) {
+        struct ggml_cgraph * cgraph = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(ctx->mutex);
+            ctx->cv_work.wait(lock, [ctx] { return ctx->graph != nullptr || ctx->stop; });
+            if (ctx->stop) {
+                break;
+            }
+            cgraph = ctx->graph;
+        }
+
+        struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads);
+        cplan.numa_node = ctx->node_id;
+
+        if (ctx->work_size < cplan.work_size) {
+            if (ctx->work_data) {
+                ggml::cpu::numa::free_onnode(ctx->work_data, ctx->work_size);
+                ctx->work_data = nullptr;
+                ctx->work_size = 0;
+            }
+            std::string err;
+            ctx->work_data = ggml::cpu::numa::alloc_onnode(cplan.work_size, ctx->node_id, err);
+            if (ctx->work_data == nullptr) {
+                ctx->work_size = 0;
+                std::lock_guard<std::mutex> lock(ctx->mutex);
+                ctx->status = GGML_STATUS_ALLOC_FAILED;
+                ctx->graph = nullptr;
+                ctx->cv_done.notify_all();
+                continue;
+            }
+            ctx->work_size = cplan.work_size;
+        }
+        cplan.work_data = (uint8_t *)ctx->work_data;
+        cplan.abort_callback = ctx->abort_callback;
+        cplan.abort_callback_data = ctx->abort_callback_data;
+        cplan.moe_expert_prefetch = ctx->moe_expert_prefetch;
+
+        enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
+
+        {
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            ctx->status = status;
+            ctx->graph = nullptr;
+            ctx->cv_done.notify_all();
+        }
+    }
+}
+
+static enum ggml_status ggml_backend_cpu_numa_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    std::unique_lock<std::mutex> lock(ctx->mutex);
+    ctx->cv_done.wait(lock, [ctx] { return ctx->graph == nullptr; });
+
+    if (ctx->status != GGML_STATUS_SUCCESS) {
+        enum ggml_status st = ctx->status;
+        ctx->status = GGML_STATUS_SUCCESS;
+        return st;
+    }
+
+    ctx->graph = cgraph;
+    ctx->cv_work.notify_one();
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cpu_numa_synchronize(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    std::unique_lock<std::mutex> lock(ctx->mutex);
+    ctx->cv_done.wait(lock, [ctx] { return ctx->graph == nullptr; });
+}
+
+static bool ggml_backend_cpu_numa_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
+    return ggml_backend_cpu_supports_op(backend, op);
+}
+
+static bool ggml_backend_cpu_numa_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    return buft == ggml_backend_cpu_numa_buffer_type(ctx->node_id);
+}
+
+static struct ggml_backend_i cpu_numa_backend_i = {
+    /* .get_name                = */ ggml_backend_cpu_numa_name,
+    /* .free                    = */ ggml_backend_cpu_numa_free,
+    /* .get_default_buffer_type = */ ggml_backend_cpu_numa_get_default_buffer_type,
+    /* .set_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ NULL,
+    /* .synchronize             = */ ggml_backend_cpu_numa_synchronize,
+    /* .graph_plan_create       = */ NULL,
+    /* .graph_plan_free         = */ NULL,
+    /* .graph_plan_update       = */ NULL,
+    /* .graph_plan_compute      = */ NULL,
+    /* .graph_compute           = */ ggml_backend_cpu_numa_graph_compute,
+    /* .supports_op             = */ ggml_backend_cpu_numa_supports_op,
+    /* .supports_buft           = */ ggml_backend_cpu_numa_supports_buft,
+    /* .offload_op              = */ NULL,
+    /* .event_new               = */ NULL,
+    /* .event_free              = */ NULL,
+    /* .event_record            = */ NULL,
+    /* .event_wait              = */ NULL,
+    /* .event_synchronize       = */ NULL,
+};
+
+static ggml_guid_t ggml_backend_cpu_numa_guid(void) {
+    static ggml_guid guid = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99 };
+    return &guid;
+}
+
+int ggml_backend_cpu_numa_node_count(void) {
+    return (int) ggml::cpu::numa::topology().size();
+}
+
+ggml_backend_t ggml_backend_cpu_numa_init(int node_id) {
+    const auto & nodes = ggml::cpu::numa::topology();
+    const ggml::cpu::numa::node * node_ptr = nullptr;
+    for (const auto & n : nodes) {
+        if (n.id == node_id) {
+            node_ptr = &n;
+            break;
+        }
+    }
+    if (!node_ptr) {
+        fprintf(stderr, "%s: node %d not found in NUMA topology\n", __func__, node_id);
+        return NULL;
+    }
+
+    auto * ctx = new ggml_backend_cpu_numa_context();
+    ctx->node_id   = node_id;
+    ctx->name      = "CPU" + std::to_string(node_id);
+    ctx->cpus      = node_ptr->cpus;
+    ctx->n_cores   = node_ptr->n_cores;
+    ctx->n_threads = node_ptr->n_cores > 0 ? node_ptr->n_cores : (int)node_ptr->cpus.size();
+
+    // Start dedicated worker thread pinned to this node
+    ctx->worker_thread = std::thread(ggml_backend_cpu_numa_worker_loop, ctx);
+
+    ggml_backend_t numa_backend = (ggml_backend_t) malloc(sizeof(struct ggml_backend));
+    *numa_backend = ggml_backend {
+        /* .guid      = */ ggml_backend_cpu_numa_guid(),
+        /* .interface = */ cpu_numa_backend_i,
+        /* .context   = */ ctx
+    };
+    return numa_backend;
+}
+
+bool ggml_backend_is_cpu_numa(ggml_backend_t backend) {
+    return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cpu_numa_guid());
+}
+
+int ggml_backend_cpu_numa_get_node(ggml_backend_t backend) {
+    if (!ggml_backend_is_cpu_numa(backend)) return -1;
+    auto * ctx = (struct ggml_backend_cpu_numa_context *) backend->context;
+    return ctx->node_id;
+}
+
+void ggml_backend_cpu_numa_get_memory(int node_id, size_t * free_mem, size_t * total_mem) {
+    const auto & nodes = ggml::cpu::numa::topology();
+    for (auto n : nodes) {
+        if (n.id == node_id) {
+            ggml::cpu::numa::refresh_memory(n);
+            if (free_mem)  *free_mem  = n.mem_available;
+            if (total_mem) *total_mem = n.mem_total;
+            return;
+        }
+    }
+    if (free_mem)  *free_mem  = 0;
+    if (total_mem) *total_mem = 0;
+}
+
 GGML_CALL bool ggml_backend_is_cpu(ggml_backend_t backend) {
-    return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cpu_guid());
+    return backend != NULL && (ggml_guid_matches(backend->guid, ggml_backend_cpu_guid()) || ggml_backend_is_cpu_numa(backend));
 }
 
 void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    if (ggml_backend_is_cpu_numa(backend_cpu)) {
+        auto * ctx = (struct ggml_backend_cpu_numa_context *)backend_cpu->context;
+        if (n_threads > 0 && n_threads <= (int)ctx->cpus.size()) {
+            ctx->n_threads = n_threads;
+        } else if (n_threads > (int)ctx->cpus.size()) {
+            ctx->n_threads = (int)ctx->cpus.size();
+        }
+        return;
+    }
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->n_threads = n_threads;
@@ -1007,6 +1411,12 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
 
 void ggml_backend_cpu_set_moe_expert_prefetch(ggml_backend_t backend_cpu, bool enable) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    if (ggml_backend_is_cpu_numa(backend_cpu)) {
+        auto * ctx = (struct ggml_backend_cpu_numa_context *)backend_cpu->context;
+        ctx->moe_expert_prefetch = enable;
+        return;
+    }
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->moe_expert_prefetch = enable;
@@ -1029,6 +1439,13 @@ void ggml_backend_cpu_set_cpu_affinity(ggml_backend_t backend_cpu, const int32_t
 void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 
+    if (ggml_backend_is_cpu_numa(backend_cpu)) {
+        auto * ctx = (struct ggml_backend_cpu_numa_context *)backend_cpu->context;
+        ctx->abort_callback = abort_callback;
+        ctx->abort_callback_data = abort_callback_data;
+        return;
+    }
+
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = abort_callback_data;
@@ -1044,6 +1461,13 @@ GGML_CALL static ggml_backend_t ggml_backend_reg_cpu_init(const char * params, v
 
     GGML_UNUSED(params);
     GGML_UNUSED(user_data);
+}
+
+GGML_CALL static ggml_backend_t ggml_backend_reg_cpu_numa_init(const char * params, void * user_data) {
+    int node_id = (int)(intptr_t)user_data;
+    return ggml_backend_cpu_numa_init(node_id);
+
+    GGML_UNUSED(params);
 }
 
 // multi-buffer buffer
@@ -1217,8 +1641,12 @@ struct ggml_backend_sched {
 
     uint32_t op_offload[(GGML_OP_COUNT + 31)/32];
 
+    struct alignas(128) backend_status_padded {
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+    };
+
     std::vector<std::thread> workers;
-    std::vector<ggml_status> statuses;
+    std::vector<backend_status_padded> statuses;
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
@@ -1228,6 +1656,21 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+
+    struct worker_pool {
+        int n_backends = 0;
+        int cur_first_reduce = -1;
+        std::unique_ptr<std::barrier<>> barrier;
+        std::vector<std::thread> threads;
+        std::mutex mtx;
+        std::condition_variable cv_start;
+        std::condition_variable cv_done;
+        int epoch = 0;
+        int done_count = 0;
+        bool stop = false;
+        std::function<void(int, int)> compute_fn;
+    };
+    std::unique_ptr<worker_pool> pool;
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -2260,7 +2703,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
 
-        for (auto & s : sched->statuses) s = GGML_STATUS_SUCCESS;
+        for (auto & s : sched->statuses) s.status = GGML_STATUS_SUCCESS;
 
         int first_reduce = -1;
         bool work_done = false;
@@ -2328,7 +2771,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
-                    sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    sched->statuses[ith].status = ggml_backend_sched_eval(sched, split_backend, split);
 
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
@@ -2368,10 +2811,61 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 #endif
         if (!work_done) {
 
-        std::barrier barrier(sched->n_backends);
-        auto compute = [sched, &barrier, first_reduce] (int ith) {
+        if (!sched->pool || sched->pool->n_backends != sched->n_backends) {
+            if (sched->pool) {
+                {
+                    std::lock_guard<std::mutex> lock(sched->pool->mtx);
+                    sched->pool->stop = true;
+                    sched->pool->cv_start.notify_all();
+                }
+                for (auto & t : sched->pool->threads) {
+                    if (t.joinable()) t.join();
+                }
+            }
+            sched->pool = std::make_unique<ggml_backend_sched::worker_pool>();
+            sched->pool->n_backends = sched->n_backends;
+            sched->pool->barrier = std::make_unique<std::barrier<>>(sched->n_backends);
+            for (int i = 1; i < sched->n_backends; ++i) {
+                sched->pool->threads.emplace_back([sched](int ith) {
+                    auto * p = sched->pool.get();
+                    if (ggml_backend_is_cpu_numa(sched->backends[ith])) {
+                        int node = ggml_backend_cpu_numa_get_node(sched->backends[ith]);
+                        ggml::cpu::numa::bind_current_thread_to_node(node, -1);
+                    }
+#ifdef GGML_USE_CUDA
+                    else if (ggml_backend_is_cuda(sched->backends[ith])) {
+                        int cuda_node = ggml_backend_cuda_get_device_numa_node(0);
+                        if (cuda_node >= 0) {
+                            ggml::cpu::numa::bind_current_thread_to_node(cuda_node, -1);
+                        }
+                    }
+#endif
+                    int my_epoch = 0;
+                    while (true) {
+                        {
+                            std::unique_lock<std::mutex> lock(p->mtx);
+                            p->cv_start.wait(lock, [p, my_epoch] { return p->stop || p->epoch > my_epoch; });
+                            if (p->stop) break;
+                            my_epoch = p->epoch;
+                        }
 
+                        p->compute_fn(ith, p->cur_first_reduce);
+
+                        {
+                            std::lock_guard<std::mutex> lock(p->mtx);
+                            p->done_count++;
+                            if (p->done_count == p->n_backends - 1) {
+                                p->cv_done.notify_one();
+                            }
+                        }
+                    }
+                }, i);
+            }
+        }
+
+        auto compute = [sched] (int ith, int first_reduce) {
             struct ggml_backend_sched_split * splits = sched->splits;
+            auto & barrier = *sched->pool->barrier;
 
             std::vector<int32_t> ids;
             std::vector<uint32_t> unique_ids;
@@ -2403,7 +2897,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
-                    sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    sched->statuses[ith].status = ggml_backend_sched_eval(sched, split_backend, split);
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
                     } else {
@@ -2428,26 +2922,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
                 }
-                //if (needs_barrier) {
-                //    barrier.arrive_and_wait();
-                //}
 
                 // record the event of this copy
                 if (split->n_inputs > 0) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        printf("Recording event %d, %d\n", split_backend_id, sched->cur_copy);
                         ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
                     }
                 }
             }
         };
 
-        for (int i = 0; i < sched->n_backends; ++i) sched->workers.emplace_back(compute, i);
-        for (auto & w : sched->workers) w.join();
-        sched->workers.clear();
+        sched->pool->compute_fn = compute;
+        sched->pool->cur_first_reduce = first_reduce;
+
+        {
+            std::lock_guard<std::mutex> lock(sched->pool->mtx);
+            sched->pool->done_count = 0;
+            sched->pool->epoch++;
+            sched->pool->cv_start.notify_all();
         }
-        for (auto status : sched->statuses) {
-            if (status != GGML_STATUS_SUCCESS) return status;
+
+        static thread_local bool s_thread0_bound = false;
+        if (!s_thread0_bound) {
+            if (ggml_backend_is_cpu_numa(sched->backends[0])) {
+                int node = ggml_backend_cpu_numa_get_node(sched->backends[0]);
+                ggml::cpu::numa::bind_current_thread_to_node(node, -1);
+            }
+#ifdef GGML_USE_CUDA
+            else if (ggml_backend_is_cuda(sched->backends[0])) {
+                int cuda_node = ggml_backend_cuda_get_device_numa_node(0);
+                if (cuda_node >= 0) {
+                    ggml::cpu::numa::bind_current_thread_to_node(cuda_node, -1);
+                }
+            }
+#endif
+            s_thread0_bound = true;
+        }
+
+        compute(0, first_reduce);
+
+        {
+            std::unique_lock<std::mutex> lock(sched->pool->mtx);
+            sched->pool->cv_done.wait(lock, [sched] {
+                return sched->pool->done_count == sched->pool->n_backends - 1;
+            });
+        }
+        }
+        for (const auto & status : sched->statuses) {
+            if (status.status != GGML_STATUS_SUCCESS) return status.status;
         }
         return GGML_STATUS_SUCCESS;
 
@@ -2643,7 +3165,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
 
     sched->workers.reserve(sched->n_backends);
-    sched->statuses.resize(sched->n_backends, GGML_STATUS_SUCCESS);
+    sched->statuses.resize(sched->n_backends);
     sched->backend_splits.resize(sched->n_backends);
 
     ggml_backend_sched_reset(sched);
@@ -2654,6 +3176,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->pool) {
+        {
+            std::lock_guard<std::mutex> lock(sched->pool->mtx);
+            sched->pool->stop = true;
+            sched->pool->cv_start.notify_all();
+        }
+        for (auto & t : sched->pool->threads) {
+            if (t.joinable()) t.join();
+        }
+        sched->pool.reset();
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
