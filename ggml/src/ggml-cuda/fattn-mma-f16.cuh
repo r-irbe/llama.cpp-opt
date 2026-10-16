@@ -49,7 +49,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
     const unsigned int tile_KV_32 = __cvta_generic_to_shared(tile_KV);
 
-    constexpr int preload = 64;
+    constexpr int preload = 128;
     constexpr int h2_per_chunk = 16/sizeof(half2);
     constexpr int chunks_per_row = k0_sync_start / h2_per_chunk;
     constexpr int stride_i = WARP_SIZE / chunks_per_row;
