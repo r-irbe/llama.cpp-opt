@@ -226,11 +226,11 @@ MLA models already have the cache compressed, it doesn't really makes sense to c
 | `--yarn-orig-ctx N` | Original training context limit for YaRN | loaded from model | Base pre-trained context size (e.g. `4096`, `8192`, `32768`). |
 | `--yarn-ext-factor N` | YaRN extrapolation mix factor | -1.0 | Controls blending between interpolation and extrapolation (0.0 = full interpolation). |
 | `--yarn-attn-factor N` | YaRN attention temperature scale factor | -1.0 | Scales attention scores to prevent entropy collapse at high context. |
-| `-unreal, --unreal-filter` | Enable UNREAL model-internal evidence selection | disabled | Dynamically identifies and filters distractor tokens in long-context prompts (arXiv:2610.08463). |
-| `--no-unreal-filter` | Disable UNREAL evidence filtering | enabled | Default behavior. |
-| `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Size of text chunks evaluated for relevance. |
-| `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Keeps the N most relevant chunks while suppressing noise. |
-| `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Prompts shorter than this bypass UNREAL filtering. |
+| `-unreal, --unreal-filter` | Enable UNREAL model-internal evidence selection | disabled | **Not implemented**: parsed into `gpt_params::unreal_filter`, but no code in `src/` or the server reads it (`common/unreal-selector.h` is used by a unit test only), so enabling it changes nothing. See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md). |
+| `--no-unreal-filter` | Disable UNREAL evidence filtering | enabled | Default behavior (the feature itself is not wired up). |
+| `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Parsed only; the value is not consumed. |
+| `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Parsed only; the value is not consumed. |
+| `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Parsed only; the value is not consumed. |
 | `--no-context-shift` | Disable context-shift | - |  |
 | `--context-shift` | Set context-shift | on | auto / on / off / 0 / 1 [PR 973](https://github.com/ikawrakow/ik_llama.cpp/pull/973) |
 
@@ -408,8 +408,8 @@ Check the full architectural guide in [`docs/numa.md`](./numa.md).
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `--numa TYPE` | NUMA optimization mode | none | Options: `none`, `distribute`, `isolate`, `numactl`, `split`, `expert`. <br>• `split`: Partitions workload and memory buffers symmetrically across NUMA domains.<br>• `expert`: Pins MoE expert groups to dedicated NUMA nodes for local memory execution.<br>Example: `--numa split` or `--numa expert` |
-| `--numa-replicate-shared` | Replicate shared layers across NUMA nodes | off | Duplicates dense shared weights (attention QKV, output projection, RMSNorm, embeddings) into each NUMA node's local memory to eliminate cross-socket interconnect bus saturation. |
+| `--numa TYPE` | NUMA optimization mode | none | Implemented values: `distribute`, `split` (documented alias of `distribute`, identical strategy), `isolate`, `numactl`. <br>• `distribute`/`split`: pins worker threads round-robin across the detected NUMA nodes; it does not partition weights or split the batch per node.<br>• `isolate`: pins all worker threads to the node the process started on - set `-t` to that node's core count, otherwise threads oversubscribe it (measured 6x slower at `-t 32`).<br>`expert` and `mirror` are accepted by the parser but **not implemented** (they warn) - see [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md). See also [`docs/numa.md`](./numa.md).<br>Example: `--numa distribute` |
+| `--numa-replicate-shared` | Replicate shared layers across NUMA nodes | off | **Not implemented**: the flag is accepted and warns, but no replica buffers are allocated, so shared weights are not duplicated per node. See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md) for what landing it would take. |
 | `-nnd, --numa-node-draft N` | Draft model NUMA affinity | -1 (auto) | Pins the draft model to a specific NUMA node or socket, preventing resource contention with the main model. |
 | `-ot, --override-tensor NAME` | Override tensor memory buffer type | - | Direct model tensors to specific NUMA memory domains (e.g. `\.ffn_.*_exps\.=CPU0`). |
 | `-cmoe, --cpu-moe` | Keep all MoE weights in CPU memory | off | Pins all MoE expert weights to system RAM while running attention layers on GPU. |
@@ -453,10 +453,10 @@ Request-level `speculative.stages` is constrained:
 | `--webui NAME` | Controls which webui to server | auto | Flexibility in choosing the integrated powerful WebUIs:  - `none`: disable webui  - `auto`: default webui   - `llamacpp`: llamacpp webui |
 | `--api-key KEY` | API key to use for authentication | none | Add a custom API KEY. Clients will need to specify it when connecting. |
 | `-a, --alias` | Set alias for model name (to be used by REST API) | none | Configure the server to serve and reply with specific model name. |
-| `--cohort-prefix-sharing` | Enable Cohort Prompt Prefix Sharing (PPS) | enabled | Enables cross-slot zero-copy prompt prefix sharing across cohorts. Requests with matching system prompts or document prefixes reuse precomputed KV caches instantly via zero-copy sequence replication. |
-| `--no-cohort-prefix-sharing` | Disable Cohort Prompt Prefix Sharing | disabled | Forces every slot to process prompts independently. |
-| `--cohort-min-prefix N` | Minimum shared prefix tokens to trigger PPS | 16 | Prevents overhead for trivially short prefixes. |
-| `--cohort-max-idle-sec SEC` | Max idle seconds before reclaiming private cohort slot | 0 (disabled) | When set, automatically evicts idle cohort slots after SEC seconds to free memory. |
+| `--cohort-prefix-sharing` | Enable Cohort Prompt Prefix Sharing (PPS) | - | **Not implemented**: `llama-server` rejects this flag (`error: unknown argument`). `examples/server/cohort-radix-trie.h` exists but is only used by a unit test. See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md). |
+| `--no-cohort-prefix-sharing` | Disable Cohort Prompt Prefix Sharing | - | **Not implemented** (same as above; the feature it would disable does not exist at HEAD). |
+| `--cohort-min-prefix N` | Minimum shared prefix tokens to trigger PPS | - | **Not implemented**: no such flag exists. |
+| `--cohort-max-idle-sec SEC` | Max idle seconds before reclaiming a cohort slot | - | **Not implemented**: no such flag exists. |
 | `-ctx-ckpt N, --ctx-checkpoints N` | Max context checkpoints per slot | 32 | Stores recurrent architecture checkpoints for fast speculative rollouts and prompt rewinds. |
 | `--ctx-ckpt-spill-dir DIR` | Spill evicted checkpoints to NVMe storage | disabled | When set, spills older checkpoints to fast disk instead of dropping them, saving RAM while preserving context rollback. |
 | `--ctx-ckpt-live-n N` | Max resident checkpoints in RAM when spill is active | 2 | Keeps only N newest checkpoints resident in memory; earlier ones are streamed to NVMe. |
@@ -499,7 +499,7 @@ llama-bench -tgb 4,16 -p 512 -n 128 other_arguments
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `-tgb (or --threads-gen-batch)` | Enable having different number of threads for generation and batch processing | - | [PR 284](https://github.com/ikawrakow/ik_llama.cpp/pull/284) |
+| `-tgb (or --threads-gen-batch)` | Enable having different number of threads for generation and batch processing | - | **llama-bench only**: `llama-server` and `llama-cli` reject it. [PR 284](https://github.com/ikawrakow/ik_llama.cpp/pull/284) |
 | `--fit` | Automatically fit to available VRAM | 0 | 0 / 1 [PR 1542](https://github.com/ikawrakow/ik_llama.cpp/pull/1542) |
 | `--fit-margin N` | Safety VRAM margin in MiB when using `--fit` | 1024 |  |
 

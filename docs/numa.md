@@ -12,64 +12,68 @@ During autoregressive token generation:
 - Every active token read must stream gigabytes of weight matrices from system memory into processor caches.
 - Uncoordinated multi-threading leads to severe cross-socket bus contention, cache invalidation storms, and dramatic throughput degradation (often 2× to 4× slower than theoretical memory bandwidth).
 
-`llama.cpp-opt` provides first-class NUMA awareness with fine-grained memory affinity, expert partitioning, and shared-tensor replication.
+`llama.cpp-opt` provides NUMA-aware thread pinning plus per-node CPU backends. Expert partitioning and
+shared-tensor replication are prototypes that are not wired up at HEAD; see section 2.3 and
+[`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
 
 ---
 
 ## 2. NUMA Operating Modes
 
-`llama.cpp-opt` supports three primary NUMA operating modes:
+What the binary at HEAD accepts for `--numa` (`common/common.cpp`, strategy enum in
+`ggml/include/ggml.h`, pinning in `ggml/src/ggml.c`):
 
-### 2.1 `--numa split` (Symmetric Workload Partitioning)
+| `--numa` value | What it does | Status |
+| --- | --- | --- |
+| `distribute` | Worker threads are pinned round-robin across the detected NUMA nodes (`set_numa_thread_affinity`, `GGML_NUMA_STRATEGY_DISTRIBUTE`). | Implemented |
+| `split` | **Documented alias of `distribute`** — same strategy, same behaviour. It does not partition weights or memory. | Implemented alias |
+| `isolate` | All worker threads are pinned to the NUMA node the process started on (`GGML_NUMA_STRATEGY_ISOLATE`). | Implemented; see the trap in 2.2 |
+| `numactl` | Uses the CPU mask that `numactl` handed to the process (`GGML_NUMA_STRATEGY_NUMACTL`). | Implemented |
+| `expert` | Accepted by the parser, warns, and does not shard experts onto nodes. | **Not implemented** — `docs/UNIMPLEMENTED.md` |
+| `mirror` | Accepted by the parser, warns, and does not mirror data per node. | **Not implemented** — `docs/UNIMPLEMENTED.md` |
 
-`--numa split` partitions thread pools and memory allocations evenly across detected NUMA domains. Each NUMA node executes sub-graph computations on weights resident in its local physical memory channels.
+### 2.1 `--numa split` is an alias of `--numa distribute`
 
-- **Best for**: Dense transformer models (e.g. Llama 3, Qwen 2.5, Mistral) where all parameters are active on every token.
-- **Mechanism**: Splits batch processing and tensor operations along parallel dimensions, ensuring each thread accesses exclusively local RAM.
+`--numa split` selects `GGML_NUMA_STRATEGY_DISTRIBUTE`. The only thing it does is pin worker threads
+round-robin over the NUMA nodes; it does **not** place weights or allocations on the node that uses
+them, and it does not split batch processing per node. Per-node CPU backends (`CPU0..CPUn`) are
+registered whenever two or more NUMA nodes exist (`ggml/src/ggml-backend.cpp`), but that is
+independent of this flag.
+
+**Meaning drift, and the decision taken at HEAD.** This flag has meant three things across tree
+states: rejected at commit `9f1339fc8` (`error: invalid parameter for argument: --numa`), an alias of
+`GGML_NUMA_STRATEGY_EXPERT` on `backup/feat-numa-split-pre-squash`, and an alias of
+`GGML_NUMA_STRATEGY_DISTRIBUTE` in the 2026-10-17 worktree (this document previously described it as
+symmetric per-node partitioning as well). Decision at HEAD: **`split` means `distribute` and nothing
+else**; expert sharding, if it ever lands, will be `--numa expert`. The value is a single spelling
+for one strategy, so the tuner no longer samples `split` and `distribute` as separate arms.
 
 **Usage:**
 ```bash
 ./build/bin/llama-cli -m models/llama-3-70b-instruct.Q4_K_M.gguf \
-    --numa split \
-    -t 64 \
+    --numa distribute \
+    -t 32 \
     -p "Explain the principles of non-uniform memory architecture."
 ```
 
-### 2.2 `--numa expert` (Mixture-of-Experts Partitioning)
+### 2.2 `--numa isolate`: match `-t` to the node's core count
 
-`--numa expert` is purpose-built for sparse Mixture-of-Experts (MoE) architectures (such as DeepSeek-V2/V3, Qwen-2.5-MoE, Mixtral 8x7B/8x22B, and GLM-4/5).
+`isolate` pins every worker to the node the process started on. On an 8-node dual-EPYC host (7 cores
+per node) that makes `-t 32` oversubscribe a single node: measured 3.48 tok/s decode and 29.7 tok/s
+pp512, versus 19.2-20.8 tok/s and 140-151 pp512 for `distribute` under the same `-t 32`. Use
+`--numa isolate` only together with `-t` equal to that node's core count, or use `--cpu-range`
+instead.
 
-- **Best for**: MoE models running on multi-socket or multi-CCX systems.
-- **Mechanism**:
-  - Assigns different expert groups to dedicated NUMA nodes based on memory locality.
-  - When the router activates top-$k$ experts, computation executes locally on the specific NUMA node hosting those expert weights.
-  - Eliminates cross-socket streaming of heavy expert weight matrices over UPI / xGMI links.
+### 2.3 Expert sharding and shared-tensor replication are not implemented
 
-**Usage:**
-```bash
-./build/bin/llama-cli -m models/DeepSeek-V3-Q4_K_M.gguf \
-    --numa expert \
-    -t 64 \
-    -p "Analyze asymptotic complexity of parallel prefix sum."
-```
-
-### 2.3 `--numa-replicate-shared` (Shared Tensor Duplication)
-
-In MoE models, non-expert layers (such as self-attention QKV projections, attention output projections, RMSNorm weights, and embedding tables) are evaluated on every single token by all worker threads. If these layers reside on a single NUMA node, all other nodes must repeatedly fetch them over cross-socket buses.
-
-`--numa-replicate-shared` duplicates these shared weights into the local physical memory of every NUMA node:
-- **Best for**: High-throughput multi-socket MoE serving where memory capacity allows duplicating dense shared layers (~10–15% memory overhead).
-- **Mechanism**: Allocates replica buffers per NUMA node during model loading. Each node's thread pool reads its private replica without inter-socket traffic.
-
-**Usage:**
-```bash
-./build/bin/llama-cli -m models/qwen2.5-moe-72b.Q4_K_M.gguf \
-    --numa expert \
-    --numa-replicate-shared \
-    -t 64
-```
+`--numa expert`, `--numa mirror` and `--numa-replicate-shared` are prototypes: the helpers exist
+(`ggml::cpu::numa::bind_tensor_experts_round_robin`, `bind_tensor_shared_interleaved`,
+`GGML_NUMA_STRATEGY_MIRROR`/`EXPERT`) but nothing calls them from the model load path, and the parser
+now prints a warning when they are requested. What landing each one would take is written down in
+[`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
 
 ---
+
 
 ## 3. Thread Pinning and Core Affinity
 
@@ -107,7 +111,9 @@ Run `numastat` during active generation to inspect memory locality:
 ```bash
 watch -n 1 numastat -c llama-cli
 ```
-A well-optimized `--numa split` or `--numa expert` run should display $>98\%$ `Numa_Hit` and near-zero `Numa_Miss` or `Foreign_Alloc`.
+A well-pinned `--numa distribute` (or `--numa isolate` with a matching `-t`) run should display
+$>98\%$ `Numa_Hit` and near-zero `Numa_Miss` or `Foreign_Alloc`. There is no per-node weight
+placement in this build, so weights stay where the allocator put them.
 
 ### 4.2 Linux Hardware Performance Counters
 Monitor cross-socket interconnect traffic and cache misses:
@@ -116,3 +122,4 @@ perf stat -e node-loads,node-load-misses,cache-misses,cycles,instructions \
     ./build/bin/llama-cli -m model.gguf --numa split -t 64 -n 256
 ```
 A low `node-load-misses` / `node-loads` ratio confirms that data is streaming locally from near memory.
+Note that this only measures the thread pinning above; it does not prove per-node placement of weights.

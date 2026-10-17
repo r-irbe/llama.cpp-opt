@@ -39,11 +39,16 @@ For a 70B parameter model with 128k context length:
 
 ---
 
-## 3. ZDD / SDD Sparse Block Compression
+## 3. ZDD / SDD Sparse Block Compression (prototype, not wired up)
+
+> **Status at HEAD:** `src/llama-kv-zdd.h` and `tests/test-kv-zdd.cpp` exist, and
+> `src/llama-cparams.h` declares `zdd_sparse_kv`, but nothing reads that field, no CLI flag sets it,
+> and the attention path has no block-selection branch. Nothing below is active in a normal run.
+> See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md) for what landing it would take.
 
 In long-context generation (>64k tokens), attention matrices exhibit extreme sparsity: $>85\%$ of 64-token key-value blocks have cumulative attention weights $< 10^{-4}$ and contribute negligibly to final token logits.
 
-`llama.cpp-opt` implements Zero-suppressed Binary Decision Diagram (ZDD) block indexing:
+The prototype explores Zero-suppressed Binary Decision Diagram (ZDD) block indexing:
 - **Minato Zero-Suppression**: Inactive token blocks are eliminated implicitly without node allocations.
 - **Hardware-Aligned Block Size**: KV blocks are grouped into 64-token chunks matching SIMD vector registers and GPU warp execution widths.
 - **Warp-Synchronous GPU Execution**: On NVIDIA Ada Lovelace (`sm_89`) and newer architectures, warps evaluate 32 candidate blocks (2,048 tokens) concurrently using register shuffles (`__ballot_sync`, `__shfl_sync`), bypassing inactive blocks with zero bank conflicts.

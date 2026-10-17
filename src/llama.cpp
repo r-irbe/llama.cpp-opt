@@ -8998,7 +8998,8 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
 
         ggml::cpu::numa::set_numa_expert(true);
         ggml_numa_init(numa);
-        LLAMA_LOG_INFO("%s: NUMA expert initialized with %zu nodes\n", __func__, topo.size());
+        LLAMA_LOG_WARN("%s: --numa expert requested with %zu nodes, but expert sharding is not wired: "
+                "no tensor is bound to a node (see docs/UNIMPLEMENTED.md)\n", __func__, topo.size());
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
 

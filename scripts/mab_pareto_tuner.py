@@ -43,6 +43,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# --- 0. Evaluation Provenance ---
+# Every row of the SQLite ledger records how its numbers were produced. Reports and
+# exports may only mix these values when the operator explicitly allows it.
+MODE_LIVE      = "live"       # measured by running ./build/bin/llama-cli on this host
+MODE_SIMULATED = "simulated"  # produced by evaluate_simulated_point (model estimate)
+MODE_FAILED    = "failed"     # live trial that exited non-zero; metrics are placeholders, not measurements
+RUN_MODES = (MODE_LIVE, MODE_SIMULATED, MODE_FAILED)
+
+
 # --- 1. Dynamic Host Hardware Auto-Discovery Engine ---
 
 class HostHardwareProfile:
@@ -312,10 +321,11 @@ def build_dynamic_parameter_space(hw: HostHardwareProfile) -> dict:
         thread_vals = sorted(list(set([per_node, per_socket, p_cores // 2, p_cores, l_threads])))
         batch_thread_vals = sorted(list(set([per_node, per_socket, p_cores // 2, p_cores])))
 
-    # NUMA mode options
+    # NUMA mode options. `--numa split` is the documented alias of `distribute`
+    # (see docs/numa.md); it is not a separate strategy, so it is not sampled twice here.
     if nodes >= 4:
-        numa_vals = ["none", "distribute", "isolate", "split"]
-        numa_default = "split"
+        numa_vals = ["none", "distribute", "isolate"]
+        numa_default = "distribute"
     elif nodes > 1:
         numa_vals = ["none", "distribute", "isolate"]
         numa_default = "distribute"
@@ -586,28 +596,6 @@ def build_dynamic_parameter_space(hw: HostHardwareProfile) -> dict:
             "default": ctx_default,
             "description": "Total context window pool size allocated across slots"
         },
-        "cohort_prefix_sharing": {
-            "group": "batching",
-            "cli_flag": "--cohort-prefix-sharing",
-            "values": [0, 1],
-            "default": 1,
-            "description": "Multi-tenant zero-copy prompt prefix sharing across slots"
-        },
-        "cohort_min_prefix": {
-            "group": "batching",
-            "cli_flag": "--cohort-min-prefix",
-            "values": [16, 64, 128, 256],
-            "default": 16,
-            "description": "Minimum prefix token threshold to trigger slot KV cloning"
-        },
-        "cohort_max_idle_sec": {
-            "group": "batching",
-            "cli_flag": "--cohort-max-idle-sec",
-            "values": [0, 30, 60, 120],
-            "default": 60,
-            "description": "Idle slot eviction timeout releasing KV cache memory"
-        },
-
         # --- Speculative Decoding Engine (8 Parameters) ---
         "spec_type": {
             "group": "speculative",
@@ -936,8 +924,7 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
     ctx_size = config.get("ctx_size", 16384)
     prefill_time_sec = float(ctx_size) / max(1.0, pp_tps)
     queue_overhead_ms = 0.82 if config.get("parallel_slots", 8) <= 16 else 7.5
-    cohort_mult = 0.45 if config.get("cohort_prefix_sharing") == 1 else 1.0
-    ttft_ms = (prefill_time_sec * 1000.0 * cohort_mult) + queue_overhead_ms
+    ttft_ms = (prefill_time_sec * 1000.0) + queue_overhead_ms
 
     # 5. Compute Memory Footprint (GB) with MLA
     slots = config.get("parallel_slots", 8)
@@ -953,8 +940,6 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
         kv_per_token_bytes *= 0.50
 
     raw_kv_gb = (ctx_size * slots * kv_per_token_bytes) / (1024.0 ** 3)
-    if config.get("cohort_prefix_sharing") == 1 and slots > 1:
-        raw_kv_gb *= (1.0 - ((slots - 1) / float(slots)) * 0.85)
 
     if config.get("defer_experts", 0) == 1:
         resident_weights_gb = prof.get("critical_gb", weights_gb * 0.05) + (prof.get("moe_gb", weights_gb * 0.45) * 0.15)
@@ -981,7 +966,8 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
         "pp_tps": round(pp_tps, 2),
         "tg_tps": round(tg_tps, 2),
         "ttft_ms": round(ttft_ms, 2),
-        "mem_gb": round(total_mem_gb, 2)
+        "mem_gb": round(total_mem_gb, 2),
+        "mode": MODE_SIMULATED
     }
 
 
@@ -1067,6 +1053,11 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
 
     env = os.environ.copy()
     env["GGML_CUDA_NO_PINNED"] = "1"
+    if config.get("n_gpu_layers", 0) <= 0:
+        # With a GPU visible, -ngl 0 still runs prompt processing on CUDA
+        # (docs/development/token_generation_performance_tips.md). Hide the devices so that a
+        # config with zero GPU layers really measures the CPU.
+        env["CUDA_VISIBLE_DEVICES"] = ""
 
     t0 = time.time()
     try:
@@ -1083,7 +1074,8 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
                 "pp_tps": 0.0,
                 "tg_tps": 0.0,
                 "ttft_ms": (time.time() - t0) * 1000.0,
-                "mem_gb": 0.0
+                "mem_gb": 0.0,
+                "mode": MODE_FAILED
             }
 
         pp_match = re.search(r"prompt eval time\s*=\s*([\d\.]+)\s*ms\s*/\s*(\d+)\s*tokens\s*\(\s*[\d\.]+\s*ms per token,\s*([\d\.]+)\s*tokens per second\)", out)
@@ -1098,7 +1090,8 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
             "pp_tps": round(pp_tps, 2),
             "tg_tps": round(tg_tps, 2),
             "ttft_ms": round(ttft_ms, 2),
-            "mem_gb": round(mem_gb, 2)
+            "mem_gb": round(mem_gb, 2),
+            "mode": MODE_LIVE
         }
     except Exception as e:
         return {
@@ -1106,7 +1099,8 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
             "pp_tps": 0.0,
             "tg_tps": 0.0,
             "ttft_ms": 10000.0,
-            "mem_gb": 20.0
+            "mem_gb": 20.0,
+            "mode": MODE_FAILED
         }
 
 
@@ -1153,6 +1147,9 @@ def run_mab_multicontext_search(
     print("================================================================================")
 
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    if live_bench and not (model_path and os.path.exists(model_path)):
+        print("[WARN] --live-bench requested but --model-path is missing or unreadable: "
+              "every trial is recorded with mode='simulated'.")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("""
@@ -1168,17 +1165,29 @@ def run_mab_multicontext_search(
             ttft_ms REAL,
             mem_gb REAL,
             reward REAL,
-            pareto_rank INTEGER
+            pareto_rank INTEGER,
+            mode TEXT NOT NULL DEFAULT 'simulated'
         )
     """)
     cur.execute("PRAGMA table_info(mab_evaluations)")
     existing_cols = [row[1] for row in cur.fetchall()]
     if "context_length" not in existing_cols:
         cur.execute("ALTER TABLE mab_evaluations ADD COLUMN context_length INTEGER DEFAULT 4096")
+    if "mode" not in existing_cols:
+        # Rows written before this column existed can only have come from the simulator:
+        # the live path requires --live-bench, no shipped report records such a run, and the
+        # stored numbers are model outputs (constant mem_gb per model, TTFT up to 1.5e8 ms).
+        # Label them 'simulated' rather than leaving the provenance unknown.
+        cur.execute("ALTER TABLE mab_evaluations ADD COLUMN mode TEXT NOT NULL DEFAULT 'simulated'")
+        cur.execute("UPDATE mab_evaluations SET mode = 'simulated' WHERE mode IS NULL")
+        cur.execute("SELECT COUNT(*) FROM mab_evaluations WHERE mode = 'simulated'")
+        print(f"[DB] Added 'mode' column to {db_path}; pre-existing rows labeled mode='simulated' "
+              f"({cur.fetchone()[0]} rows).")
     conn.commit()
 
     all_stage_results = []
     global_pareto_points = []
+    run_modes_used = set()
     total_start_time = time.time()
 
     for stage_idx, ctx_len in enumerate(context_lengths, start=1):
@@ -1214,6 +1223,10 @@ def run_mab_multicontext_search(
                 metrics = execute_live_trial(config, model_path, ctx_len, hw, draft_model_path=draft_model_path)
             else:
                 metrics = evaluate_simulated_point(config, model_name, hw)
+            mode = metrics["mode"]
+            if mode not in RUN_MODES:
+                raise RuntimeError(f"unexpected evaluation mode {mode!r}")
+            run_modes_used.add(mode)
 
             reward = compute_scalar_reward(metrics, model_name)
             point = ParetoPoint(config, metrics)
@@ -1226,12 +1239,12 @@ def run_mab_multicontext_search(
             cur.execute("""
                 INSERT INTO mab_evaluations (
                     timestamp, model_name, context_length, trial_index, config_json,
-                    pp_tps, tg_tps, ttft_ms, mem_gb, reward, pareto_rank
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pp_tps, tg_tps, ttft_ms, mem_gb, reward, pareto_rank, mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 datetime.now(timezone.utc).isoformat(), model_name, ctx_len, trial,
                 json.dumps(config), metrics["pp_tps"], metrics["tg_tps"],
-                metrics["ttft_ms"], metrics["mem_gb"], reward, point.rank
+                metrics["ttft_ms"], metrics["mem_gb"], reward, point.rank, mode
             ))
 
         conn.commit()
@@ -1285,6 +1298,7 @@ def run_mab_multicontext_search(
     return {
         "stages": all_stage_results,
         "global_pareto": global_rank1,
+        "modes": sorted(run_modes_used),
         "total_elapsed_sec": round(total_elapsed, 2)
     }
 
@@ -1308,7 +1322,51 @@ def run_mab_pareto_search(
     return res["global_pareto"]
 
 
+def load_points_from_db(db_path: str, model_name: str, context_length: int = None, limit: int = None) -> list:
+    """Reads recorded evaluations back as ParetoPoints, preserving each row's mode."""
+    if not os.path.exists(db_path):
+        raise SystemExit(f"[REFUSED] --from-db: database {db_path} does not exist")
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(mab_evaluations)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "mode" not in cols:
+        conn.close()
+        raise SystemExit(f"[REFUSED] --from-db: {db_path} has no 'mode' column; "
+                         f"open it once with the tuner (or re-run) to migrate it before exporting")
+
+    query = ("SELECT config_json, pp_tps, tg_tps, ttft_ms, mem_gb, mode FROM mab_evaluations "
+             "WHERE model_name = ?")
+    params = [model_name]
+    if context_length is not None:
+        query += " AND context_length = ?"
+        params.append(context_length)
+    query += " ORDER BY pareto_rank ASC, id ASC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    points = []
+    for config_json, pp_tps, tg_tps, ttft_ms, mem_gb, mode in cur.execute(query, params):
+        if mode not in RUN_MODES:
+            raise SystemExit(f"[REFUSED] --from-db: row with unknown mode {mode!r} in {db_path}")
+        points.append(ParetoPoint(json.loads(config_json), {
+            "pp_tps": pp_tps, "tg_tps": tg_tps, "ttft_ms": ttft_ms, "mem_gb": mem_gb, "mode": mode
+        }))
+    conn.close()
+    if not points:
+        raise SystemExit(f"[REFUSED] --from-db: no rows for model '{model_name}' in {db_path}")
+    return points
+
 # --- 7. Publication-Grade Markdown Pareto Synthesis ---
+
+def point_mode(p: "ParetoPoint") -> str:
+    """Return the recorded evaluation mode of a point, refusing to guess when it is unknown."""
+    mode = p.metrics.get("mode")
+    if mode not in RUN_MODES:
+        raise SystemExit(f"[REFUSED] point {p.config} carries unknown evaluation mode {mode!r}; refusing to label it")
+    return mode
+
 
 def format_pareto_report(
     model_name: str,
@@ -1316,9 +1374,31 @@ def format_pareto_report(
     output_md: str,
     hw: HostHardwareProfile,
     param_space: dict,
-    multi_context_stages: list = None
+    multi_context_stages: list = None,
+    modes: list = None,
+    allow_mixed_modes: bool = False
 ):
     """Generates an architectural Markdown monograph detailing the discovered Pareto frontier."""
+    if modes is None:
+        modes = [point_mode(p) for p in pareto_points]
+    modes = sorted(set(modes))
+
+    # Provenance gate: failed trials and mode mixtures are never presented as one frontier.
+    if MODE_FAILED in modes:
+        raise SystemExit(f"[REFUSED] {output_md}: run contains failed live trials (mode='{MODE_FAILED}'); "
+                         f"their metrics are placeholders, not measurements. Drop those rows and retry.")
+    if len(modes) > 1 and not allow_mixed_modes:
+        raise SystemExit(f"[REFUSED] {output_md}: refusing to mix evaluation modes {modes} in one Pareto report; "
+                         f"export one mode per report or pass --allow-mixed-modes to override.")
+
+    if modes == [MODE_LIVE]:
+        mode_desc = "`live` — measured on this host by running `./build/bin/llama-cli`"
+    elif modes == [MODE_SIMULATED]:
+        mode_desc = ("`simulated` — hardware-calibrated estimate from `evaluate_simulated_point()`; "
+                     "**these are model outputs, not measurements of this host**")
+    else:
+        mode_desc = f"mixed {modes} (explicitly allowed via `--allow-mixed-modes`)"
+
     gpu_desc = f"{hw.gpu_count}x {hw.gpu_name} ({hw.vram_gb:.1f} GB VRAM)" if hw.has_gpu else "None (CPU only)"
     thp_desc = "Supported" if hw.has_thp else "Disabled/Standard Pages"
 
@@ -1327,6 +1407,7 @@ def format_pareto_report(
         "",
         f"**Repository**: `ikawrakow/ik_llama.cpp` (`feat/numa-split`)  ",
         f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}  ",
+        f"**Execution Mode**: {mode_desc}  ",
         f"**Evaluation**: Combinatorial Multi-Armed Bandit ({len(param_space)} Hyperparameters, UCB1 + Thompson Sampling)  ",
         f"**Pareto Frontier Size**: {len(pareto_points)} Non-Dominated Configurations  ",
         "",
@@ -1355,7 +1436,7 @@ def format_pareto_report(
         "",
         "### Table 1: Discovered Pareto Frontier Configurations (Rank 1 Non-Dominated)",
         "",
-        "| ID | Profile / Bias | PP Throughput | TG Throughput | TTFT (ms) | Memory Footprint | GPU Offload (`-ngl`) | NUMA Mode | Cohort PPS | Speculative Drafting |",
+        "| ID | Profile / Bias | PP Throughput | TG Throughput | TTFT (ms) | Memory Footprint | GPU Offload (`-ngl`) | NUMA Mode | Speculative Drafting | Mode |",
         "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     ]
 
@@ -1373,12 +1454,11 @@ def format_pareto_report(
             profile = "Balanced Pareto"
 
         spec_str = f"{c.get('spec_type', 'none')} (K={c.get('n_draft', 0)})" if c.get("spec_type", "none") != "none" else "disabled"
-        cohort_str = "Enabled" if c.get("cohort_prefix_sharing") == 1 else "Disabled"
         numa_str = c.get("numa_mode", "none")
         ngl_str = str(c.get("n_gpu_layers", 0))
 
         lines.append(
-            f"| P{idx:02d} | {profile} | **{m['pp_tps']:.1f}** tok/s | **{m['tg_tps']:.1f}** tok/s | **{m['ttft_ms']:.1f}** ms | {m['mem_gb']:.1f} GB | `{ngl_str}` layers | `{numa_str}` | {cohort_str} | {spec_str} |"
+            f"| P{idx:02d} | {profile} | **{m['pp_tps']:.1f}** tok/s | **{m['tg_tps']:.1f}** tok/s | **{m['ttft_ms']:.1f}** ms | {m['mem_gb']:.1f} GB | `{ngl_str}` layers | `{numa_str}` | {spec_str} | `{point_mode(p)}` |"
         )
 
     if multi_context_stages:
@@ -1473,10 +1553,7 @@ def format_pareto_report(
         "    -thp \\\n"
         f"    -c {c_best.get('ctx_size', 16384)} \\\n"
         f"    -np {c_best.get('parallel_slots', 8)} \\\n"
-        f"    -b {c_best.get('batch_size', 2048)} -ub {c_best.get('ubatch_size', 512)} \\\n"
-        "    --cohort-prefix-sharing \\\n"
-        "    --cohort-min-prefix 16 \\\n"
-        "    --cohort-max-idle-sec 60",
+        f"    -b {c_best.get('batch_size', 2048)} -ub {c_best.get('ubatch_size', 512)}",
         "```",
         "",
         "### Configuration B: Ultra-Fast Interactive Dialog with Speculative Decoding",
@@ -1530,6 +1607,11 @@ def main():
     parser.add_argument("-ctv", "--cache-type-v", default=None, help="KV cache quantization type for V (e.g. f16, q8_0, q4_0)")
     parser.add_argument("--db-path", default="results/mab_pareto_tuning.sqlite", help="Path to SQLite results database")
     parser.add_argument("--output-md", default=None, help="Path to Markdown Pareto summary report")
+    parser.add_argument("--from-db", default=None, metavar="PATH",
+                        help="Export a Pareto report from the rows already recorded for --model "
+                             "in this SQLite ledger instead of running new trials")
+    parser.add_argument("--allow-mixed-modes", action="store_true",
+                        help="Allow one report to mix live and simulated evaluations (refused by default)")
 
     # Hardware Overrides (for tuning for different target machines)
     parser.add_argument("--physical-cores", type=int, default=None, help="Override detected physical CPU core count")
@@ -1589,6 +1671,24 @@ def main():
     # 5. Output paths
     out_md = args.output_md or f"results/pareto_frontier_{args.model}.md"
 
+    if args.from_db:
+        # Export path: read recorded rows (each carrying its own mode) instead of running trials.
+        points = load_points_from_db(args.from_db, args.model)
+        fronts = compute_pareto_fronts(points)
+        pareto_points = fronts[0] if fronts else points
+        print(f"[DB] Loaded {len(points)} rows for '{args.model}' from {args.from_db}; "
+              f"modes={sorted({point_mode(p) for p in pareto_points})}; rank-1 configs={len(pareto_points)}")
+        format_pareto_report(
+            model_name=args.model,
+            pareto_points=pareto_points,
+            output_md=out_md,
+            hw=hw,
+            param_space=param_space,
+            modes=[point_mode(p) for p in pareto_points],
+            allow_mixed_modes=args.allow_mixed_modes
+        )
+        return
+
     # 6. Execute Staged Multi-Context MAB Pareto Search
     search_results = run_mab_multicontext_search(
         model_name=args.model,
@@ -1614,7 +1714,9 @@ def main():
         output_md=out_md,
         hw=hw,
         param_space=param_space,
-        multi_context_stages=search_results.get("stages")
+        multi_context_stages=search_results.get("stages"),
+        modes=search_results.get("modes"),
+        allow_mixed_modes=args.allow_mixed_modes
     )
 
 

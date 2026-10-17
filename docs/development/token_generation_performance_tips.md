@@ -19,6 +19,30 @@ If you see these lines, then the GPU is being used.
 ## Verifying that the CPU is not oversaturated
 llama accepts a `-t N` (or `--threads N`) parameter. It's extremely important that this parameter is not too large. If your token generation is extremely slow, try setting this number to 1. If this significantly improves your token generation speed, then your CPU is being oversaturated and you need to explicitly set this parameter to the number of the physical CPU cores on your machine (even if you utilize a GPU). If in doubt, start with 1 and double the amount until you hit a performance bottleneck, then scale the number down.
 
+## Measuring CPU-only performance: `-ngl 0` is not CPU-only when a GPU is visible
+
+On a build with a GPU backend, a run with `-ngl 0` still allocates a GPU compute buffer and runs
+prompt processing on the GPU, while token generation stays on the CPU. Measured on an RTX 4090 +
+2x EPYC 7453 host with an 8.79 B Q4_K_M model (`llama-bench -r 3 -t 32`):
+
+| configuration | pp512 (tok/s) | tg32 (tok/s) |
+| --- | ---: | ---: |
+| `CUDA_VISIBLE_DEVICES=""` (true CPU-only) | 140 | 19.2 |
+| GPU visible, `-ngl 0` | 1066 | 17.7 |
+| GPU visible, `-ngl 20` | 1694 | 28.6 |
+| GPU visible, `-ngl 999` | 7285 | 148.5 |
+
+Consequences for reading and writing benchmark data:
+
+- To measure the CPU, hide the GPU: `CUDA_VISIBLE_DEVICES="" ./llama-bench ...`. `llama-bench` warns when
+  a GPU is visible together with `-ngl 0`, because the resulting row looks CPU-only but is not.
+- In the `llama-bench` output (including its SQLite/CSV/JSON rows), the `cuda` / `vulkan` / `metal` /
+  `sycl` / `blas` columns record the **compiled-in backends**, not the backends that executed the run.
+  A row with `cuda=1` and `n_gpu_layers=0` is *not* a CPU measurement; only the combination with
+  `CUDA_VISIBLE_DEVICES=""` is.
+- The same applies to `llama-cli`-driven harnesses such as `scripts/mab_pareto_tuner.py`, which sets
+  `CUDA_VISIBLE_DEVICES=""` for live trials configured with zero GPU layers.
+
 # Example of runtime flags effect on inference speed benchmark
 These runs were tested on the following machine:
 GPU: A6000 (48GB VRAM)

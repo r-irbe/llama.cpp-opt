@@ -30,6 +30,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# How the numbers in a record were produced. `simulated` is the --mock path (random timings,
+# no server involved); `live` is a request batch answered by a running llama-server.
+MODE_LIVE      = "live"
+MODE_SIMULATED = "simulated"
+MODE_UNSPECIFIED = "unspecified"  # records written before the mode field existed
+
+
 # --- Synthetic Prefix & Query Generators ---
 
 TECHNICAL_PARAGRAPHS = [
@@ -183,11 +190,14 @@ def run_concurrency_batch(server_url: str, concurrency: int, prefix_tokens: int,
     wall_duration = t_wall_end - t_wall_start
 
     successful = [r for r in results if r["success"]]
+    mode = MODE_SIMULATED if mock else MODE_LIVE
     if not successful:
         return {
             "scenario": scenario,
             "concurrency": concurrency,
             "prefix_tokens": prefix_tokens,
+            "mode": mode,
+            "success_count": 0,
             "success_rate": 0.0,
             "primary_ttft_ms": 0.0,
             "sibling_ttft_ms": 0.0,
@@ -215,6 +225,8 @@ def run_concurrency_batch(server_url: str, concurrency: int, prefix_tokens: int,
         "scenario": scenario,
         "concurrency": concurrency,
         "prefix_tokens": prefix_tokens,
+        "mode": mode,
+        "success_count": len(successful),
         "success_rate": len(successful) / concurrency * 100.0,
         "primary_ttft_ms": round(primary_ttft, 2),
         "sibling_ttft_ms": round(sibling_ttft, 2),
@@ -227,26 +239,69 @@ def run_concurrency_batch(server_url: str, concurrency: int, prefix_tokens: int,
 
 # --- Markdown Summary Formatter ---
 
-def format_cohort_markdown_table(records: list) -> str:
-    """Format benchmark results into GitHub-flavored markdown summary table."""
-    lines = [
+def format_cohort_markdown_table(records: list, data_source: str = "results/cohort_bench_results.json",
+                                 allow_mixed_modes: bool = False) -> str:
+    """Format benchmark results into GitHub-flavored markdown summary table.
+
+    Refuses to emit a measurement table when the records cannot support one:
+      - every record failed (0 successful requests), or
+      - the records mix live and simulated runs (mock) unless allow_mixed_modes is set.
+    Records written before the `mode` field existed are labeled `unspecified`.
+    """
+    header = [
         "# High-Concurrency Cohort Serving & Prefix Sharing Benchmark Summary",
         "",
         f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}  ",
+        f"**Data source**: `{data_source}` ({len(records)} records)  ",
         "**Evaluated**: Scenario A (Disjoint $PPS=1$) vs Scenario B (Cohort Prefix Sharing $PPS=C$)",
+        ""
+    ]
+
+    modes = sorted({r.get("mode", MODE_UNSPECIFIED) for r in records})
+    total = len(records)
+    ok = [r for r in records if r.get("success_count", 0) > 0]
+
+    if not records:
+        return "\n".join(header + [
+            "**REFUSED**: no records to summarize.",
+            ""
+        ])
+
+    if not ok:
+        return "\n".join(header + [
+            "**REFUSED**: no successful requests in the data file, so no measurement table is emitted.",
+            "",
+            f"| Records | Successful records | Modes | Total wall time (s) |",
+            "| :---: | :---: | :--- | :---: |",
+            f"| {total} | 0 | {', '.join(f'`{m}`' for m in modes)} | "
+            f"{sum(r.get('wall_duration', 0.0) for r in records):.3f} |",
+            "",
+            "Every request in the only raw run in the data file failed, so this file carries no throughput",
+            f"or latency numbers. Any previously published cohort table is unsupported by `{data_source}`.",
+            "Re-run the harness against a live `llama-server` (without `--mock`) to produce a measurement table.",
+            ""
+        ])
+
+    if len(modes) > 1 and not allow_mixed_modes:
+        raise SystemExit(f"[REFUSED] {data_source}: refusing to mix evaluation modes {modes} in one table; "
+                         f"summarize one mode per table or pass --allow-mixed-modes to override.")
+
+    lines = header + [
+        f"**Evaluation mode(s)**: {', '.join(f'`{m}`' for m in modes)}",
         "",
         "### Concurrency Scaling & TTFT Speedup Table",
         "",
-        "| Concurrency ($C$) | Prefix Len ($L$) | Disjoint TTFT (ms) | Cohort Primary TTFT (ms) | Cohort Sibling TTFT (ms) | Sibling TTFT Speedup | Disjoint Throughput | Cohort Throughput | Active KV Reduction |",
-        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "| Concurrency ($C$) | Prefix Len ($L$) | Disjoint TTFT (ms) | Cohort Primary TTFT (ms) | Cohort Sibling TTFT (ms) | Sibling TTFT Speedup | Disjoint Throughput | Cohort Throughput | Active KV Reduction | Mode | Source |",
+        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |"
     ]
 
     # Group by (concurrency, prefix_tokens)
     pairs = sorted(list(set((r["concurrency"], r["prefix_tokens"]) for r in records)))
+    indexed = list(enumerate(records))
 
     for c, l in pairs:
-        disjoint_rec = next((r for r in records if r["concurrency"] == c and r["prefix_tokens"] == l and r["scenario"] == "disjoint"), None)
-        cohort_rec = next((r for r in records if r["concurrency"] == c and r["prefix_tokens"] == l and r["scenario"] == "cohort"), None)
+        disjoint_idx, disjoint_rec = next(((i, r) for i, r in indexed if r["concurrency"] == c and r["prefix_tokens"] == l and r["scenario"] == "disjoint"), (None, None))
+        cohort_idx, cohort_rec = next(((i, r) for i, r in indexed if r["concurrency"] == c and r["prefix_tokens"] == l and r["scenario"] == "cohort"), (None, None))
 
         disjoint_ttft_str = f"{disjoint_rec['primary_ttft_ms']:.1f} ms" if disjoint_rec else "N/A"
         cohort_pri_str = f"{cohort_rec['primary_ttft_ms']:.1f} ms" if cohort_rec else "N/A"
@@ -255,9 +310,11 @@ def format_cohort_markdown_table(records: list) -> str:
         disjoint_tps_str = f"{disjoint_rec['aggregate_tps']:.1f} tok/s" if disjoint_rec else "N/A"
         cohort_tps_str = f"{cohort_rec['aggregate_tps']:.1f} tok/s" if cohort_rec else "N/A"
         kv_reduct_str = f"**{cohort_rec['kv_cache_reduction_pct']:.1f}%**" if (cohort_rec and cohort_rec['concurrency'] > 1) else "0.0%"
+        row_mode = " + ".join(sorted({r.get("mode", MODE_UNSPECIFIED) for _, r in ((disjoint_idx, disjoint_rec), (cohort_idx, cohort_rec)) if r}))
+        source_cells = "/".join(f"`{data_source}[{i}]`" for i in (disjoint_idx, cohort_idx) if i is not None)
 
         lines.append(
-            f"| {c} | {l} | {disjoint_ttft_str} | {cohort_pri_str} | {cohort_sib_str} | {speedup_str} | {disjoint_tps_str} | {cohort_tps_str} | {kv_reduct_str} |"
+            f"| {c} | {l} | {disjoint_ttft_str} | {cohort_pri_str} | {cohort_sib_str} | {speedup_str} | {disjoint_tps_str} | {cohort_tps_str} | {kv_reduct_str} | `{row_mode}` | {source_cells} |"
         )
 
     return "\n".join(lines) + "\n"
@@ -273,7 +330,9 @@ def main():
     parser.add_argument("--n-predict", type=int, default=48, help="Number of tokens to generate per stream")
     parser.add_argument("--output-json", default="results/cohort_bench_results.json", help="Path to JSON results output")
     parser.add_argument("--output-md", default="results/cohort_bench_summary.md", help="Path to Markdown summary output")
-    parser.add_argument("--mock", action="store_true", help="Simulate server responses without live server for testing")
+    parser.add_argument("--mock", action="store_true", help="Simulate server responses without live server for testing (records are tagged mode='simulated')")
+    parser.add_argument("--allow-mixed-modes", action="store_true",
+                        help="Allow one summary table to combine live and simulated records (refused by default)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -310,7 +369,8 @@ def main():
             print(f"    -> Throughput: {res_b['aggregate_tps']} tok/s | Active KV Cache Reduction: {res_b['kv_cache_reduction_pct']}%")
 
     # Generate and display markdown table
-    md_content = format_cohort_markdown_table(records)
+    md_content = format_cohort_markdown_table(records, data_source=args.output_json,
+                                              allow_mixed_modes=args.allow_mixed_modes)
     print("\n" + md_content)
 
     # Save outputs

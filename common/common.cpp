@@ -2539,10 +2539,20 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--numa") {
         CHECK_ARG
         std::string value(argv[i]);
-        /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
+        /**/ if (value == "distribute" || value == "split" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
         else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
         else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+        else if (value == "mirror")  { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
+        else if (value == "expert")  { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
         else { invalid_param = true; }
+        if (params.numa == GGML_NUMA_STRATEGY_MIRROR || params.numa == GGML_NUMA_STRATEGY_EXPERT) {
+            fprintf(stderr, "warning: --numa %s is accepted but not implemented: no expert sharding or node-local mirroring happens (see docs/UNIMPLEMENTED.md)\n", value.c_str());
+        }
+        return true;
+    }
+    if (arg == "--numa-replicate-shared") {
+        setenv("GGML_NUMA_REPLICATE_SHARED", "1", 1);
+        fprintf(stderr, "warning: --numa-replicate-shared is accepted but not implemented: shared tensors are not replicated per NUMA node (see docs/UNIMPLEMENTED.md)\n");
         return true;
     }
     if (arg == "-dev" || arg == "--device") {
@@ -3599,8 +3609,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --fit",                  "automatically determine which tensors to offload to the GPU(s)"});
     options.push_back({ "*",           "       --numa TYPE",            "attempt optimizations that help on some NUMA systems\n"
                                                                         "  - distribute: spread execution evenly over all nodes\n"
+                                                                        "  - split: documented alias of distribute (identical strategy)\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
+                                                                        "  - expert, mirror: accepted but NOT implemented (prints a warning; see docs/UNIMPLEMENTED.md)\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
 

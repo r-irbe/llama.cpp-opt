@@ -2214,6 +2214,15 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // A visible GPU is used for prompt processing even with -ngl 0, so a run that looks CPU-only is not:
+    // the `cuda`/`vulkan`/... columns record the compiled backend, not what executed the graph.
+    if (!get_gpu_info().empty() &&
+        std::find(params.n_gpu_layers.begin(), params.n_gpu_layers.end(), 0) != params.n_gpu_layers.end()) {
+        fprintf(stderr, "warning: a GPU device is visible and -ngl 0 still runs prompt processing on it; "
+                        "set CUDA_VISIBLE_DEVICES=\"\" for a true CPU-only measurement "
+                        "(see docs/development/token_generation_performance_tips.md)\n");
+    }
+
     // initialize printer
     std::unique_ptr<printer> p = create_printer(params.output_format);
     std::unique_ptr<printer> p_err = create_printer(params.output_format_stderr);
