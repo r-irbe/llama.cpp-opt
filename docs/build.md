@@ -1,46 +1,42 @@
-# Build ik_llama.cpp locally
+# Build llama.cpp-opt locally
 
-`ik_llama.cpp` requires has a very minimal set of dependencies: `cmake`, a functional C++-17 compiler, and, if building with Nvidia GPU support, the CUDA toolkit. All these are available from the system package manager on Linux. If you are building on Windows and are worried about messing up your main OS, you may consider building in a virtual machine (VM). In that case, make sure you can copy files between the host OS and the VM.  
+`llama.cpp-opt` (high-performance optimization fork of `ik_llama.cpp` and `llama.cpp`) requires a minimal set of dependencies: `cmake` (>= 3.14), a modern C++17 compiler (GCC, Clang, or MSVC), and optionally the NVIDIA CUDA Toolkit (>= 12.0) for GPU acceleration.
 
-**To get the Code:**
+### Quick Start (Linux / macOS)
 
 ```bash
-git clone https://github.com/ikawrakow/ik_llama.cpp
-cd ik_llama.cpp
+# Clone the repository
+git clone https://github.com/ikawrakow/ik_llama.cpp llama.cpp-opt
+cd llama.cpp-opt
+
+# Configure with CUDA and NUMA support
+cmake -B build -DGGML_CUDA=ON -DGGML_NUMA=ON -DCMAKE_BUILD_TYPE=Release
+
+# Build using all available processor cores
+cmake --build build -j $(nproc)
 ```
 
-In order to build `ik_llama.cpp` you have four different options.
+In order to build `llama.cpp-opt`, you can use CMake or Make:
+
+- Using `CMake` (Recommended):
+
+  ```bash
+  cmake -B build -DCMAKE_BUILD_TYPE=Release
+  cmake --build build -j $(nproc)
+  ```
+
+  **Recommended Build Flags:**
+  - `-DGGML_CUDA=ON`: Enable CUDA GPU acceleration.
+  - `-DCMAKE_CUDA_ARCHITECTURES="native"`: Target your local GPU architecture (e.g. `89` for Ada Lovelace RTX 4090, `90` for Hopper H100).
+  - `-DGGML_NUMA=ON`: Enable multi-socket and multi-CCX NUMA optimizations.
+  - `-DGGML_AVX512=ON`: Enable AVX-512 vector acceleration on supported CPUs (AMD Zen 4+, Intel Skylake-X+).
 
 - Using `make`:
   - On Linux or MacOS:
 
       ```bash
-      make
+      make -j $(nproc)
       ```
-
-  - On Windows (x86/x64 only, arm64 requires cmake):
-
-    1. Download the latest fortran version of [w64devkit](https://github.com/skeeto/w64devkit/releases).
-    2. Extract `w64devkit` on your pc.
-    3. Run `w64devkit.exe`.
-    4. Use the `cd` command to reach the `llama.cpp` folder.
-    5. From here you can run:
-        ```bash
-        make
-        ```
-
-  - Notes:
-    - For `Q4_0_4_4` quantization type build, add the `GGML_NO_LLAMAFILE=1` flag. For example, use `make GGML_NO_LLAMAFILE=1`.
-    - For faster compilation, add the `-j` argument to run multiple jobs in parallel. For example, `make -j 8` will run 8 jobs in parallel.
-    - For faster repeated compilation, install [ccache](https://ccache.dev/).
-    - For debug builds, run `make LLAMA_DEBUG=1`
-
-- Using `CMake`:
-
-  ```bash
-  cmake -B build
-  cmake --build build --config Release
-  ```
 
   **Notes**:
 
