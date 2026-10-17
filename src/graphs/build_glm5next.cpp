@@ -15,6 +15,17 @@ static constexpr int64_t GLM5NEXT_IDX_SCORE_CHUNK = 256;
 
 // mHC pre (copied from build_deepseek4.cpp)
 
+static ggml_tensor * glm5next_hc_mean_for_capture(ggml_context * ctx, ggml_tensor * x) {
+    GGML_ASSERT(x != nullptr && x->ne[1] > 0);
+
+    ggml_tensor * mean = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    for (int64_t hc_row = 1; hc_row < x->ne[1]; ++hc_row) {
+        mean = ggml_add(ctx, mean,
+                ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], hc_row * x->nb[1]));
+    }
+    return ggml_scale(ctx, mean, 1.0f / (float) x->ne[1]);
+}
+
 static ggml_tensor * glm5next_build_hc_pre(
         ggml_context * ctx0,
         llm_build_context & llm,
@@ -647,7 +658,13 @@ ggml_cgraph * llm_build_context::build_glm5next() {
 
         inpL = build_mhc_post(cur, post_ffn, residual_ffn, comb_ffn, n_embd, hc, true);
         inpL = lctx.cvec.apply_to(ctx0, inpL, il);
-        cb(inpL, "l_out", il);
+        if (lctx.dflash.capture) {
+            ggml_tensor * capture = glm5next_hc_mean_for_capture(ctx0, inpL);
+            cb(capture, "l_out", il);
+            ggml_build_forward_expand(gf, capture);
+        } else {
+            cb(inpL, "l_out", il);
+        }
     }
 
     // Collapse the mHC streams before the shared output head.
