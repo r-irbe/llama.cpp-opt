@@ -5957,6 +5957,56 @@ static void llama_kv_prev_tokens(const llama_kv_cache & kv, const llama_batch & 
 
 static constexpr llama_token DSV41_IMAGE_TOKEN_ID = 129264;
 
+static void llama_prefetch_rows(const ggml_tensor * w, const int32_t * ids, int n) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (!w || !w->data || !w->buffer || !ggml_backend_buffer_is_host(w->buffer) || n <= 0) {
+        return;
+    }
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    std::vector<std::pair<uintptr_t, uintptr_t>> page_ranges;
+    page_ranges.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const uintptr_t a     = (uintptr_t) w->data + (size_t) ids[i] * w->nb[1];
+        const uintptr_t first = a & ~(uintptr_t) (page - 1);
+        const uintptr_t last  = (a + w->nb[1] + page - 1) & ~(uintptr_t) (page - 1);
+        page_ranges.emplace_back(first, last);
+    }
+    if (!page_ranges.empty()) {
+        std::sort(page_ranges.begin(), page_ranges.end());
+
+        // Merge overlapping and adjacent page ranges to minimize madvise syscall count
+        size_t merged_idx = 0;
+        for (size_t i = 1; i < page_ranges.size(); ++i) {
+            if (page_ranges[i].first <= page_ranges[merged_idx].second) {
+                page_ranges[merged_idx].second = std::max(page_ranges[merged_idx].second, page_ranges[i].second);
+            } else {
+                ++merged_idx;
+                page_ranges[merged_idx] = page_ranges[i];
+            }
+        }
+        page_ranges.resize(merged_idx + 1);
+
+        for (const auto & range : page_ranges) {
+            const size_t len = range.second - range.first;
+#if defined(__linux__)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+            if (madvise((void *) range.first, len, MADV_POPULATE_READ) != 0) {
+                madvise((void *) range.first, len, MADV_WILLNEED);
+            }
+#else
+            posix_madvise((void *) range.first, len, POSIX_MADV_WILLNEED);
+#endif
+        }
+    }
+#else
+    GGML_UNUSED(w);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n);
+#endif
+}
+
 // DeepSeek-V4.1 engram row indices for one engram layer: map every token through the
 // compressed vocabulary, fold the n-gram with the per-layer multipliers into a rolling
 // hash, and place each (n-gram size, head) bucket at offset + hash % prime.
@@ -5999,54 +6049,10 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
             }
         }
     }
-#if defined(__linux__) || defined(__APPLE__)
     // the table is read lazily by get_rows, so an untouched row is a synchronous major fault
     // inside the graph; the ids are known here, before it runs, so start the reads now
-    {
-        const uint32_t il = hp.engram_layer_ids[eg];
-        const ggml_tensor * w = il < model.layers.size() ? model.layers[il].engram_embd : nullptr;
-        if (w && w->data && w->buffer && ggml_backend_buffer_is_host(w->buffer)) {
-            const size_t page = (size_t) sysconf(_SC_PAGESIZE);
-            std::vector<std::pair<uintptr_t, uintptr_t>> page_ranges;
-            page_ranges.reserve(idx.size());
-            for (int32_t id : idx) {
-                const uintptr_t a     = (uintptr_t) w->data + (size_t) id * w->nb[1];
-                const uintptr_t first = a & ~(uintptr_t) (page - 1);
-                const uintptr_t last  = (a + w->nb[1] + page - 1) & ~(uintptr_t) (page - 1);
-                page_ranges.emplace_back(first, last);
-            }
-            if (!page_ranges.empty()) {
-                std::sort(page_ranges.begin(), page_ranges.end());
-
-                // Merge overlapping and adjacent page ranges to minimize madvise syscall count
-                size_t merged_idx = 0;
-                for (size_t i = 1; i < page_ranges.size(); ++i) {
-                    if (page_ranges[i].first <= page_ranges[merged_idx].second) {
-                        page_ranges[merged_idx].second = std::max(page_ranges[merged_idx].second, page_ranges[i].second);
-                    } else {
-                        ++merged_idx;
-                        page_ranges[merged_idx] = page_ranges[i];
-                    }
-                }
-                page_ranges.resize(merged_idx + 1);
-
-                for (const auto & range : page_ranges) {
-                    const size_t len = range.second - range.first;
-#if defined(__linux__)
-#ifndef MADV_POPULATE_READ
-#define MADV_POPULATE_READ 22
-#endif
-                    if (madvise((void *) range.first, len, MADV_POPULATE_READ) != 0) {
-                        madvise((void *) range.first, len, MADV_WILLNEED);
-                    }
-#else
-                    posix_madvise((void *) range.first, len, POSIX_MADV_WILLNEED);
-#endif
-                }
-            }
-        }
-    }
-#endif
+    const uint32_t il = hp.engram_layer_ids[eg];
+    llama_prefetch_rows(il < model.layers.size() ? model.layers[il].engram_embd : nullptr, idx.data(), (int) idx.size());
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*sizeof(int32_t));
 }
 
@@ -7316,6 +7322,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
             hist[pos] = tok_of(i);
         }
+
+        llama_prefetch_rows(lctx.model.tok_embd_per_layer, data, n_tokens * n_heads);
     }
 
     if (lctx.inp_pos_bucket) {
