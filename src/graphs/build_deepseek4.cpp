@@ -1172,6 +1172,10 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
     const auto n_head   = llm.n_head;
     const auto n_kv     = llm.n_kv;
 
+    if (lctx.paged_kv) {
+        llm_build_context::llama_graph_stream_paged_kv(lctx, kv_self, (int32_t)n_kv, il);
+    }
+
     ggml_tensor * cur = build_hc_pre(ctx0, llm, hparams, llm.n_embd, hparams.f_norm_rms_eps, inpL,
             layer.hc_attn_fn,
             layer.hc_attn_scale,
@@ -2119,6 +2123,10 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
     const auto n_tokens = llm.n_tokens;
     const auto n_head   = llm.n_head;
     const auto n_kv     = llm.n_kv;
+
+    if (lctx.paged_kv) {
+        llm_build_context::llama_graph_stream_paged_kv(lctx, kv_self, (int32_t)n_kv, il);
+    }
 
     ggml_tensor * cur = build_hc_pre(ctx0, llm, hparams, llm.n_embd, hparams.f_norm_rms_eps, inpL,
             layer.hc_attn_fn,

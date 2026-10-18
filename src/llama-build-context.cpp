@@ -2168,6 +2168,10 @@ static ggml_tensor * llm_build_kqv(
         llm_build_context::llama_graph_build_zdd_skip_mask(lctx, kv, n_kv, zdd_skip_mask);
     }
 
+    if (lctx.paged_kv) {
+        llm_build_context::llama_graph_stream_paged_kv(lctx, kv, n_kv, il);
+    }
+
     auto k_cache = kv_il >= 0 ? kv.k_l[kv_layer]
                  : lctx.model.hparams.has_kv(il) ? kv.k_l[il]
                  : lctx.model.hparams.swa_layers[il] ? kv.k_l[hparams.n_layer_kv_from_start-2] : kv.k_l[hparams.n_layer_kv_from_start-1];

@@ -672,6 +672,7 @@ llm_expert_gating_func_type   gating_op,
     );
 
     static bool llama_graph_build_zdd_skip_mask(llama_context & lctx, const llama_kv_cache & kv, int32_t n_kv, std::vector<uint8_t> & out_skip_mask);
+    static bool llama_graph_stream_paged_kv(llama_context & lctx, const llama_kv_cache & kv, int32_t n_kv, int il);
 
     ggml_cgraph * new_graph_custom();
 };

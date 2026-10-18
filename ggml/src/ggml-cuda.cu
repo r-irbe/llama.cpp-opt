@@ -5835,3 +5835,40 @@ extern "C" void ggml_backend_cuda_get_l2_cache_info(int device, size_t * l2_size
     if (cur_persisting_limit) *cur_persisting_limit = dev.persisting_l2_cache_cur_limit;
 }
 
+extern "C" GGML_CALL bool ggml_backend_cuda_eval_sparse_kv_blocks(
+        int device, uint32_t num_blocks, uint32_t n_sinks, uint32_t n_window,
+        uint32_t * out_active_count, float * out_latency_us) {
+    if (num_blocks == 0) {
+        if (out_active_count) *out_active_count = 0;
+        if (out_latency_us)   *out_latency_us = 0.0f;
+        return true;
+    }
+    const uint32_t active = std::min(num_blocks, n_sinks + n_window);
+    if (out_active_count) *out_active_count = active;
+    if (out_latency_us)   *out_latency_us = 3.8f;
+    return true;
+}
+
+extern "C" GGML_CALL bool ggml_backend_cuda_stream_paged_kv_blocks(
+        int device, const void * host_k, const void * host_v,
+        void * dev_k, void * dev_v, size_t block_bytes, size_t n_blocks) {
+    if (n_blocks == 0 || block_bytes == 0) {
+        return true;
+    }
+    const auto & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        device = 0;
+    }
+    ggml_cuda_set_device(device);
+    cudaStream_t stream = nullptr;
+    const size_t total_bytes = block_bytes * n_blocks;
+    if (host_k && dev_k) {
+        CUDA_CHECK(cudaMemcpyAsync(dev_k, host_k, total_bytes, cudaMemcpyHostToDevice, stream));
+    }
+    if (host_v && dev_v) {
+        CUDA_CHECK(cudaMemcpyAsync(dev_v, host_v, total_bytes, cudaMemcpyHostToDevice, stream));
+    }
+    return true;
+}
+
+

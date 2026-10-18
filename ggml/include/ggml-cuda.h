@@ -53,6 +53,9 @@ GGML_API GGML_CALL void ggml_backend_cuda_get_l2_cache_info(int device, size_t *
 // GPU SIMT & Cache Hierarchy KV Block Selector (Ada Lovelace sm_89)
 GGML_API GGML_CALL bool ggml_backend_cuda_eval_sparse_kv_blocks(int device, uint32_t num_blocks, uint32_t n_sinks, uint32_t n_window, uint32_t * out_active_count, float * out_latency_us);
 
+// Host Paged KV Block Streaming (Host-to-Device asynchronous PCIe DMA)
+GGML_API GGML_CALL bool ggml_backend_cuda_stream_paged_kv_blocks(int device, const void * host_k, const void * host_v, void * dev_k, void * dev_v, size_t block_bytes, size_t n_blocks);
+
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
 #ifdef  __cplusplus
 }
