@@ -1399,14 +1399,16 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         if (cparams.flash_attn) {
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
-        raw_k = dsv4_repeat_streams(ctx0, raw_k, extra_k->ne[3]);
+        const int64_t target_stream = std::max({raw_mask->ne[3], extra_mask->ne[3], raw_k->ne[3], extra_k->ne[3]});
+        raw_k      = dsv4_repeat_streams(ctx0, raw_k,      target_stream);
+        extra_k    = dsv4_repeat_streams(ctx0, extra_k,    target_stream);
+        raw_mask   = dsv4_repeat_streams(ctx0, raw_mask,   target_stream);
+        extra_mask = dsv4_repeat_streams(ctx0, extra_mask, target_stream);
         if (!cparams.flash_attn && !raw_compacted) {
             raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
-                    read_idxs, raw_kq_n_kv, n_tokens, extra_k->ne[3], cb, il);
+                    read_idxs, raw_kq_n_kv, n_tokens, target_stream, cb, il);
             raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
-        }
-        if (raw_mask->ne[3] != extra_k->ne[3]) {
-            raw_mask = dsv4_repeat_streams(ctx0, raw_mask, extra_k->ne[3]);
+            raw_mask = dsv4_repeat_streams(ctx0, raw_mask, target_stream);
         }
         if (!cparams.flash_attn && raw_compacted && raw_mask->ne[1] != n_tokens) {
             // non-FA masks are unpadded; drop the win mask's token padding before the concat
@@ -2325,14 +2327,16 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
         if (cparams.flash_attn) {
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
-        raw_k = dsv4_repeat_streams(ctx0, raw_k, extra_k->ne[3]);
+        const int64_t target_stream = std::max({raw_mask->ne[3], extra_mask->ne[3], raw_k->ne[3], extra_k->ne[3]});
+        raw_k      = dsv4_repeat_streams(ctx0, raw_k,      target_stream);
+        extra_k    = dsv4_repeat_streams(ctx0, extra_k,    target_stream);
+        raw_mask   = dsv4_repeat_streams(ctx0, raw_mask,   target_stream);
+        extra_mask = dsv4_repeat_streams(ctx0, extra_mask, target_stream);
         if (!cparams.flash_attn && !raw_compacted) {
             raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
-                    read_idxs, raw_kq_n_kv, n_tokens, extra_k->ne[3], cb, il);
+                    read_idxs, raw_kq_n_kv, n_tokens, target_stream, cb, il);
             raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
-        }
-        if (raw_mask->ne[3] != extra_k->ne[3]) {
-            raw_mask = dsv4_repeat_streams(ctx0, raw_mask, extra_k->ne[3]);
+            raw_mask = dsv4_repeat_streams(ctx0, raw_mask, target_stream);
         }
         if (!cparams.flash_attn && raw_compacted && raw_mask->ne[1] != n_tokens) {
             raw_mask = ggml_view_2d(ctx0, raw_mask, raw_mask->ne[0], n_tokens, raw_mask->nb[1], 0);

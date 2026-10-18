@@ -7325,6 +7325,13 @@ struct ggml_tensor * ggml_concat(
             ne[d] = a->ne[d] + b->ne[d];
             continue;
         }
+        if (a->ne[d] != b->ne[d]) {
+            fprintf(stderr, "GGML_ASSERT FAILED in ggml_concat: dim=%d d=%d a->name='%s' b->name='%s' a->ne=[%ld,%ld,%ld,%ld] b->ne=[%ld,%ld,%ld,%ld]\n",
+                    dim, d, a->name ? a->name : "(null)", b->name ? b->name : "(null)",
+                    (long)a->ne[0], (long)a->ne[1], (long)a->ne[2], (long)a->ne[3],
+                    (long)b->ne[0], (long)b->ne[1], (long)b->ne[2], (long)b->ne[3]);
+            fflush(stderr);
+        }
         GGML_ASSERT(a->ne[d] == b->ne[d]);
         ne[d] = a->ne[d];
     }
