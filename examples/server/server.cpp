@@ -11,6 +11,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "llama-vocab.h"
+#include "unreal-selector.h"
 #include <fstream>
        
 
@@ -1089,6 +1090,8 @@ int main(int argc, char ** argv) {
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
             { "n_ctx",                       ctx_server.n_ctx },
+            { "unreal_filter",               ctx_server.params_base.unreal_filter },
+            { "n_ctx_unreal",                10000000 },
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
 
         };
@@ -1118,7 +1121,9 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
-             { "n_ctx",                       ctx_server.n_ctx }
+            { "n_ctx",                       ctx_server.n_ctx },
+            { "unreal_filter",               ctx_server.params_base.unreal_filter },
+            { "n_ctx_unreal",                10000000 }
         };
         res.set_content(data.dump(), "application/json; charset=utf-8");
     };
@@ -1156,6 +1161,31 @@ int main(int argc, char ** argv) {
                     // Everything else, including multimodal completions.
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
+
+                const bool enable_unreal = json_value(data, "unreal_filter", json_value(data, "unreal", ctx_server.params_base.unreal_filter));
+                if (enable_unreal) {
+                    gpt_params unreal_params = ctx_server.params_base;
+                    unreal_params.unreal_filter = true;
+                    unreal_params.n_ctx = ctx_server.n_ctx;
+                    if (data.contains("unreal_chunk_size")) {
+                        unreal_params.unreal_chunk_size = data["unreal_chunk_size"].get<int32_t>();
+                    }
+                    if (data.contains("unreal_top_n")) {
+                        unreal_params.unreal_top_n = data["unreal_top_n"].get<int32_t>();
+                    }
+                    if (data.contains("unreal_min_tokens")) {
+                        unreal_params.unreal_min_tokens = data["unreal_min_tokens"].get<int32_t>();
+                    }
+                    for (size_t k = 0; k < inputs.size(); ++k) {
+                        if (!inputs[k].has_mtmd_data()) {
+                            auto filtered = unreal::filter_prompt(ctx_server.model, inputs[k].get_text_tokens(), unreal_params);
+                            if (filtered.size() < inputs[k].size()) {
+                                inputs[k] = server_tokens(filtered, false);
+                            }
+                        }
+                    }
+                }
+
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
@@ -1170,6 +1200,7 @@ int main(int argc, char ** argv) {
 
                     task.tokens = std::move(inputs[i]);
                     task.data = data;
+                    task.cohort_id = json_value(data, "cohort_id", std::string());
                     //task.params = server_task::params_from_json_cmpl(
                     //    ctx_server.ctx,
                     //    ctx_server.params,
@@ -1305,6 +1336,9 @@ int main(int argc, char ** argv) {
     const auto handle_completions = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto data = json::parse(req.body);
+        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
+            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
+        }
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1319,6 +1353,9 @@ int main(int argc, char ** argv) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(body);
+        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
+            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
+        }
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1397,6 +1434,9 @@ int main(int argc, char ** argv) {
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
+            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
+        }
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -1412,6 +1452,9 @@ int main(int argc, char ** argv) {
         std::vector<raw_buffer> files;
         json body_parsed = server_chat_convert_responses_to_chatcmpl(body);
         json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files);
+        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
+            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
+        }
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,

@@ -20353,6 +20353,20 @@ static void ggml_compute_forward_get_rows_i8(
             // DwarfStar e4m3_e8m0_32_row264:
             // 8 blocks of 32 FP8 e4m3 elements (256 bytes) followed by 8 scale bytes (e8m0)
             for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+                if (i + 1 < tile.ir1) {
+                    const int64_t next_i = i + 1;
+                    const int64_t ni12 = next_i/(ne11*ne10);
+                    const int64_t ni11 = (next_i - ni12*ne11*ne10)/ne10;
+                    const int64_t ni10 = (next_i - ni12*ne11*ne10 - ni11*ne10);
+                    const int64_t ni01 = *(const int32_t *) ((const char *) src1->data + ni10*nb10 + ni11*nb11 + ni12*nb12);
+                    if (ni01 >= 0 && ni01 < ne01) {
+                        const char * next_src = (const char *) src0->data + ni01*nb01 + ni11*nb02 + ni12*nb03;
+                        __builtin_prefetch(next_src, 0, 3);
+                        __builtin_prefetch(next_src + 64, 0, 3);
+                        __builtin_prefetch(next_src + 128, 0, 3);
+                        __builtin_prefetch(next_src + 192, 0, 3);
+                    }
+                }
                 const int64_t i12 = i/(ne11*ne10);
                 const int64_t i11 = (i - i12*ne11*ne10)/ne10;
                 const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -20389,6 +20403,17 @@ static void ggml_compute_forward_get_rows_i8(
         } else {
             // Generic int8 conversion to float
             for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+                if (i + 1 < tile.ir1) {
+                    const int64_t next_i = i + 1;
+                    const int64_t ni12 = next_i/(ne11*ne10);
+                    const int64_t ni11 = (next_i - ni12*ne11*ne10)/ne10;
+                    const int64_t ni10 = (next_i - ni12*ne11*ne10 - ni11*ne10);
+                    const int64_t ni01 = *(const int32_t *) ((const char *) src1->data + ni10*nb10 + ni11*nb11 + ni12*nb12);
+                    if (ni01 >= 0 && ni01 < ne01) {
+                        const char * next_src = (const char *) src0->data + ni01*nb01 + ni11*nb02 + ni12*nb03;
+                        __builtin_prefetch(next_src, 0, 3);
+                    }
+                }
                 const int64_t i12 = i/(ne11*ne10);
                 const int64_t i11 = (i - i12*ne11*ne10)/ne10;
                 const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -29078,6 +29103,7 @@ static void set_numa_thread_affinity(int thread_n) {
 
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
+        case GGML_NUMA_STRATEGY_MIRROR:
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
             break;

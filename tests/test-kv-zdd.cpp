@@ -65,8 +65,55 @@ int main() {
     assert(avg_ns < 100.0); // Must be sub-100ns (target < 50ns)
     printf("[✓] Verified Sub-50ns/Sub-100ns Target: %.2f ns\n", avg_ns);
 
+    // 5. Knuth DLX-to-ZDD Exact Cover Compilation for MoE Expert Groups
+    printf("\n--- Section 5.1: Knuth DLX-to-ZDD Exact Cover Test ---\n");
+    ExactCoverMatrix ec_mat;
+    ec_mat.init(4); // 4 items/experts to cover: {0, 1, 2, 3}
+    // Row 0: covers {0, 2} -> mask 0b0101 = 5
+    // Row 1: covers {1, 3} -> mask 0b1010 = 10
+    // Row 2: covers {0, 1} -> mask 0b0011 = 3
+    // Row 3: covers {2, 3} -> mask 0b1100 = 12
+    ec_mat.add_row(0b0101);
+    ec_mat.add_row(0b1010);
+    ec_mat.add_row(0b0011);
+    ec_mat.add_row(0b1100);
+
+    DlxZddCompiler dlx_compiler;
+    uint32_t ec_root = dlx_compiler.solve_exact_cover(0b1111, ec_mat);
+    assert(ec_root > ZDD_BASE);
+    std::vector<uint32_t> solution_rows;
+    dlx_compiler.extract_first_solution(ec_root, solution_rows);
+    assert(solution_rows.size() == 2);
+    printf("[✓] Knuth DLX-to-ZDD Exact Cover solved: %zu rows cover all 4 items.\n", solution_rows.size());
+    printf("[*] ZDD Exact Cover Graph Size : %zu nodes\n", dlx_compiler.node_count());
+
+    // 6. MoE Cluster Router Sub-50ns Resolution Test
+    printf("\n--- Section 5.1: MoE Cluster Router Test ---\n");
+    ZddMoeClusterRouter router;
+    // 8 clusters covering 64 experts (8 experts per contiguous 2MB cluster block)
+    for (uint16_t c = 0; c < 8; ++c) {
+        uint64_t mask = 0xFFULL << (c * 8);
+        router.add_cluster(c, mask);
+    }
+    // Active top-8 experts: {0, 1, 8, 9, 16, 24, 32, 40}
+    uint64_t active_mask = (1ULL << 0) | (1ULL << 1) | (1ULL << 8) | (1ULL << 9) |
+                           (1ULL << 16) | (1ULL << 24) | (1ULL << 32) | (1ULL << 40);
+    std::vector<uint16_t> resolved_clusters;
+    start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < N_ITERS; ++i) {
+        router.resolve_clusters(active_mask, resolved_clusters);
+    }
+    end = std::chrono::high_resolution_clock::now();
+    total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    avg_ns = total_ns / N_ITERS;
+    printf("[*] MoE Top-8 Expert Cluster Resolution Latency: %.2f ns\n", avg_ns);
+    assert(avg_ns < 50.0); // Target < 50 ns
+    printf("[✓] Verified Sub-50ns MoE Cluster Resolution Target: %.2f ns (Resolved %zu clusters)\n",
+           avg_ns, resolved_clusters.size());
+
     printf("=================================================================\n");
-    printf("[✓] ALL ZDD KV CACHE TESTS PASSED SUCCESSFULLY!\n");
+    printf("[✓] ALL ZDD KV CACHE & DLX MOE TESTS PASSED SUCCESSFULLY!\n");
     printf("=================================================================\n");
     return 0;
 }
+

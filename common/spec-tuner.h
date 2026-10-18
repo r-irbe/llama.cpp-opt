@@ -82,7 +82,7 @@ struct spec_tuner {
     void write_best(common_params_speculative & params) const;
 
     bool has_dflash_target_only_arm() const {
-        return enabled && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK) && configured_n_max > 0;
+        return enabled && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK || spec_type == COMMON_SPECULATIVE_TYPE_MTP) && configured_n_max > 0;
     }
 
 private:

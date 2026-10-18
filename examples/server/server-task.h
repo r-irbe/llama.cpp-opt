@@ -99,6 +99,7 @@ struct server_task {
 
     bool infill = false;
     bool embedding = false;
+    std::string cohort_id;
 
     // used by SERVER_TASK_TYPE_DECISION
     struct decision {

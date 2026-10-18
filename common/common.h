@@ -576,6 +576,22 @@ struct gpt_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    // Cohort Prompt Prefix Sharing (PPS)
+    bool    cohort_prefix_sharing   = false; // enable cohort-aware prompt prefix sharing
+    int32_t cohort_min_prefix       = 64;    // minimum prefix tokens required to trigger sharing
+    int32_t cohort_max_idle_sec     = 300;   // idle duration in seconds before slot cache is evicted
+
+    // ZDD Sparse KV Cache Block Selection
+    bool    zdd_sparse_kv           = false; // enable Minato ZDD sparse KV block indexing
+
+    // UNREAL: Model-Internal Evidence Selection (arXiv:2610.08463)
+    bool    unreal_filter           = false; // enable UNREAL model-internal evidence selection
+    int32_t unreal_chunk_size       = 140;   // chunk size in tokens (T)
+    int32_t unreal_top_n            = 10;    // number of top-scoring chunks to select (n)
+    int32_t unreal_min_tokens       = 4096;  // minimum prompt tokens to activate UNREAL filtering (0 = auto N*)
+    int32_t unreal_query_groups     = 4;     // pooled query groups (G)
+    int32_t unreal_chunk_vectors    = 7;     // pooled vectors per chunk (Lp)
+
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot
     std::string ctx_checkpoint_spill_dir = ""; // disk dir for checkpoint spill (empty = disabled, behavior unchanged)

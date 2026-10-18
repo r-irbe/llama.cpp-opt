@@ -697,11 +697,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             } else {
                 std::string value(argv[i]);
-                /**/ if (value == "distribute" || value == "" ) { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
+                /**/ if (value == "distribute" || value == "split" || value == "" ) { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
                 else if (value == "isolate")                    { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
                 else if (value == "numactl")                    { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+                else if (value == "mirror")                     { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
+                else if (value == "expert")                     { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
                 else { invalid_param = true; break; }
             }
+        } else if (arg == "--numa-replicate-shared") {
+            setenv("GGML_NUMA_REPLICATE_SHARED", "1", 1);
         } else if (arg == "-fa" || arg == "--flash-attn") {
             if (++i >= argc) {
                 invalid_param = true;

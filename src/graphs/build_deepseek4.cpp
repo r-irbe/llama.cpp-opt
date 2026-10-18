@@ -266,10 +266,6 @@ static ggml_tensor * dsv4_build_raw_mask_view(
         return mask;
     }
 
-    printf("%s: Oops(%s). mask is %ld x %ld x %ld x %ld. n_stream = %ld, n_tokens = %ld, raw_k_read_idxs = %ld x %ld x %ld x %ld\n",
-            __func__, mask->name, mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3], n_stream, n_tokens,
-            raw_k_read_idxs->ne[0], raw_k_read_idxs->ne[1], raw_k_read_idxs->ne[2], raw_k_read_idxs->ne[3]);
-
     ggml_tensor * mask_t = ggml_cont(ctx, ggml_transpose(ctx, mask));
     ggml_tensor * result = nullptr;
     for (int64_t s = 0; s < n_stream; ++s) {
@@ -320,8 +316,6 @@ static ggml_tensor * dsv4_pad_raw_mask_to(
     if (n_kv_target <= n_kv_cur) {
         return raw_mask;
     }
-
-    printf("%s: Oops, padding mask\n", __func__);
 
     const int64_t n_pad = n_kv_target - n_kv_cur;
     GGML_UNUSED(n_tokens);
@@ -598,7 +592,7 @@ static ggml_tensor * dsv4_build_attn(
     const bool v_trans = v->nb[1] > v->nb[2];
     const int64_t n_stream = k->ne[3];
 
-    if (!cparams.flash_attn && n_stream > 1) {
+    if (n_stream > 1) {
         GGML_ASSERT(q->ne[2] % n_stream == 0);
         const int64_t n_tokens_stream = q->ne[2]/n_stream;
         ggml_tensor * result = nullptr;
@@ -632,12 +626,9 @@ static ggml_tensor * dsv4_build_attn(
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
-    // The DSV4 cache/controller is non-unified. Keep the eligibility rule
-    // explicit so a future unified cache cannot route multi-stream masks
-    // through Flash Attention accidentally.
-    constexpr bool kv_unified = false;
+    // Flash Attention requires mask->ne[3] == 1
     const bool use_flash_attn = cparams.flash_attn &&
-            (!kv_unified || kq_mask->ne[3] == 1);
+            (kq_mask == nullptr || kq_mask->ne[3] == 1);
     if (use_flash_attn) {
 
         if (v_trans) {

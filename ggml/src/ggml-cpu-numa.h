@@ -81,6 +81,8 @@ void set_numa_replicate_shared(bool enable);
 bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_nodes);
 bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes);
 void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id);
+void free_tensor_numa_replicas(const struct ggml_tensor * tensor);
+void free_all_numa_replicas();
 
 } // namespace ggml::cpu::numa
 #else
@@ -104,6 +106,8 @@ bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_no
 // C-compatible wrapper for replicating shared tensors across NUMA nodes
 bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes);
 void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id);
+void ggml_cpu_numa_free_tensor_replicas(const struct ggml_tensor * tensor);
+void ggml_cpu_numa_free_all_replicas(void);
 
 #ifdef __cplusplus
 }

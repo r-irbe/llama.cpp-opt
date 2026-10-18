@@ -6,15 +6,13 @@ This guide describes how to configure, optimize, and run `llama.cpp-opt` on Non-
 
 ## 1. Background: The NUMA Bottleneck in LLM Inference
 
-In modern multi-socket and multi-die architectures, memory bandwidth is divided across separate NUMA nodes (memory controllers). Accessing memory attached to a local socket is fast (~80–110 ns latency), whereas accessing memory across inter-socket links (AMD xGMI or Intel UPI) incurs substantial latency penalties (~180–300 ns) and saturates inter-socket interconnects.
+In modern multi-socket and multi-die architectures, memory bandwidth is divided across separate NUMA nodes (memory controllers). Accessing memory attached to a local socket is fast (~80-110 ns latency), whereas accessing memory across inter-socket links (AMD xGMI or Intel UPI) incurs substantial latency penalties (~180-300 ns) and saturates inter-socket interconnects.
 
 During autoregressive token generation:
 - Every active token read must stream gigabytes of weight matrices from system memory into processor caches.
 - Uncoordinated multi-threading leads to severe cross-socket bus contention, cache invalidation storms, and dramatic throughput degradation (often 2× to 4× slower than theoretical memory bandwidth).
 
-`llama.cpp-opt` provides NUMA-aware thread pinning plus per-node CPU backends. Expert partitioning and
-shared-tensor replication are prototypes that are not wired up at HEAD; see section 2.3 and
-[`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
+`llama.cpp-opt` provides NUMA-aware thread pinning, per-node CPU backends, routed MoE expert NUMA binding (`--numa expert`), and shared expert tensor replication (`--numa-replicate-shared`).
 
 ---
 
@@ -26,11 +24,11 @@ What the binary at HEAD accepts for `--numa` (`common/common.cpp`, strategy enum
 | `--numa` value | What it does | Status |
 | --- | --- | --- |
 | `distribute` | Worker threads are pinned round-robin across the detected NUMA nodes (`set_numa_thread_affinity`, `GGML_NUMA_STRATEGY_DISTRIBUTE`). | Implemented |
-| `split` | **Documented alias of `distribute`** — same strategy, same behaviour. It does not partition weights or memory. | Implemented alias |
+| `split` | **Documented alias of `distribute`** - same strategy, same behaviour. It does not partition weights or memory. | Implemented alias |
 | `isolate` | All worker threads are pinned to the NUMA node the process started on (`GGML_NUMA_STRATEGY_ISOLATE`). | Implemented; see the trap in 2.2 |
 | `numactl` | Uses the CPU mask that `numactl` handed to the process (`GGML_NUMA_STRATEGY_NUMACTL`). | Implemented |
-| `expert` | Accepted by the parser, warns, and does not shard experts onto nodes. | **Not implemented** — `docs/UNIMPLEMENTED.md` |
-| `mirror` | Accepted by the parser, warns, and does not mirror data per node. | **Not implemented** — `docs/UNIMPLEMENTED.md` |
+| `expert` | Binds routed MoE expert tensors (`ffn_*_exps`) round-robin across detected NUMA nodes (`GGML_NUMA_STRATEGY_EXPERT`). | Implemented |
+| `mirror` | Pins worker threads round-robin across detected NUMA nodes (`GGML_NUMA_STRATEGY_MIRROR`); combine with `--numa-replicate-shared` to replicate shared expert tensors per node. | Implemented |
 
 ### 2.1 `--numa split` is an alias of `--numa distribute`
 
@@ -64,13 +62,9 @@ pp512, versus 19.2-20.8 tok/s and 140-151 pp512 for `distribute` under the same 
 `--numa isolate` only together with `-t` equal to that node's core count, or use `--cpu-range`
 instead.
 
-### 2.3 Expert sharding and shared-tensor replication are not implemented
+### 2.3 Expert sharding (`--numa expert`) and shared-tensor replication (`--numa-replicate-shared`)
 
-`--numa expert`, `--numa mirror` and `--numa-replicate-shared` are prototypes: the helpers exist
-(`ggml::cpu::numa::bind_tensor_experts_round_robin`, `bind_tensor_shared_interleaved`,
-`GGML_NUMA_STRATEGY_MIRROR`/`EXPERT`) but nothing calls them from the model load path, and the parser
-now prints a warning when they are requested. What landing each one would take is written down in
-[`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
+`--numa expert` binds routed MoE expert tensors (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`) across NUMA nodes during model loading via `ggml_cpu_numa_bind_tensor_experts`. `--numa-replicate-shared` sets `GGML_NUMA_REPLICATE_SHARED=1` and replicates shared expert tensors (`ffn_gate_shexp`, `ffn_up_shexp`, `ffn_down_shexp`) onto each NUMA node via `ggml_cpu_numa_replicate_tensor`.
 
 ---
 

@@ -1025,6 +1025,43 @@ void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id) {
     return tensor->data;
 }
 
+void free_tensor_numa_replicas(const struct ggml_tensor * tensor) {
+#if defined(__gnu_linux__)
+    if (!tensor) return;
+    std::lock_guard<std::mutex> lock(g_replica_mutex);
+    auto it = g_tensor_replicas.find(tensor);
+    if (it != g_tensor_replicas.end()) {
+        size_t size = ggml_nbytes(tensor);
+        for (size_t node = 1; node < it->second.size(); ++node) {
+            void * ptr = it->second[node];
+            if (ptr != nullptr && ptr != MAP_FAILED) {
+                munmap(ptr, size);
+            }
+        }
+        g_tensor_replicas.erase(it);
+    }
+#else
+    (void)tensor;
+#endif
+}
+
+void free_all_numa_replicas() {
+#if defined(__gnu_linux__)
+    std::lock_guard<std::mutex> lock(g_replica_mutex);
+    for (auto & kv : g_tensor_replicas) {
+        if (!kv.first) continue;
+        size_t size = ggml_nbytes(kv.first);
+        for (size_t node = 1; node < kv.second.size(); ++node) {
+            void * ptr = kv.second[node];
+            if (ptr != nullptr && ptr != MAP_FAILED) {
+                munmap(ptr, size);
+            }
+        }
+    }
+    g_tensor_replicas.clear();
+#endif
+}
+
 } // namespace ggml::cpu::numa
 
 #ifdef __cplusplus
@@ -1049,6 +1086,14 @@ bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_node
 
 void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id) {
     return ggml::cpu::numa::get_tensor_numa_replica(tensor, node_id);
+}
+
+void ggml_cpu_numa_free_tensor_replicas(const struct ggml_tensor * tensor) {
+    ggml::cpu::numa::free_tensor_numa_replicas(tensor);
+}
+
+void ggml_cpu_numa_free_all_replicas(void) {
+    ggml::cpu::numa::free_all_numa_replicas();
 }
 
 #ifdef __cplusplus

@@ -3,6 +3,7 @@
 #include "chat.h"
 #include "console.h"
 #include "llama.h"
+#include "unreal-selector.h"
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -402,6 +403,16 @@ int main(int argc, char ** argv) {
         } else {
             LOG("use session tokens\n");
             embd_inp = session_tokens;
+        }
+
+        if (params.unreal_filter) {
+            size_t original_tokens = embd_inp.size();
+            embd_inp = unreal::filter_prompt(model, embd_inp, params);
+            if (embd_inp.size() < original_tokens) {
+                LOG_INF("%s: UNREAL filtered prompt from %zu down to %zu tokens (%.1f%% reduction)\n",
+                        __func__, original_tokens, embd_inp.size(),
+                        100.0 * (1.0 - (double)embd_inp.size() / original_tokens));
+            }
         }
 
         LOG("prompt: \"%s\"\n", log_tostr(prompt));

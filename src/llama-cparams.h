@@ -57,6 +57,7 @@ struct llama_cparams {
     bool mtp;
     int  worst_graph_tokens;
     int  dflash_query_capacity = 0; // internal DFlash query capacity override
+    bool zdd_sparse_kv = false;     // enable Minato ZDD sparse KV block indexing
 
     enum ggml_type reduce_type;
     enum ggml_type graph_attn_precision;

@@ -265,6 +265,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         ready = true;
 
         llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
+        llama_set_dflash_visible_cross_ctx(ctx_tgt, this->cross_ctx);
         llama_set_dflash_dspark(ctx_dft, is_dspark);
         LOG_INF("%s: DFlash context ready (n_ctx=%d, block_size=%d, query_capacity=%d, active_width=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d, host_ring=%.2f MiB)\n",
                 __func__, llama_n_ctx(ctx_dft), block_size, query_capacity, active_width, this->cross_ctx,
@@ -358,7 +359,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        llama_kv_cache_clear(ctx_dft);
+        if (cache_plan.rebuild_cache) {
+            llama_kv_cache_clear(ctx_dft);
+        }
         batch.n_tokens = 0;
         const bool output_seed_row = is_dspark;
         const bool output_mask_rows = !is_dflash2;

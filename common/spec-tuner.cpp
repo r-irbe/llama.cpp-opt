@@ -94,7 +94,7 @@ void spec_tuner_coord::build_grid_int(int lo, int hi, int step, int user_value) 
 
 void spec_tuner::reset_exploration() {
     n_resets++;
-    LOG_DBG("Autotune task change detected (n_low=%d) — resetting MAB (reset #%d)\n", n_low, n_resets);
+    LOG_DBG("Autotune task change detected (n_low=%d) -- resetting MAB (reset #%d)\n", n_low, n_resets);
     for (auto & coord : coords) {
         coord.reset_scores();
     }
@@ -116,7 +116,7 @@ void spec_tuner::write_best(common_params_speculative & params) const {
     for (const auto & coord : coords) {
         float val = coord.arms[coord.best_idx].value;
         if      (coord.name == "n_max") {
-            params.n_max = ((spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK) && (int32_t)val == 0)
+            params.n_max = ((spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK || spec_type == COMMON_SPECULATIVE_TYPE_MTP) && (int32_t)val == 0)
                 ? configured_n_max
                 : (int32_t)val;
         }
@@ -159,16 +159,16 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
         spec_tuner_coord coord;
         coord.name = "n_max";
         const bool recurrent_target = model_tgt != nullptr && llama_model_has_recurrent(model_tgt);
-        int hi = (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK)
+        int hi = (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK || type == COMMON_SPECULATIVE_TYPE_MTP)
             ? configured_n_max
             : (recurrent_target ? std::max(1, (int) user_params.n_max)
                                  : std::max(16, (int) user_params.n_max));
-        const int lo = (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK) ? 0 : 1;
+        const int lo = (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK || type == COMMON_SPECULATIVE_TYPE_MTP) ? 0 : 1;
         coord.build_grid_int(lo, hi, 1, user_params.n_max);
         coords.push_back(std::move(coord));
     }
 
-    if (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK) {
+    if (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK || type == COMMON_SPECULATIVE_TYPE_MTP) {
         dflash_quarantined.assign(coords[0].arms.size(), false);
     }
 
@@ -426,7 +426,7 @@ void spec_tuner::accept_feedback(int n_accepted, int n_drafted, double step_tps)
             oss << " " << coord.name << "=";
             if (is_int) oss << (int)coord.arms[coord.current_idx].value;
             else oss << std::fixed << std::setprecision(2) << coord.arms[coord.current_idx].value;
-            if (coord.name == "n_max" && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK)) {
+            if (coord.name == "n_max" && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK || spec_type == COMMON_SPECULATIVE_TYPE_MTP)) {
                 oss << "(target_only=" << ((int) coord.arms[coord.current_idx].value == 0 ? "true" : "false") << ")";
             }
             oss << "→best=";
@@ -518,7 +518,7 @@ void spec_tuner::print_best() const {
             first_kv = false;
 
             int reuse_value = is_int ? (int) coord.arms[coord.best_idx].value : 0;
-            if (coord.name == "n_max" && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK) && reuse_value == 0) {
+            if (coord.name == "n_max" && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK || spec_type == COMMON_SPECULATIVE_TYPE_MTP) && reuse_value == 0) {
                 reuse_value = configured_n_max;
             }
             if (is_int) oss << reuse_value;

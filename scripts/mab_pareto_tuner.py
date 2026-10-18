@@ -1392,9 +1392,9 @@ def format_pareto_report(
                          f"export one mode per report or pass --allow-mixed-modes to override.")
 
     if modes == [MODE_LIVE]:
-        mode_desc = "`live` — measured on this host by running `./build/bin/llama-cli`"
+        mode_desc = "`live` -- measured on this host by running `./build/bin/llama-cli`"
     elif modes == [MODE_SIMULATED]:
-        mode_desc = ("`simulated` — hardware-calibrated estimate from `evaluate_simulated_point()`; "
+        mode_desc = ("`simulated` -- hardware-calibrated estimate from `evaluate_simulated_point()`; "
                      "**these are model outputs, not measurements of this host**")
     else:
         mode_desc = f"mixed {modes} (explicitly allowed via `--allow-mixed-modes`)"

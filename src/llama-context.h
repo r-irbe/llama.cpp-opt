@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-cparams.h"
 #include "llama-sampling.h"
+#include "llama-kv-zdd.h"
 
 #include "llama-spec-features.h"
 
@@ -151,6 +152,9 @@ struct llama_kv_cache {
 
     // Per-device replicas of the MLA compressed-latent KV cache (-sm graph for DEEPSEEK2/GLM_DSA/MISTRAL4).
     std::vector<llama_split_tensor> replicated_k_l;
+
+    // ZDD Sparse Block Indexing Manager for extreme context windows
+    std::unique_ptr<llama::kv::zdd::ZddKvManager> zdd_mgr;
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;

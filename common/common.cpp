@@ -2545,14 +2545,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else if (value == "mirror")  { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
         else if (value == "expert")  { params.numa = GGML_NUMA_STRATEGY_EXPERT; }
         else { invalid_param = true; }
-        if (params.numa == GGML_NUMA_STRATEGY_MIRROR || params.numa == GGML_NUMA_STRATEGY_EXPERT) {
-            fprintf(stderr, "warning: --numa %s is accepted but not implemented: no expert sharding or node-local mirroring happens (see docs/UNIMPLEMENTED.md)\n", value.c_str());
-        }
         return true;
     }
     if (arg == "--numa-replicate-shared") {
         setenv("GGML_NUMA_REPLICATE_SHARED", "1", 1);
-        fprintf(stderr, "warning: --numa-replicate-shared is accepted but not implemented: shared tensors are not replicated per NUMA node (see docs/UNIMPLEMENTED.md)\n");
+        LOG_INF("%s: NUMA shared tensor replication enabled\n", __func__);
         return true;
     }
     if (arg == "-dev" || arg == "--device") {
@@ -3060,6 +3057,65 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         CHECK_ARG
         auto p = string_split<int>(argv[i], split_delim);
         params.n_pl.insert(params.n_pl.end(), p.begin(), p.end());
+        return true;
+    }
+    if (arg == "--cohort-prefix-sharing") {
+        params.cohort_prefix_sharing = true;
+        return true;
+    }
+    if (arg == "--no-cohort-prefix-sharing") {
+        params.cohort_prefix_sharing = false;
+        return true;
+    }
+    if (arg == "--cohort-min-prefix") {
+        CHECK_ARG
+        params.cohort_min_prefix = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--cohort-max-idle-sec") {
+        CHECK_ARG
+        params.cohort_max_idle_sec = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--zdd-sparse-kv") {
+        params.zdd_sparse_kv = true;
+        return true;
+    }
+    if (arg == "--no-zdd-sparse-kv") {
+        params.zdd_sparse_kv = false;
+        return true;
+    }
+    if (arg == "--unreal-filter" || arg == "-unreal") {
+        params.unreal_filter = true;
+        return true;
+    }
+    if (arg == "--no-unreal-filter" || arg == "-no-unreal") {
+        params.unreal_filter = false;
+        return true;
+    }
+    if (arg == "--unreal-chunk-size") {
+        CHECK_ARG
+        params.unreal_chunk_size = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-top-n") {
+        CHECK_ARG
+        params.unreal_top_n = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-min-tokens") {
+        CHECK_ARG
+        params.unreal_min_tokens = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-query-groups") {
+        CHECK_ARG
+        params.unreal_query_groups = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--unreal-chunk-vectors") {
+        CHECK_ARG
+        params.unreal_chunk_vectors = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--context-file") {
@@ -3612,7 +3668,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - split: documented alias of distribute (identical strategy)\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
-                                                                        "  - expert, mirror: accepted but NOT implemented (prints a warning; see docs/UNIMPLEMENTED.md)\n"
+                                                                        "  - expert: bind routed MoE expert tensors across NUMA nodes\n"
+                                                                        "  - mirror: pin worker threads across NUMA nodes for mirrored execution\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
 
@@ -4741,6 +4798,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.fused_idx_topk    = params.fused_idx_topk;
     cparams.swa_compress      = params.swa_compress;
     cparams.dsv4_legacy_state = params.dsv4_legacy_state;
+    cparams.zdd_sparse_kv     = params.zdd_sparse_kv;
     cparams.dsa_top_k         = params.dsa_top_k;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;

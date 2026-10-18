@@ -3,6 +3,7 @@
 #include "server-queue.h"
 #include "speculative.h"
 #include "json-schema-to-grammar.h"
+#include "cohort-radix-trie.h"
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
@@ -38,6 +39,9 @@ struct server_slot {
     llama_context* ctx = nullptr;
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+
+    std::string cohort_id;
+    int cohort_reuse_count = 0;
 
     std::unique_ptr<const server_task> task;
 
@@ -276,6 +280,8 @@ struct server_context {
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
+
+    cohort_radix_trie cohort_trie;
 
     common_chat_templates_ptr chat_templates;
     server_chat_params  chat_params;

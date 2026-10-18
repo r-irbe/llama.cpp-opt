@@ -519,8 +519,8 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
     }
 
     const int32_t row_width = (int32_t) tensor->ne[0];
-    const int32_t row_count = row_width > 0 ? (int32_t) (ggml_nelements(tensor) / (int64_t) row_width) : 0;
-    if (row_width <= 0 || row_count <= 0) {
+    const int32_t tensor_rows = row_width > 0 ? (int32_t) (ggml_nelements(tensor) / (int64_t) row_width) : 0;
+    if (row_width <= 0 || tensor_rows <= 0) {
         return 0;
     }
 
@@ -552,6 +552,13 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
         return 2;
     }
 
+    const int32_t target_rows = capture.expected_rows;
+    const int32_t skip_rows = std::max(0, tensor_rows - target_rows);
+    const int32_t row_count = std::min(tensor_rows - skip_rows, target_rows);
+    if (row_count <= 0) {
+        return 0;
+    }
+
     auto & rows = capture.layer_rows[(size_t) layer_idx];
     auto & chunks = capture.layer_chunks[(size_t) layer_idx];
     auto & rows_written = capture.layer_rows_written[(size_t) layer_idx];
@@ -571,14 +578,11 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
     const size_t raw_row_stride = (size_t) row_width * sizeof(float);
     const size_t byte_offset = (size_t) rows_written * raw_row_stride;
 
-    void * readback_dst = nullptr;
-    size_t readback_bytes = 0;
-    if (capture_type == GGML_TYPE_F32) {
-        readback_bytes = (size_t) row_count * (size_t) row_width * sizeof(float);
-    } else {
-        const size_t row_bytes = ggml_row_size(capture_type, row_width);
-        readback_bytes = (size_t) row_count * row_bytes;
-    }
+    const size_t row_bytes = capture_type == GGML_TYPE_F32
+        ? ((size_t) row_width * sizeof(float))
+        : ggml_row_size(capture_type, row_width);
+    const size_t readback_bytes = (size_t) row_count * row_bytes;
+    const size_t tensor_byte_offset = (size_t) skip_rows * row_bytes;
 
     const size_t rows_bytes = rows.size() * sizeof(float);
     if (byte_offset > rows_bytes || readback_bytes > rows_bytes - byte_offset) {
@@ -588,11 +592,11 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
         return 2;
     }
 
-    readback_dst = capture_type == GGML_TYPE_F32
+    void * readback_dst = capture_type == GGML_TYPE_F32
         ? static_cast<void *>(rows.data() + (size_t) rows_written * (size_t) row_width)
         : static_cast<void *>(reinterpret_cast<uint8_t *>(rows.data()) + byte_offset);
 
-    ggml_backend_tensor_get_async(backend, tensor, readback_dst, 0, readback_bytes);
+    ggml_backend_tensor_get_async(backend, tensor, readback_dst, tensor_byte_offset, readback_bytes);
 
     chunks.push_back({ rows_written, row_count, byte_offset, capture_type });
     rows_written += row_count;
@@ -671,6 +675,10 @@ void llama_begin_dflash_capture_batch(struct llama_context * ctx, int32_t expect
     if (capture.readback_pending) {
         llama_synchronize(ctx);
         capture.readback_pending = false;
+    }
+    const int32_t cross_ctx = ctx->dflash.visible_cross_ctx;
+    if (cross_ctx > 0 && expected_rows > cross_ctx) {
+        expected_rows = cross_ctx;
     }
     capture.capture_batch_id++;
     capture.row_count = 0;

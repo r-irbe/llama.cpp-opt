@@ -19,6 +19,7 @@ Outputs:
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -229,6 +230,41 @@ def detect_environment_telemetry():
             pass
     return telemetry
 
+def purge_page_cache():
+    """Attempt to flush OS file system page cache to ensure cold-start measurement."""
+    try:
+        subprocess.run(["sync"], check=False)
+        drop_caches = Path("/proc/sys/vm/drop_caches")
+        if drop_caches.exists():
+            try:
+                drop_caches.write_text("3\n")
+            except PermissionError:
+                pass
+    except Exception:
+        pass
+
+def enforce_thermal_cooldown(max_cpu_temp=75.0, max_gpu_temp=70.0, max_wait_sec=60):
+    """Enforce thermal equilibrium gating between benchmark model runs."""
+    start_wait = time.perf_counter()
+    while time.perf_counter() - start_wait < max_wait_sec:
+        telemetry = read_environment_telemetry()
+        cpu_t = telemetry.get("cpu_temp_c", 0.0)
+        gpu_t = telemetry.get("gpu_temp_c", 0.0)
+        if cpu_t <= max_cpu_temp and gpu_t <= max_gpu_temp:
+            break
+        time.sleep(2.0)
+
+def compute_variance_and_cv(samples):
+    """Compute mean, sample standard deviation, and coefficient of variation (CV)."""
+    if not samples or len(samples) < 2:
+        return 0.0, 0.0, 0.0
+    n = len(samples)
+    mean = sum(samples) / float(n)
+    variance = sum((x - mean) ** 2 for x in samples) / float(n - 1)
+    std_dev = math.sqrt(variance)
+    cv = (std_dev / mean) if mean > 0 else 0.0
+    return round(mean, 3), round(std_dev, 3), round(cv, 4)
+
 def compute_hdr_percentiles(samples):
     """Compute High Dynamic Range percentiles (p50, p90, p95, p99, p99.9, p99.99)."""
     if not samples:
@@ -282,6 +318,23 @@ def compute_bootstrap_ci(samples, n_bootstrap=10000, alpha_95=0.05, alpha_99=0.0
         "ci99_low": q(alpha_99 / 2.0),
         "ci99_high": q(1.0 - alpha_99 / 2.0),
     }
+
+
+def compute_trimmed_mean(samples, trim_ratio=0.20):
+    """Compute 20% symmetric trimmed mean (Bilokon & Gunduz 2023) for robust outlier rejection."""
+    if not samples:
+        return 0.0
+    n = len(samples)
+    if n < 3:
+        return round(sum(samples) / float(n), 3)
+    s = sorted(samples)
+    k = int(n * trim_ratio)
+    if 2 * k >= n:
+        k = max(0, (n - 1) // 2)
+    trimmed_slice = s[k : n - k]
+    if not trimmed_slice:
+        return round(s[n // 2], 3)
+    return round(sum(trimmed_slice) / float(len(trimmed_slice)), 3)
 
 
 # --- Complete 19-Model Architecture Matrix Definition ---
@@ -648,6 +701,7 @@ CREATE TABLE IF NOT EXISTS benchmark_statistics (
   task TEXT,
   n_samples INTEGER,
   median_ts REAL,
+  trimmed_mean_ts REAL,
   ci95_low REAL,
   ci95_high REAL,
   ci99_low REAL,
@@ -667,6 +721,13 @@ def init_db(db_path):
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p))
     conn.executescript(SQL_SUPERSET_SCHEMA)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(benchmark_statistics)")
+    cols = [col[1] for col in cur.fetchall()]
+    if "trimmed_mean_ts" not in cols:
+        cur.execute("ALTER TABLE benchmark_statistics ADD COLUMN trimmed_mean_ts REAL DEFAULT NULL")
+    conn.commit()
+    conn.close()
 
     # Ensure metadata columns exist if table was created in an older run
     cur = conn.cursor()
@@ -862,6 +923,10 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
     if dry_run:
         return {"returncode": 0, "stdout": "", "stderr": "", "duration": 0.0, "numa_delta": {}}
 
+    if not dry_run:
+        purge_page_cache()
+        enforce_thermal_cooldown()
+
     snap0 = read_numastat()
     t0 = time.perf_counter()
     try:
@@ -927,19 +992,23 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
                     samples = [r[0] for r in sample_rows]
                     hdr = compute_hdr_percentiles(samples)
                     boot = compute_bootstrap_ci(samples)
+                    tmean = compute_trimmed_mean(samples)
+                    mean_val, std_val, cv_val = compute_variance_and_cv(samples)
                     cur.execute("""
                         INSERT INTO benchmark_statistics (
                             timestamp, model_id, model_name, engine, track, task, n_samples,
-                            median_ts, ci95_low, ci95_high, ci99_low, ci99_high,
+                            median_ts, trimmed_mean_ts, ci95_low, ci95_high, ci99_low, ci99_high,
                             p50_ts, p90_ts, p95_ts, p99_ts, p99_9_ts, p99_99_ts
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         datetime.now(timezone.utc).isoformat(), model_meta["id"], model_meta["name"],
                         engine, track, task_label, len(samples),
-                        boot["median"], boot["ci95_low"], boot["ci95_high"], boot["ci99_low"], boot["ci99_high"],
+                        boot["median"], tmean, boot["ci95_low"], boot["ci95_high"], boot["ci99_low"], boot["ci99_high"],
                         hdr.get("p50"), hdr.get("p90"), hdr.get("p95"), hdr.get("p99"), hdr.get("p99_9"), hdr.get("p99_99")
                     ))
-                    print(f"  [STATS ({task_label})] Median: {boot['median']:.2f} t/s | 99% CI: [{boot['ci99_low']:.2f}, {boot['ci99_high']:.2f}] | p90: {hdr.get('p90', 0.0):.2f} | p99: {hdr.get('p99', 0.0):.2f}")
+                    print(f"  [STATS ({task_label})] Median: {boot['median']:.2f} t/s | Trimmed Mean (20%): {tmean:.2f} t/s | CV: {cv_val:.4f} (std={std_val:.2f}) | 99% CI: [{boot['ci99_low']:.2f}, {boot['ci99_high']:.2f}] | p90: {hdr.get('p90', 0.0):.2f} | p99: {hdr.get('p99', 0.0):.2f}")
+                    if cv_val > 0.05:
+                        print(f"  [GATE] Warning: CV={cv_val:.4f} > 0.05 exceeds Bilokon & Gunduz variance threshold!")
 
             db_conn.commit()
             print(f"  [SQL] Ingested {rows} test result records into SQLite.")

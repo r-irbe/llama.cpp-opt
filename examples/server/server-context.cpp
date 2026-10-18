@@ -1037,6 +1037,47 @@ server_slot* server_context::get_available_slot(const server_task& task) {
     server_slot* ret = nullptr;
     bool update_cache = false;
 
+    // dynamic idle cohort slot eviction
+    if (params_base.cohort_prefix_sharing && params_base.cohort_max_idle_sec > 0) {
+        int64_t now_us = ggml_time_us();
+        for (server_slot& s : slots) {
+            if (s.available() && !s.cohort_id.empty() && s.t_last_used > 0) {
+                int64_t idle_sec = (now_us - s.t_last_used) / 1000000LL;
+                if (idle_sec >= params_base.cohort_max_idle_sec) {
+                    cohort_trie.remove_slot(s.id);
+                    s.cohort_id.clear();
+                    s.cache_tokens.clear();
+                    s.n_past = 0;
+                    s.n_past_prompt = 0;
+                    s.cohort_reuse_count = 0;
+                }
+            }
+        }
+    }
+
+    // cohort radix trie O(L) prefix lookup
+    if (ret == nullptr && params_base.cohort_prefix_sharing && !task.tokens.empty()) {
+        std::vector<llama_token> task_toks = task.tokens.get_text_tokens();
+        auto match = cohort_trie.find_best_match(
+            task_toks,
+            task.cohort_id,
+            params_base.cohort_min_prefix,
+            [this](int id) -> const server_slot* { return get_slot_by_id(id); }
+        );
+        if (match.slot_id >= 0) {
+            server_slot* matched_slot = get_slot_by_id(match.slot_id);
+            if (matched_slot && matched_slot->available()) {
+                ret = matched_slot;
+                LOG_INFO("selected slot via cohort radix trie match", {
+                    {"id_slot", ret->id},
+                    {"matched_tokens", match.matched_tokens},
+                    {"cohort_id", task.cohort_id},
+                    {"reuse_count", ret->cohort_reuse_count}
+                });
+            }
+        }
+    }
+
     // find the slot that has at least n% prompt similarity
     if (ret == nullptr && slot_prompt_similarity != 0.0f) {
         int max_lcp_len = 0;
@@ -1177,6 +1218,17 @@ int32_t server_context::populate_vocab_pieces() {
 bool server_context::launch_slot_with_task(server_slot& slot, server_task& task) {
     slot_params defaults;
     defaults.speculative = params_base.speculative;
+
+    if (params_base.cohort_prefix_sharing) {
+        if (!slot.cohort_id.empty() && slot.cohort_id != task.cohort_id) {
+            cohort_trie.remove_slot(slot.id);
+            slot.cache_tokens.clear();
+            slot.n_past = 0;
+            slot.n_past_prompt = 0;
+            slot.cohort_reuse_count = 0;
+        }
+        slot.cohort_id = task.cohort_id;
+    }
 
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
     common_params_sampling default_sparams = params_base.sparams;
@@ -2117,6 +2169,7 @@ void server_context::kv_cache_clear() {
 
         common_speculative_clear_sequence(slot.spec, slot.id, true);
     }
+    cohort_trie.clear();
     clean_kv_cache = false;
 }
 
@@ -3777,7 +3830,7 @@ static bool verify_restored_checkpoint(
 {
     const llama_pos check_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
     if (check_pos != ckpt.pos_max) {
-        SLT_ERR(slot, "%srestore position mismatch: cache pos_max=%d != checkpoint pos_max=%d — state corrupted\n",
+        SLT_ERR(slot, "%srestore position mismatch: cache pos_max=%d != checkpoint pos_max=%d -- state corrupted\n",
             label, check_pos, ckpt.pos_max);
         return false;
     }
@@ -4423,6 +4476,11 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                     slot.n_decoded = 0;
                     slot.i_batch = batch.n_tokens - 1;
+
+                    if (params_base.cohort_prefix_sharing && !slot.prompt_tokens.has_mtmd_data()) {
+                        cohort_trie.insert_slot(slot.id, slot.prompt_tokens.get_text_tokens());
+                        slot.cohort_reuse_count++;
+                    }
 
                     LOG_VERBOSE("prompt done", {
                         {"id_slot",  slot.id},

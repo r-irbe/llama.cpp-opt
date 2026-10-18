@@ -105,6 +105,11 @@ add_library(${TARGET} STATIC
     jinja/string.h
     jinja/caps.cpp
     jinja/caps.h
+    npmc-discrete-structures.h
+    ccd-suffix-trie.h
+    paged-kv-cache.h
+    tiered-kv-cache.h
+    superchip-unified-pipeline.h
     )
 
 if (BUILD_SHARED_LIBS)

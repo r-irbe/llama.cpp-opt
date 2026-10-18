@@ -249,3 +249,56 @@ if (GGML_CUDA)
     llama_build_and_test(test-cuda-l2-persistence.cpp)
     target_include_directories(test-cuda-l2-persistence PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
+
+add_executable(test-npmc-structures test-npmc-structures.cpp)
+target_include_directories(test-npmc-structures PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-npmc-structures PRIVATE common)
+add_test(NAME test-npmc-structures COMMAND $<TARGET_FILE:test-npmc-structures>)
+
+add_executable(test-ccd-suffix-trie test-ccd-suffix-trie.cpp)
+target_include_directories(test-ccd-suffix-trie PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-ccd-suffix-trie PRIVATE common)
+add_test(NAME test-ccd-suffix-trie COMMAND $<TARGET_FILE:test-ccd-suffix-trie>)
+
+add_executable(test-paged-kv-cache test-paged-kv-cache.cpp)
+target_include_directories(test-paged-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-paged-kv-cache PRIVATE common)
+add_test(NAME test-paged-kv-cache COMMAND $<TARGET_FILE:test-paged-kv-cache>)
+
+add_executable(test-tiered-kv-cache test-tiered-kv-cache.cpp)
+target_include_directories(test-tiered-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-tiered-kv-cache PRIVATE common)
+add_test(NAME test-tiered-kv-cache COMMAND $<TARGET_FILE:test-tiered-kv-cache>)
+
+add_executable(test-superchip-pipeline test-superchip-pipeline.cpp)
+target_include_directories(test-superchip-pipeline PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-superchip-pipeline PRIVATE common)
+add_test(NAME test-superchip-pipeline COMMAND $<TARGET_FILE:test-superchip-pipeline>)
+
+add_executable(test-model-loader-npmc test-model-loader-npmc.cpp)
+target_include_directories(test-model-loader-npmc PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/ggml/include)
+target_link_libraries(test-model-loader-npmc PRIVATE llama common)
+add_test(NAME test-model-loader-npmc COMMAND $<TARGET_FILE:test-model-loader-npmc>)
+
+add_executable(test-cluster-pipeline test-cluster-pipeline.cpp)
+target_include_directories(test-cluster-pipeline PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-cluster-pipeline PRIVATE common)
+add_test(NAME test-cluster-pipeline COMMAND $<TARGET_FILE:test-cluster-pipeline>)
+
+add_executable(test-veb-layout test-veb-layout.cpp)
+target_include_directories(test-veb-layout PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-veb-layout PRIVATE common)
+add_test(NAME test-veb-layout COMMAND $<TARGET_FILE:test-veb-layout>)
+
+add_executable(test-unreal-selector test-unreal-selector.cpp)
+target_include_directories(test-unreal-selector PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(test-unreal-selector PRIVATE common llama)
+add_test(NAME test-unreal-selector COMMAND $<TARGET_FILE:test-unreal-selector>)
+
+add_executable(test-bitwise-veb test-bitwise-veb.cpp)
+target_include_directories(test-bitwise-veb PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-bitwise-veb PRIVATE common)
+add_test(NAME test-bitwise-veb COMMAND $<TARGET_FILE:test-bitwise-veb>)
+
+
+

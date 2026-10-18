@@ -426,6 +426,7 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    ggml_cpu_numa_free_all_replicas();
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -3223,7 +3224,7 @@ static void llm_requantize_output_tensor(llama_model & model, ggml_type new_type
 // the returned tensor (data pointing into tmp_buffer) is only valid until the
 // buffers are reused, and only its type/shape/data may be used: its src chain
 // and the populated graph reference stack locals of this function, so do not
-// walk the srcs or recompute the graph — clear it with ggml_graph_clear before
+// walk the srcs or recompute the graph -- clear it with ggml_graph_clear before
 // reuse. ctx/graph must be able to hold the ~8 nodes of the derivation.
 // Returns null if the graph computation fails.
 static ggml_tensor * llm_compute_wkv_b(ggml_context * ctx, ggml_cgraph * graph,
@@ -3521,7 +3522,7 @@ static void llm_prepare_mla(llama_model & model, int mla) {
             };
 
             // pp_opt-favoring wk_b_pp = quantize(wk_b_f32) directly (absorb-favoring
-            // wk_b above is its transpose). Not gated on mla — wk_b_pp shares wk_b_f32
+            // wk_b above is its transpose). Not gated on mla -- wk_b_pp shares wk_b_f32
             // with the wk_b synthesis above and skipping it breaks absorb on some
             // quant combinations. Second pass below gates the mla=1 saving for
             // GGUFs that ship wk_b directly.
@@ -5107,7 +5108,7 @@ static bool llm_load_tensors(
     }
 #endif
 
-    // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
+    // --dry-run skips MAP_POPULATE/WILLNEED -- tensor data is never read.
     ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run
 #if defined(_WIN32)
         && !win_skip_bulk_prefetch
@@ -5638,6 +5639,47 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             return -2;
         }
 
+        if (ggml::cpu::numa::is_numa_replicate_shared()) {
+            const int n_nodes = (int) ggml::cpu::numa::topology().size();
+            if (n_nodes > 1) {
+                int replicated_count = 0;
+                for (auto & layer : model.layers) {
+                    if (layer.ffn_gate_shexp && layer.ffn_gate_shexp->data && ggml_backend_buffer_is_host(layer.ffn_gate_shexp->buffer)) {
+                        ggml_cpu_numa_replicate_tensor(layer.ffn_gate_shexp, n_nodes);
+                        replicated_count++;
+                    }
+                    if (layer.ffn_up_shexp && layer.ffn_up_shexp->data && ggml_backend_buffer_is_host(layer.ffn_up_shexp->buffer)) {
+                        ggml_cpu_numa_replicate_tensor(layer.ffn_up_shexp, n_nodes);
+                        replicated_count++;
+                    }
+                    if (layer.ffn_down_shexp && layer.ffn_down_shexp->data && ggml_backend_buffer_is_host(layer.ffn_down_shexp->buffer)) {
+                        ggml_cpu_numa_replicate_tensor(layer.ffn_down_shexp, n_nodes);
+                        replicated_count++;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: replicated %d shared expert tensors across %d NUMA nodes\n", __func__, replicated_count, n_nodes);
+            }
+        }
+
+        if (ggml::cpu::numa::is_numa_expert()) {
+            const int n_nodes = (int) ggml::cpu::numa::topology().size();
+            if (n_nodes > 1) {
+                int bound_count = 0;
+                for (auto & layer : model.layers) {
+                    if (layer.ffn_gate_exps && layer.ffn_gate_exps->data && ggml_backend_buffer_is_host(layer.ffn_gate_exps->buffer)) {
+                        if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_gate_exps, n_nodes)) bound_count++;
+                    }
+                    if (layer.ffn_up_exps && layer.ffn_up_exps->data && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
+                        if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_up_exps, n_nodes)) bound_count++;
+                    }
+                    if (layer.ffn_down_exps && layer.ffn_down_exps->data && ggml_backend_buffer_is_host(layer.ffn_down_exps->buffer)) {
+                        if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_down_exps, n_nodes)) bound_count++;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: bound %d routed MoE expert tensors across %d NUMA nodes (strategy expert)\n", __func__, bound_count, n_nodes);
+            }
+        }
+
         const enum llama_mtp_package mtp_package = llama_model_mtp_package(&model);
         if (mtp_package == LLAMA_MTP_PACKAGE_INVALID) {
             throw std::runtime_error("invalid MTP package: missing target trunk and predictor tail tensors");
@@ -5812,11 +5854,42 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
         const ggml_tensor * w = il < model.layers.size() ? model.layers[il].engram_embd : nullptr;
         if (w && w->data && w->buffer && ggml_backend_buffer_is_host(w->buffer)) {
             const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+            std::vector<std::pair<uintptr_t, uintptr_t>> page_ranges;
+            page_ranges.reserve(idx.size());
             for (int32_t id : idx) {
                 const uintptr_t a     = (uintptr_t) w->data + (size_t) id * w->nb[1];
                 const uintptr_t first = a & ~(uintptr_t) (page - 1);
                 const uintptr_t last  = (a + w->nb[1] + page - 1) & ~(uintptr_t) (page - 1);
-                posix_madvise((void *) first, last - first, POSIX_MADV_WILLNEED);
+                page_ranges.emplace_back(first, last);
+            }
+            if (!page_ranges.empty()) {
+                std::sort(page_ranges.begin(), page_ranges.end());
+
+                // Merge overlapping and adjacent page ranges to minimize madvise syscall count
+                size_t merged_idx = 0;
+                for (size_t i = 1; i < page_ranges.size(); ++i) {
+                    if (page_ranges[i].first <= page_ranges[merged_idx].second) {
+                        page_ranges[merged_idx].second = std::max(page_ranges[merged_idx].second, page_ranges[i].second);
+                    } else {
+                        ++merged_idx;
+                        page_ranges[merged_idx] = page_ranges[i];
+                    }
+                }
+                page_ranges.resize(merged_idx + 1);
+
+                for (const auto & range : page_ranges) {
+                    const size_t len = range.second - range.first;
+#if defined(__linux__)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+                    if (madvise((void *) range.first, len, MADV_POPULATE_READ) != 0) {
+                        madvise((void *) range.first, len, MADV_WILLNEED);
+                    }
+#else
+                    posix_madvise((void *) range.first, len, POSIX_MADV_WILLNEED);
+#endif
+                }
             }
         }
     }
@@ -5858,7 +5931,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // ASSUMPTION (latent today): min(pos) over the whole [0,n_kv) span equals the sequence's
         // genuine first-present token only for a NON-SLIDING cache. GLM_DSA has no SWA, so the
         // oldest cell of a seq is its true sink; if SWA were ever added, the window could evict the
-        // real sink and min(pos) would anchor on the wrong (window-floor) cell — revisit then.
+        // real sink and min(pos) would anchor on the wrong (window-floor) cell -- revisit then.
         std::unordered_map<llama_seq_id, llama_pos> seq_min_pos;
         for (int64_t i = 0; i < n_kv; ++i) {
             const auto & cell = kv_self.cells[i];
@@ -6639,7 +6712,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
             // For causal models running in non-causal mode (e.g., Gemma-4 image decode),
             // the flash-attn mask is allocated as [n_kv, n_tokens_pad] and must be filled
-            // using KV cache cell metadata — not batch-token indices — because image tokens
+            // using KV cache cell metadata -- not batch-token indices -- because image tokens
             // occupy cells starting at n_past, not at cell 0.
             // swa_full_non_causal: in a non-causal (image) span the window only clips
             // cells older than the span; in-span cells attend fully. Track each span start.
@@ -8873,6 +8946,7 @@ struct llama_context_params llama_context_default_params() {
         /*.fused_idx_topk              =*/ true,
         /*.swa_compress                =*/ false,
         /*.dsv4_legacy_state           =*/ false,
+        /*.zdd_sparse_kv               =*/ false,
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
@@ -8998,8 +9072,8 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
 
         ggml::cpu::numa::set_numa_expert(true);
         ggml_numa_init(numa);
-        LLAMA_LOG_WARN("%s: --numa expert requested with %zu nodes, but expert sharding is not wired: "
-                "no tensor is bound to a node (see docs/UNIMPLEMENTED.md)\n", __func__, topo.size());
+        LLAMA_LOG_INFO("%s: --numa expert enabled with %zu nodes; routed MoE tensors will be bound across NUMA nodes\n",
+                __func__, topo.size());
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
 
@@ -9437,6 +9511,7 @@ struct llama_context * llama_init_from_model(
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;
     cparams.dsv4_legacy_state = params.dsv4_legacy_state;
+    cparams.zdd_sparse_kv    = params.zdd_sparse_kv;
     cparams.dsa_top_k        = params.dsa_top_k;
 
     if (cparams.swa_compress != model->swa_compress) {
@@ -10307,6 +10382,53 @@ int32_t llama_model_n_embd(const struct llama_model * model) {
 
 int32_t llama_model_n_embd_inp(const llama_model* model) {
     return model->hparams.n_embd_inp();
+}
+
+bool llama_model_get_token_embedding(const struct llama_model * model, llama_token token, float * dest) {
+    if (!model || !dest) {
+        return false;
+    }
+    const struct ggml_tensor * t = model->tok_embd ? model->tok_embd : model->tok_embd_per_layer;
+    if (!t) {
+        return false;
+    }
+    const int64_t n_embd = t->ne[0];
+    const int64_t n_vocab = t->ne[1];
+    if (token < 0 || token >= n_vocab) {
+        return false;
+    }
+
+    const size_t row_size = ggml_row_size(t->type, n_embd);
+    const size_t offset = (size_t)token * t->nb[1];
+
+    if (t->type == GGML_TYPE_F32) {
+        if (t->data != nullptr) {
+            memcpy(dest, (const char *)t->data + offset, n_embd * sizeof(float));
+            return true;
+        } else if (t->buffer != nullptr) {
+            ggml_backend_tensor_get(t, dest, offset, n_embd * sizeof(float));
+            return true;
+        }
+        return false;
+    }
+
+    auto type_traits = ggml_internal_get_type_traits(t->type);
+    if (!type_traits.to_float) {
+        return false;
+    }
+
+    if (t->data != nullptr) {
+        const char * src = (const char *)t->data + offset;
+        type_traits.to_float(src, dest, n_embd);
+        return true;
+    } else if (t->buffer != nullptr) {
+        std::vector<uint8_t> row_buf(row_size);
+        ggml_backend_tensor_get(t, row_buf.data(), offset, row_size);
+        type_traits.to_float(row_buf.data(), dest, n_embd);
+        return true;
+    }
+
+    return false;
 }
 
 int32_t llama_n_layer(const struct llama_model * model) {
@@ -11484,7 +11606,7 @@ struct llama_data_write {
             write_openpangu_state(ctx, seq_id, false);
         }
 
-        // DSV4 compressed indexer cache (only for DSV4 models — preserves
+        // DSV4 compressed indexer cache (only for DSV4 models -- preserves
         // the old file layout for all other architectures)
         if (llm_arch_is_dsv4(ctx->model.arch) && ctx->dsv4.cache.cache_ctx != nullptr) {
             // --dsv4-legacy-state: emit the pre-PR full-slice layout (no MAGIC,

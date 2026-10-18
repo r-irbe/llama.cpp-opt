@@ -506,6 +506,7 @@ extern "C" {
         bool fused_idx_topk;    // enable the fused indexer topk op (on by default) [EXPERIMENTAL]
         bool swa_compress;      // allocate sliding-window layers at window size instead of n_ctx (off by default) [EXPERIMENTAL]
         bool dsv4_legacy_state; // write DeepSeek-V4 state in the legacy full-slice layout (no MAGIC), byte-identical to main [EXPERIMENTAL]
+        bool zdd_sparse_kv;     // enable Minato ZDD sparse KV block indexing [EXPERIMENTAL]
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
         float thresh_experts;
@@ -672,6 +673,15 @@ extern "C" {
     LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp(const struct llama_model* model);
+
+    // Retrieve float embedding vector for a given token from model.tok_embd.
+    // If the tensor is quantized, it is automatically dequantized to float.
+    // dest must point to an allocated buffer of at least llama_model_n_embd(model) floats.
+    // Returns true on success, false if token is invalid or model has no token embedding tensor.
+    LLAMA_API bool llama_model_get_token_embedding(
+        const struct llama_model * model,
+        llama_token token,
+        float * dest);
 
     LLAMA_API int32_t llama_n_layer    (const struct llama_model * model);
 
@@ -1333,7 +1343,7 @@ extern "C" {
     /// Apply chat template. Inspired by hf apply_chat_template() on python.
     /// Both "model" and "custom_template" are optional, but at least one is required. "custom_template" has higher precedence than "model"
     /// NOTE: This function does not use a jinja parser. It only support a pre-defined list of template. See more: https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template
-    /// @param tmpl A Jinja template to use for this chat. If this is nullptr, the model’s default chat template will be used instead.
+    /// @param tmpl A Jinja template to use for this chat. If this is nullptr, the model's default chat template will be used instead.
     /// @param chat Pointer to a list of multiple llama_chat_message
     /// @param n_msg Number of llama_chat_message in this chat
     /// @param add_ass Whether to end the prompt with the token(s) that indicate the start of an assistant message.
