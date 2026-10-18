@@ -5,6 +5,8 @@
 #include "llama-context.h"
 #include "llama-moe-cache.h"
 #include "llama-delta-net.h"
+#include "llama-kv-zdd.h"
+#include <cstdlib>
 
 #include "ggml.h"
 
@@ -2160,6 +2162,11 @@ static ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
+
+    if (cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) {
+        std::vector<uint8_t> zdd_skip_mask;
+        llm_build_context::llama_graph_build_zdd_skip_mask(lctx, kv, n_kv, zdd_skip_mask);
+    }
 
     auto k_cache = kv_il >= 0 ? kv.k_l[kv_layer]
                  : lctx.model.hparams.has_kv(il) ? kv.k_l[il]

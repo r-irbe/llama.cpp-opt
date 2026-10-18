@@ -9,6 +9,8 @@
 
 struct llama_model;
 class llama_moe_cache;
+class common_paged_kv_cache;
+class common_tiered_kv_cache;
 
 #include <vector>
 #include <map>
@@ -366,6 +368,8 @@ struct llama_context {
 
     std::vector<ggml_backend_t> backends;
     std::unique_ptr<llama_moe_cache> moe_cache;
+    std::unique_ptr<common_paged_kv_cache> paged_kv;
+    std::unique_ptr<common_tiered_kv_cache> tiered_kv;
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif

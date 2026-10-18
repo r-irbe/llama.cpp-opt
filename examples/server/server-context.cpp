@@ -1121,25 +1121,36 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         }
     }
 
-    // find the slot that has been least recently used
+    // find an available slot: prefer empty slots first, then pick victim by weighted LFU/LRU
     if (ret == nullptr) {
-        int64_t t_last = ggml_time_us();
         for (server_slot& slot : slots) {
-            // skip the slot if it is not available
+            if (slot.available() && slot.cache_tokens.empty()) {
+                ret = &slot;
+                break;
+            }
+        }
+    }
+
+    if (ret == nullptr) {
+        double best_score = 1e30;
+        int64_t now_us = ggml_time_us();
+        for (server_slot& slot : slots) {
             if (!slot.available()) {
                 continue;
             }
-            // select the current slot if the criteria match
-            if (slot.t_last_used < t_last) {
-                t_last = slot.t_last_used;
+            // Weighted LFU/LRU: lower reuse count and older access time makes a slot more attractive for eviction
+            double age_s = std::max(0.001, (double)(now_us - slot.t_last_used) / 1000000.0);
+            double score = (double)(slot.cohort_reuse_count + 1) / age_s;
+            if (score < best_score) {
+                best_score = score;
                 ret = &slot;
             }
         }
 
         if (ret != nullptr) {
-            LOG_VERBOSE("selected slot by lru", {
+            LOG_VERBOSE("selected slot by weighted lfu/lru", {
                 {"id_slot", ret->id},
-                {"t_last", t_last},
+                {"score", best_score},
                 });
         }
     }

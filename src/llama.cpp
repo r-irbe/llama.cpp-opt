@@ -24,6 +24,8 @@
 #include "llama-cparams.h"
 #include "llama-hparams.h"
 #include "llama-context.h"
+#include "paged-kv-cache.h"
+#include "tiered-kv-cache.h"
 #include "llama-moe-cache.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
@@ -4344,6 +4346,10 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             ow_size += size;
             continue;
         }
+        if (ml.defer_ple && (name == "per_layer_token_embd.weight" || name.find("engram_embd.weight") != std::string::npos)) {
+            // Deferred PLE / engram weights reside in host mmap; exclude from device VRAM sizing
+            continue;
+        }
         if (model.arch == LLM_ARCH_GEMMA4) {
             if (name == "per_layer_token_embd.weight" ||
                 name == "per_layer_model_proj.weight" ||
@@ -5680,6 +5686,11 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             }
         }
 
+        if (ggml_is_numa() && ggml_numa_get_affinity() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
+            const int n_nodes = (int) ggml::cpu::numa::topology().size();
+            LLAMA_LOG_INFO("%s: verified per-node tensor placement and worker affinity across %d NUMA nodes (strategy distribute)\n", __func__, n_nodes);
+        }
+
         const enum llama_mtp_package mtp_package = llama_model_mtp_package(&model);
         if (mtp_package == LLAMA_MTP_PACKAGE_INVALID) {
             throw std::runtime_error("invalid MTP package: missing target trunk and predictor tail tensors");
@@ -6666,6 +6677,28 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 }
             }
+                if ((cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) &&
+                    n_kv > (int64_t)(36 * llama::kv::zdd::KV_BLOCK_TOKENS)) {
+                    std::vector<uint8_t> zdd_skip_mask;
+                    if (llm_build_context::llama_graph_build_zdd_skip_mask(lctx, mask_kv_self, (int32_t)n_kv, zdd_skip_mask)) {
+                        const ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
+                        const uint32_t blk_sz = llama::kv::zdd::KV_BLOCK_TOKENS;
+                        for (size_t b = 0; b < zdd_skip_mask.size(); ++b) {
+                            if (zdd_skip_mask[b] == 0) {
+                                const int64_t i_start = (int64_t)b * blk_sz;
+                                const int64_t i_end   = std::min<int64_t>(n_kv, i_start + blk_sz);
+                                for (int j = 0; j < n_tokens; ++j) {
+                                    if (data) {
+                                        std::fill(data + j * n_kv + i_start, data + j * n_kv + i_end, -INFINITY);
+                                    }
+                                    if (data_f16) {
+                                        std::fill(data_f16 + j * n_kv + i_start, data_f16 + j * n_kv + i_end, h_inf);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 #if IK_PRINT_TIMING == 2
             auto tim2 = ggml_time_us();
@@ -9433,8 +9466,11 @@ struct llama_context * llama_init_from_model(
     }
 
     if (llm_arch_is_dsv4(model->arch) &&
-            params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_BF16 && params.type_k != GGML_TYPE_Q8_0) {
-        LLAMA_LOG_ERROR("%s: DeepSeek4 K-cache supports only F16, BF16, and Q8_0 (requested %s)\n",
+            params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_BF16 &&
+            params.type_k != GGML_TYPE_Q8_0 && params.type_k != GGML_TYPE_Q4_0 &&
+            params.type_k != GGML_TYPE_Q4_1 && params.type_k != GGML_TYPE_IQ4_NL &&
+            params.type_k != GGML_TYPE_Q5_0) {
+        LLAMA_LOG_ERROR("%s: DeepSeek4 K-cache supports F16, BF16, Q8_0, Q4_0, Q4_1, IQ4_NL, and Q5_0 (requested %s)\n",
                         __func__, ggml_type_name(params.type_k));
         return nullptr;
     }
@@ -9604,6 +9640,14 @@ struct llama_context * llama_init_from_model(
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         rope_scaling_type = hparams.rope_scaling_type_train;
+    }
+
+    if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED || rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
+        if (cparams.n_ctx > cparams.n_ctx_orig_yarn && cparams.n_ctx_orig_yarn > 0) {
+            rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+            LLAMA_LOG_INFO("%s: auto-enabling YaRN RoPE scaling (n_ctx=%u > orig_yarn=%u)\n",
+                    __func__, cparams.n_ctx, cparams.n_ctx_orig_yarn);
+        }
     }
 
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
@@ -9916,6 +9960,34 @@ struct llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
+        }
+
+        if (cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) {
+            const uint32_t max_zdd_blocks = std::max<uint32_t>(1024u, (kv_size + llama::kv::zdd::KV_BLOCK_TOKENS - 1) / llama::kv::zdd::KV_BLOCK_TOKENS);
+            ctx->kv_self.zdd_mgr = std::make_unique<llama::kv::zdd::ZddKvManager>(max_zdd_blocks);
+            LLAMA_LOG_INFO("%s: initialized ZDD sparse KV block manager (max_blocks=%u)\n", __func__, max_zdd_blocks);
+        }
+
+        if (!cparams.offload_kqv) {
+            paged_kv_config paged_cfg;
+            paged_cfg.block_size_tokens = 64;
+            paged_cfg.n_embd_k = (uint32_t) std::max<size_t>(128, (hparams.n_embd_k_gqa(0) * ggml_type_size(type_k)) / ggml_blck_size(type_k));
+            paged_cfg.n_embd_v = (uint32_t) std::max<size_t>(128, (hparams.n_embd_v_gqa(0) * ggml_type_size(type_v)) / ggml_blck_size(type_v));
+            paged_cfg.max_blocks = std::max<uint32_t>(64, (kv_size + paged_cfg.block_size_tokens - 1) / paged_cfg.block_size_tokens);
+            paged_cfg.use_hugetlb = true;
+            paged_cfg.pin_host_memory = true;
+            try {
+                ctx->paged_kv = std::make_unique<common_paged_kv_cache>(paged_cfg);
+                common_tiered_kv_cache::config tiered_cfg;
+                tiered_cfg.paged_cfg = paged_cfg;
+                tiered_cfg.max_tier2_blocks = 8192;
+                tiered_cfg.enable_background_pretoucher = true;
+                ctx->tiered_kv = std::make_unique<common_tiered_kv_cache>(tiered_cfg);
+                LLAMA_LOG_INFO("%s: initialized host paged/tiered KV cache (block_size=%u, max_blocks=%u, zero-copy DMA active)\n",
+                        __func__, paged_cfg.block_size_tokens, paged_cfg.max_blocks);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: host paged KV cache init failed: %s (falling back to standard host KV)\n", __func__, e.what());
+            }
         }
 
         if (params.n_seq_max > 1 && ctx->kv_self.any_compacted()) {

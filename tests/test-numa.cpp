@@ -183,6 +183,7 @@ int main() {
 
     printf("numa expert registration & backend verification\n");
     {
+        check(ggml_numa_get_affinity() == GGML_NUMA_STRATEGY_DISABLED, "initial ggml_numa_get_affinity is disabled");
         const enum llama_numa_init_status status = llama_numa_init_ex(GGML_NUMA_STRATEGY_EXPERT);
 
         if (topology().size() < 2) {
@@ -190,6 +191,8 @@ int main() {
         } else {
             check(status == LLAMA_NUMA_INIT_STATUS_SUCCESS, "expert initialized");
             check(is_numa_expert(), "is_numa_expert reports true");
+            check(ggml_numa_get_affinity() == GGML_NUMA_STRATEGY_EXPERT, "ggml_numa_get_affinity reports expert");
+            check(ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_EXPERT, "ggml_numa_get_strategy reports expert");
 
             for (const auto & n : topology()) {
                 const std::string expected = "CPU" + std::to_string(n.id);

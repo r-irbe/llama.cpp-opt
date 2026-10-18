@@ -1336,6 +1336,25 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "-tgb" || arg == "--threads-gen-batch") {
+        CHECK_ARG
+        std::string val = argv[i];
+        auto comma_pos = val.find(',');
+        if (comma_pos != std::string::npos) {
+            params.n_threads = std::stoi(val.substr(0, comma_pos));
+            params.n_threads_batch = std::stoi(val.substr(comma_pos + 1));
+        } else {
+            params.n_threads = std::stoi(val);
+            params.n_threads_batch = params.n_threads;
+        }
+        if (params.n_threads <= 0) {
+            params.n_threads = std::thread::hardware_concurrency();
+        }
+        if (params.n_threads_batch <= 0) {
+            params.n_threads_batch = std::thread::hardware_concurrency();
+        }
+        return true;
+    }
     if (arg == "-tm" || arg == "--threads-mtmd") {
         CHECK_ARG
         params.n_threads_mtmd = std::stoi(argv[i]);

@@ -944,8 +944,10 @@ extern "C" {
     // accepts a UTF-8 path, even on Windows
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
-    GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
-    GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_API void                    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
+    GGML_API bool                    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_API enum ggml_numa_strategy ggml_numa_get_affinity(void);
+    GGML_API enum ggml_numa_strategy ggml_numa_get_strategy(void);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);

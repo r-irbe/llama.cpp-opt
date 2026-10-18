@@ -1,4 +1,5 @@
 #include "llama-mmap.h"
+#include "llama-io-uring.h"
 
 #include "llama-impl.h"
 
@@ -306,12 +307,29 @@ struct llama_mmap::impl {
             if (addr != MAP_FAILED) {
                 printf("%s: using THP with page size %zu MiB ", __func__, huge/(1024*1024));
                 fflush(stdout);
-                size_t tot = 0;
-                while (tot < file->size()) {
-                    auto n_read = pread(fd, static_cast<char*>(addr) + tot, file->size() - tot, tot);
-                    if (n_read < 0) throw std::runtime_error(format("Reading into mapped huge pages failed at %zu (%s)", tot, strerror(errno)));
-                    printf(".");  fflush(stdout);
-                    tot += n_read;
+                bool uring_ok = false;
+#if defined(__linux__)
+                if (llama_io_uring_available()) {
+                    llama_io_uring_config iocfg;
+                    iocfg.try_sqpoll = true;
+                    iocfg.try_direct_io = true;
+                    iocfg.try_register_buffers = true;
+                    llama_io_uring_stats stats;
+                    uring_ok = llama_io_uring_read_fd(fd, addr, file->size(), size, iocfg, &stats);
+                    if (uring_ok) {
+                        printf("(io_uring DMA: %.2f GB/s, direct=%d, sqpoll=%d)",
+                               stats.throughput_gb_s, (int)stats.used_direct_io, (int)stats.used_sqpoll);
+                    }
+                }
+#endif
+                if (!uring_ok) {
+                    size_t tot = 0;
+                    while (tot < file->size()) {
+                        auto n_read = pread(fd, static_cast<char*>(addr) + tot, file->size() - tot, tot);
+                        if (n_read < 0) throw std::runtime_error(format("Reading into mapped huge pages failed at %zu (%s)", tot, strerror(errno)));
+                        printf(".");  fflush(stdout);
+                        tot += n_read;
+                    }
                 }
                 printf(" done\n");
                 mapped_fragments.emplace_back(0, file->size());

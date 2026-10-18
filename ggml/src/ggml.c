@@ -4943,13 +4943,13 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         return;
     }
 
+    // set numa scheme
+    g_state.numa.numa_strategy = numa_flag;
+
 #if defined(__gnu_linux__)
     struct stat st;
     char path[256];
     int rv;
-
-    // set numa scheme
-    g_state.numa.numa_strategy = numa_flag;
 
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
 
@@ -5026,6 +5026,14 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+enum ggml_numa_strategy ggml_numa_get_affinity(void) {
+    return g_state.numa.numa_strategy;
+}
+
+enum ggml_numa_strategy ggml_numa_get_strategy(void) {
+    return g_state.numa.numa_strategy;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

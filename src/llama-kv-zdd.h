@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // ZDD/SDD Compressed KV Cache Block Indexer
-// Theoretical Foundation: Minato (1993), Knuth TAOCP Vol 4A §7.1.4, Darwiche (2011)
+// Theoretical Foundation: Minato (1993), Knuth TAOCP Vol 4A sec. 7.1.4, Darwiche (2011)
 //
 // Represents active block manifolds for extreme context windows (128k - 512k tokens).
 // In 512k context, >85% of 64-token KV blocks have attention weights < 10^-4.
@@ -114,7 +114,7 @@ public:
         return curr;
     }
 
-    /// Recursive Minato ZDD Union: F ∪ G
+    /// Recursive Minato ZDD Union: F union G
     uint32_t zdd_union(uint32_t p, uint32_t q) {
         if (p == ZDD_EMPTY) return q;
         if (q == ZDD_EMPTY) return p;
@@ -379,6 +379,27 @@ public:
 
 private:
     std::vector<ClusterEntry> clusters_;
+};
+
+/// High-Performance Attention Kernel Block Skipping Helper
+/// Evaluates active block manifolds to skip inactive KV blocks during CPU/CUDA FlashAttention
+struct ZddAttentionBlockSkipper {
+    /// Returns true if the block is active and should be evaluated; false if it can be skipped.
+    static inline bool is_block_active(uint32_t block_id, const std::vector<uint32_t> & active_blocks) {
+        return std::binary_search(active_blocks.begin(), active_blocks.end(), block_id);
+    }
+
+    /// Generates a fast lookup bitmask/byte-array for O(1) block skipping in attention loops:
+    /// mask[block_id] == 1 means process block; mask[block_id] == 0 means skip block.
+    static inline std::vector<uint8_t> generate_skip_mask(uint32_t total_blocks, const std::vector<uint32_t> & active_blocks) {
+        std::vector<uint8_t> mask(total_blocks, 0);
+        for (uint32_t b : active_blocks) {
+            if (b < total_blocks) {
+                mask[b] = 1;
+            }
+        }
+        return mask;
+    }
 };
 
 } // namespace llama::kv::zdd

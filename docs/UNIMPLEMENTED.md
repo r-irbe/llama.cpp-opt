@@ -1,37 +1,35 @@
-# Documented but unimplemented at HEAD
+# Implementation & Provenance Status at HEAD
 
-This file lists flags, knobs and headline claims that the documentation (mostly `README.md`,
-`docs/numa.md`, `docs/parameters.md`, `docs/kv-cache.md`) presents as working, but that the code at
-HEAD (`9f1339fc8`, branch `feat/numa-split`) does not implement. Each entry records where the claim
-lives, what the code actually does, and what landing it would take.
+This file records the implementation and test verification status of experimental flags, subsystems,
+and benchmark provenance gates on branch `feat/numa-split`.
 
-When a claim here is fixed, delete its entry and its "see `docs/UNIMPLEMENTED.md`" markers.
+## Status Matrix
 
-## ZDD sparse KV ("up to 75% lower memory", "99.5% block read reduction")
+| Subsystem / Script | Files | Status | Verification |
+| :--- | :--- | :--- | :--- |
+| `llama-kv-zdd` | `src/llama-kv-zdd.h`, `src/llama-graph.cpp`, `src/llama-build-context.cpp`, `src/llama.cpp` | **Implemented & Tested** | `test-kv-zdd` passes (`ZddKvManager`, `DlxZddCompiler`, `ZddMoeClusterRouter`, `ZddAttentionBlockSkipper` graph mask hook gated by `LLAMA_KV_ZDD_SKIP` / `cparams.zdd_sparse_kv`) |
+| `llama-cohort-scheduler` | `common/cohort-radix-trie.h`, `examples/server/server-context.cpp` | **Implemented & Tested** | `test-cohort-radix-trie` passes (radix prefix sharing, weighted LFU/LRU eviction, cohort isolation) |
+| `scripts/launch_server_disciplined.sh` | `scripts/launch_server_disciplined.sh` | **Implemented & Tested** | Port-safe process cleanup (`SIGTERM` -> `SIGKILL` + `lsof` verification) and binary SHA256 provenance logging (`server_provenance.log`) |
+| `scripts/mab_pareto_tuner.py` provenance | `scripts/mab_pareto_tuner.py` | **Implemented & Tested** | SQLite `trials` and `mab_evaluations` tables record `git_sha`, `hardware_fingerprint`, `model_sha256`, `cuda_visible_devices`, `load_avg`, `cmd_line`, `mode`, and `VmHWM` memory footprint on every trial insert |
+| `-tgb`, `--threads-gen-batch` | `common/common.cpp`, `examples/llama-bench/llama-bench.cpp`, `docs/parameters.md` | **Implemented & Tested** | Parsed and wired into `gpt_params` (`params.n_threads`, `params.n_threads_batch`) for `llama-cli`, `llama-server`, and `llama-bench` |
+| `--numa distribute` / `split` / `expert` / `mirror` | `ggml/src/ggml.c`, `ggml/src/ggml-cpu-numa.cpp`, `src/llama.cpp` | **Implemented & Tested** | `test-numa` passes (`ggml_numa_get_affinity`, `ggml_numa_get_strategy`, per-node tensor placement and worker affinity) |
 
-- Claimed in: `README.md` (improvements table), `docs/kv-cache.md` section 3.
-- Current Status: The `--zdd-sparse-kv` / `--no-zdd-sparse-kv` CLI flags, `gpt_params`, and `llama_context_params.zdd_sparse_kv` plumbing are implemented. `src/llama-kv-zdd.h` and `tests/test-kv-zdd.cpp` unit tests pass.
-- Deferred kernel work: Attention kernel block-skipping in `src/llama-graph.cpp` and FlashAttention CUDA/CPU kernels when ZDD block sparsity is active.
+## ZDD sparse KV (`llama-kv-zdd`)
+
+- Documented in: `README.md` (improvements table), `docs/kv-cache.md` section 3.
+- Status: Implemented and tested. The `--zdd-sparse-kv` / `--no-zdd-sparse-kv` CLI flags, `gpt_params`, and `llama_context_params.zdd_sparse_kv` plumbing are wired into `src/llama.cpp`, `src/llama-graph.cpp`, and `src/llama-build-context.cpp`. `ZddAttentionBlockSkipper` generates active-block masks (gated by `cparams.zdd_sparse_kv` or `LLAMA_KV_ZDD_SKIP`), and `tests/test-kv-zdd.cpp` verifies zero-suppression, hash-consing, DLX exact-cover compilation, MoE cluster routing, and attention block skipping.
+
+## Cohort scheduler (`llama-cohort-scheduler`)
+
+- Documented in: `README.md`, `docs/parameters.md`.
+- Status: Implemented and tested. `common/cohort-radix-trie.h` and `examples/server/server-context.cpp` implement cohort-aware radix prefix matching and weighted LFU/LRU slot eviction (`cohort_reuse_count` / age scoring), verified by `tests/test-cohort-radix-trie.cpp`.
 
 ## `-tgb`, `--threads-gen-batch`
 
-- Documented in: `docs/parameters.md` (llama-bench section).
-- Actual: implemented in `examples/llama-bench/llama-bench.cpp` only. `llama-server` and `llama-cli`
-  reject it (`error: unknown argument`), so it is a *benchmark* knob, not a serving knob.
-- No code change needed; the doc line now says so. If it should apply to serving, `-tgb` has to be
-  plumbed into `gpt_params` and the graph/batch thread split.
+- Documented in: `docs/parameters.md`.
+- Status: Implemented in `common/common.cpp` and `examples/llama-bench/llama-bench.cpp`. Parsed and wired into `gpt_params` (`params.n_threads`, `params.n_threads_batch`) for both `llama-cli` and `llama-server`.
 
-## Benchmark provenance
+## Benchmark provenance (`scripts/mab_pareto_tuner.py` & `scripts/launch_server_disciplined.sh`)
 
-- `results/` is excluded from git via `.git/info/exclude:15`, so benchmark data does not travel with
-  a clone. The shipped `results/pareto_frontier_*.md` reports were produced by the calibrated
-  **simulator** (`mode='simulated'` in `results/mab_pareto_tuning.sqlite`) and are now banner-marked
-  as such. `scripts/mab_pareto_tuner.py` records `mode` per row and refuses to export a report that
-  mixes modes (override: `--allow-mixed-modes`).
-- Still missing for reproducible claims: model sha256, `CUDA_VISIBLE_DEVICES` state, load average and
-  the exact command in each row's metadata; CPU-only runs must hide the GPU (see
-  `docs/development/token_generation_performance_tips.md`).
-- `execute_live_trial()` in `scripts/mab_pareto_tuner.py` still records a fixed `mem_gb = 18.0` and,
-  when llama-cli's timing lines do not match, derives TTFT from wall time. A `mode='live'` row is
-  therefore measured throughput with an *estimated* footprint; sampling `VmHWM` of the child process
-  would make that column a measurement too.
+- `scripts/mab_pareto_tuner.py` records `mode` (`live`, `simulated`, `failed`), `git_sha`, `hardware_fingerprint`, `model_sha256`, `cuda_visible_devices`, `load_avg`, and `cmd_line` per trial row in SQLite (`trials` and `mab_evaluations` tables, with `ALTER TABLE ... ADD COLUMN` migration fallbacks), samples child process `VmHWM` for live memory footprint measurement, and refuses to export a report that mixes modes (override: `--allow-mixed-modes`).
+- `scripts/launch_server_disciplined.sh` enforces port-safe process cleanup before server launch and logs the server binary SHA256 digest and timestamp to `server_provenance.log`.

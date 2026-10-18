@@ -23,14 +23,14 @@ int main() {
     // 1. Minato Zero-Suppression Rule: node(v, low, ZDD_EMPTY) == low
     uint32_t s1 = mgr.get_node(10, ZDD_EMPTY, ZDD_EMPTY);
     assert(s1 == ZDD_EMPTY);
-    printf("[✓] Minato Zero-Suppression test passed: high=EMPTY -> returns EMPTY directly.\n");
+    printf("[OK] Minato Zero-Suppression test passed: high=EMPTY -> returns EMPTY directly.\n");
 
     // 2. Canonical Singleton & Hash-Consing
     uint32_t single_5 = mgr.singleton(5);
     uint32_t single_5_dup = mgr.singleton(5);
     assert(single_5 == single_5_dup);
     assert(single_5 > ZDD_BASE);
-    printf("[✓] Hash-Consing test passed: Canonical node ID = %u\n", single_5);
+    printf("[OK] Hash-Consing test passed: Canonical node ID = %u\n", single_5);
 
     // 3. 512k Context Sparse Block Indexing (524,288 tokens / 64 = 8,192 blocks)
     const uint32_t total_tokens = 524288;
@@ -50,7 +50,7 @@ int main() {
     float bandwidth_saving = mgr.calculate_bandwidth_saving(total_tokens, root);
     printf("[*] KV DRAM Bandwidth Savings : %.2f%%\n", bandwidth_saving * 100.0f);
     assert(bandwidth_saving >= 0.70f); // Must achieve >= 70% bandwidth reduction
-    printf("[✓] Verified Bandwidth Reduction >= 70%%: Actual = %.2f%%\n", bandwidth_saving * 100.0f);
+    printf("[OK] Verified Bandwidth Reduction >= 70%%: Actual = %.2f%%\n", bandwidth_saving * 100.0f);
 
     // 4. Benchmarking Traversal Latency
     const int N_ITERS = 100000;
@@ -63,7 +63,7 @@ int main() {
     double avg_ns = total_ns / N_ITERS;
     printf("[*] Average Traversal Latency : %.2f ns per query\n", avg_ns);
     assert(avg_ns < 100.0); // Must be sub-100ns (target < 50ns)
-    printf("[✓] Verified Sub-50ns/Sub-100ns Target: %.2f ns\n", avg_ns);
+    printf("[OK] Verified Sub-50ns/Sub-100ns Target: %.2f ns\n", avg_ns);
 
     // 5. Knuth DLX-to-ZDD Exact Cover Compilation for MoE Expert Groups
     printf("\n--- Section 5.1: Knuth DLX-to-ZDD Exact Cover Test ---\n");
@@ -84,7 +84,7 @@ int main() {
     std::vector<uint32_t> solution_rows;
     dlx_compiler.extract_first_solution(ec_root, solution_rows);
     assert(solution_rows.size() == 2);
-    printf("[✓] Knuth DLX-to-ZDD Exact Cover solved: %zu rows cover all 4 items.\n", solution_rows.size());
+    printf("[OK] Knuth DLX-to-ZDD Exact Cover solved: %zu rows cover all 4 items.\n", solution_rows.size());
     printf("[*] ZDD Exact Cover Graph Size : %zu nodes\n", dlx_compiler.node_count());
 
     // 6. MoE Cluster Router Sub-50ns Resolution Test
@@ -108,11 +108,23 @@ int main() {
     avg_ns = total_ns / N_ITERS;
     printf("[*] MoE Top-8 Expert Cluster Resolution Latency: %.2f ns\n", avg_ns);
     assert(avg_ns < 50.0); // Target < 50 ns
-    printf("[✓] Verified Sub-50ns MoE Cluster Resolution Target: %.2f ns (Resolved %zu clusters)\n",
+    printf("[OK] Verified Sub-50ns MoE Cluster Resolution Target: %.2f ns (Resolved %zu clusters)\n",
            avg_ns, resolved_clusters.size());
 
+    // 7. Attention Kernel ZDD Block Skipping Test
+    printf("\n--- Section 7: ZDD Attention Kernel Block Skipping Test ---\n");
+    auto skip_mask = ZddAttentionBlockSkipper::generate_skip_mask(total_blocks, active_blocks);
+    assert(skip_mask.size() == total_blocks);
+    // Sink block 0 must be active
+    assert(skip_mask[0] == 1);
+    assert(ZddAttentionBlockSkipper::is_block_active(0, active_blocks));
+    // Middle block (e.g. block 100) outside sink & window must be skipped
+    assert(skip_mask[100] == 0);
+    assert(!ZddAttentionBlockSkipper::is_block_active(100, active_blocks));
+    printf("[OK] Verified ZDD Attention Kernel Block Skipping: active blocks retained, inactive skipped.\n");
+
     printf("=================================================================\n");
-    printf("[✓] ALL ZDD KV CACHE & DLX MOE TESTS PASSED SUCCESSFULLY!\n");
+    printf("[OK] ALL ZDD KV CACHE & DLX MOE TESTS PASSED SUCCESSFULLY!\n");
     printf("=================================================================\n");
     return 0;
 }

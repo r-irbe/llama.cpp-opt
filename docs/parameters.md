@@ -499,7 +499,7 @@ llama-bench -tgb 4,16 -p 512 -n 128 other_arguments
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `-tgb (or --threads-gen-batch)` | Enable having different number of threads for generation and batch processing | - | **llama-bench only**: `llama-server` and `llama-cli` reject it. [PR 284](https://github.com/ikawrakow/ik_llama.cpp/pull/284) |
+| `-tgb (or --threads-gen-batch)` | Enable having different number of threads for generation and batch processing | - | Supported in `llama-bench`, `llama-cli`, and `llama-server`. Format: `<n_gen>,<n_batch>` (e.g. `-tgb 4,16`). |
 | `--fit` | Automatically fit to available VRAM | 0 | 0 / 1 [PR 1542](https://github.com/ikawrakow/ik_llama.cpp/pull/1542) |
 | `--fit-margin N` | Safety VRAM margin in MiB when using `--fit` | 1024 |  |
 

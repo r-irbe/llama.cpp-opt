@@ -54,6 +54,7 @@ add_library(llama
             llama-load-tensors.cpp
             llama-build-context.h
             llama-build-context.cpp
+            llama-graph.cpp
             llama-moe-cache.h
             llama-moe-cache.cpp
             llama-model.h
@@ -145,7 +146,7 @@ add_library(llama
             )
 
 target_include_directories(llama PUBLIC . ../include)
-target_include_directories(llama PRIVATE ../ggml/src)
+target_include_directories(llama PRIVATE ../ggml/src ../common)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)

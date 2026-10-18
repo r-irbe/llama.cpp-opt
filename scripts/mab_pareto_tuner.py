@@ -995,6 +995,112 @@ def compute_scalar_reward(metrics: dict, target_model: str) -> float:
     return round(reward, 4)
 
 
+_MODEL_SHA256_CACHE = {}
+_GIT_SHA_CACHE = None
+
+def get_git_sha() -> str:
+    global _GIT_SHA_CACHE
+    if _GIT_SHA_CACHE is not None:
+        return _GIT_SHA_CACHE
+    try:
+        res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        _GIT_SHA_CACHE = res.stdout.strip() if res.returncode == 0 and res.stdout.strip() else "unknown"
+    except Exception:
+        _GIT_SHA_CACHE = "unknown"
+    return _GIT_SHA_CACHE
+
+
+def get_hardware_fingerprint(hw: "HostHardwareProfile") -> str:
+    gpu_part = f"{hw.gpu_count}x{hw.gpu_name}" if hw.has_gpu else "cpu-only"
+    return f"{hw.arch}|{hw.cpu_model}|{hw.physical_cores}c/{hw.logical_threads}t|numa={hw.numa_nodes}|ram={hw.ram_gb:.1f}GB|{gpu_part}"
+
+
+def get_model_sha256(model_path: str, model_name: str = "") -> str:
+    key = model_path or f"simulated:{model_name}"
+    if key in _MODEL_SHA256_CACHE:
+        return _MODEL_SHA256_CACHE[key]
+    if model_path and os.path.exists(model_path) and os.path.isfile(model_path):
+        try:
+            import hashlib
+            h = hashlib.sha256()
+            with open(model_path, "rb") as f:
+                while chunk := f.read(1024 * 1024):
+                    h.update(chunk)
+            val = h.hexdigest()
+            _MODEL_SHA256_CACHE[key] = val
+            return val
+        except Exception:
+            pass
+    val = f"simulated:{model_name or "unknown"}"
+    _MODEL_SHA256_CACHE[key] = val
+    return val
+
+
+def get_load_avg() -> str:
+    try:
+        la = os.getloadavg()
+        return f"{la[0]:.2f},{la[1]:.2f},{la[2]:.2f}"
+    except Exception:
+        return "0.00,0.00,0.00"
+
+
+def build_trial_cmd(config: dict, model_path: str, ctx_len: int, hw: "HostHardwareProfile", draft_model_path: str = None) -> list:
+    cmd = [
+        "./build/bin/llama-cli",
+        "-m", model_path or "<simulated-model>",
+        "-p", "Artificial intelligence is",
+        "-n", "16",
+        "--temp", "0",
+        "-c", str(ctx_len),
+        "-t", str(config.get("threads", min(14, hw.physical_cores))),
+        "-tb", str(config.get("threads_batch", min(14, hw.physical_cores))),
+        "-b", str(config.get("batch_size", 2048)),
+        "-ub", str(config.get("ubatch_size", 512))
+    ]
+    if config.get("n_gpu_layers", 0) > 0 and hw.has_gpu:
+        cmd.extend(["-ngl", str(config.get("n_gpu_layers", 999))])
+    if config.get("split_mode") and config.get("split_mode") != "none" and hw.gpu_count >= 2:
+        cmd.extend(["-sm", config.get("split_mode")])
+    if config.get("tensor_override_strategy") and config.get("tensor_override_strategy") != "none":
+        cmd.extend(["-ot", config.get("tensor_override_strategy")])
+    if config.get("numa_mode") and config.get("numa_mode") != "none" and hw.numa_nodes > 1:
+        cmd.extend(["--numa", config.get("numa_mode")])
+    if config.get("defer_ple", 0) == 1:
+        cmd.append("--defer-ple")
+    if config.get("defer_experts", 0) == 1:
+        cmd.append("--defer-experts")
+    if config.get("prefetch_experts", 0) == 1:
+        cmd.append("-prexp")
+        cmd.extend(["-prexp-t", str(config.get("prefetch_threads", 8))])
+    if config.get("flash_attn", 0) == 1:
+        cmd.extend(["-fa", "1"])
+    if config.get("cache_type_k"):
+        cmd.extend(["-ctk", str(config.get("cache_type_k"))])
+    if config.get("cache_type_v"):
+        cmd.extend(["-ctv", str(config.get("cache_type_v"))])
+
+    eff_draft_path = draft_model_path or config.get("model_draft")
+    spec_type = config.get("spec_type", "none")
+    if eff_draft_path and os.path.exists(eff_draft_path):
+        cmd.extend(["-md", eff_draft_path])
+        cmd.extend(["-ngld", str(config.get("n_gpu_layers_draft", 999))])
+        if spec_type != "none":
+            cmd.extend(["--spec-type", spec_type])
+        if config.get("n_draft"):
+            cmd.extend(["--draft", str(config.get("n_draft"))])
+        if config.get("p_min"):
+            cmd.extend(["--p-min", str(config.get("p_min"))])
+        if config.get("spec_autotune", 1) == 1:
+            cmd.append("--spec-autotune")
+        if config.get("spec_ckpt_mode"):
+            cmd.extend(["--spec-ckpt-mode", str(config.get("spec_ckpt_mode"))])
+    elif spec_type in ["ngram-mod", "suffix"]:
+        cmd.extend(["--spec-type", spec_type])
+        if config.get("n_draft"):
+            cmd.extend(["--draft", str(config.get("n_draft"))])
+    return cmd
+
+
 def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHardwareProfile, draft_model_path: str = None) -> dict:
     """Executes a real llama-cli benchmark on host hardware and records measured throughput and latency."""
     cmd = [
@@ -1060,21 +1166,65 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
         env["CUDA_VISIBLE_DEVICES"] = ""
 
     t0 = time.time()
+    bin_path = cmd[0]
+    bin_sha256 = ""
+    if os.path.exists(bin_path):
+        try:
+            import hashlib
+            h = hashlib.sha256()
+            with open(bin_path, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            bin_sha256 = h.hexdigest()
+        except Exception:
+            pass
+
     try:
-        proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=180)
-        out = proc.stdout + proc.stderr
-        if proc.returncode != 0:
+        import resource
+        import threading
+        hwm_kb = 0
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        stop_monitor = threading.Event()
+        def monitor_hwm():
+            nonlocal hwm_kb
+            while not stop_monitor.is_set():
+                try:
+                    with open(f"/proc/{p.pid}/status") as sf:
+                        for sline in sf:
+                            if sline.startswith("VmHWM:"):
+                                hwm_kb = max(hwm_kb, int(sline.split()[1]))
+                                break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        monitor_thread = threading.Thread(target=monitor_hwm, daemon=True)
+        monitor_thread.start()
+        try:
+            stdout, stderr = p.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            stdout, stderr = p.communicate()
+            raise TimeoutError("Trial process timed out")
+        finally:
+            stop_monitor.set()
+            monitor_thread.join(timeout=0.5)
+
+        ru_after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        out = stdout + stderr
+        if p.returncode != 0:
             err_lines = [
                 line.strip() for line in out.splitlines()
                 if any(k in line.lower() for k in ["error", "failed", "out of memory", "cuda error", "exception"])
             ]
-            err_msg = err_lines[-1] if err_lines else f"Process exited with code {proc.returncode}"
+            err_msg = err_lines[-1] if err_lines else f"Process exited with code {p.returncode}"
             return {
                 "error": err_msg,
                 "pp_tps": 0.0,
                 "tg_tps": 0.0,
                 "ttft_ms": (time.time() - t0) * 1000.0,
                 "mem_gb": 0.0,
+                "binary_sha256": bin_sha256,
                 "mode": MODE_FAILED
             }
 
@@ -1085,12 +1235,14 @@ def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHard
         pp_ms = float(pp_match.group(1)) if pp_match else (time.time() - t0) * 1000.0
         tg_tps = float(tg_match.group(3)) if tg_match else 0.0
         ttft_ms = pp_ms
-        mem_gb = 18.0
+        mem_kb = hwm_kb if hwm_kb > 0 else max(0, ru_after)
+        mem_gb = (mem_kb / (1024.0 * 1024.0)) if mem_kb > 0 else 18.0
         return {
             "pp_tps": round(pp_tps, 2),
             "tg_tps": round(tg_tps, 2),
             "ttft_ms": round(ttft_ms, 2),
             "mem_gb": round(mem_gb, 2),
+            "binary_sha256": bin_sha256,
             "mode": MODE_LIVE
         }
     except Exception as e:
@@ -1152,37 +1304,69 @@ def run_mab_multicontext_search(
               "every trial is recorded with mode='simulated'.")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS mab_evaluations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            model_name TEXT,
-            context_length INTEGER,
-            trial_index INTEGER,
-            config_json TEXT,
-            pp_tps REAL,
-            tg_tps REAL,
-            ttft_ms REAL,
-            mem_gb REAL,
-            reward REAL,
-            pareto_rank INTEGER,
-            mode TEXT NOT NULL DEFAULT 'simulated'
-        )
-    """)
+    for tbl_name in ("mab_evaluations", "trials"):
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {tbl_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                model_name TEXT,
+                context_length INTEGER,
+                trial_index INTEGER,
+                config_json TEXT,
+                pp_tps REAL,
+                tg_tps REAL,
+                ttft_ms REAL,
+                mem_gb REAL,
+                reward REAL,
+                pareto_rank INTEGER,
+                mode TEXT NOT NULL DEFAULT 'simulated',
+                git_sha TEXT,
+                hardware_fingerprint TEXT,
+                model_sha256 TEXT,
+                cuda_visible_devices TEXT,
+                load_avg TEXT,
+                cmd_line TEXT
+            )
+        """)
     cur.execute("PRAGMA table_info(mab_evaluations)")
     existing_cols = [row[1] for row in cur.fetchall()]
     if "context_length" not in existing_cols:
         cur.execute("ALTER TABLE mab_evaluations ADD COLUMN context_length INTEGER DEFAULT 4096")
     if "mode" not in existing_cols:
-        # Rows written before this column existed can only have come from the simulator:
-        # the live path requires --live-bench, no shipped report records such a run, and the
-        # stored numbers are model outputs (constant mem_gb per model, TTFT up to 1.5e8 ms).
-        # Label them 'simulated' rather than leaving the provenance unknown.
         cur.execute("ALTER TABLE mab_evaluations ADD COLUMN mode TEXT NOT NULL DEFAULT 'simulated'")
         cur.execute("UPDATE mab_evaluations SET mode = 'simulated' WHERE mode IS NULL")
         cur.execute("SELECT COUNT(*) FROM mab_evaluations WHERE mode = 'simulated'")
         print(f"[DB] Added 'mode' column to {db_path}; pre-existing rows labeled mode='simulated' "
               f"({cur.fetchone()[0]} rows).")
+    for col_name, col_type in (
+        ("git_sha", "TEXT"),
+        ("hardware_fingerprint", "TEXT"),
+        ("model_sha256", "TEXT"),
+        ("cuda_visible_devices", "TEXT"),
+        ("load_avg", "TEXT"),
+        ("cmd_line", "TEXT"),
+    ):
+        if col_name not in existing_cols:
+            cur.execute(f"ALTER TABLE mab_evaluations ADD COLUMN {col_name} {col_type}")
+
+    cur.execute("PRAGMA table_info(trials)")
+    existing_trials_cols = [row[1] for row in cur.fetchall()]
+    if "context_length" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN context_length INTEGER DEFAULT 4096")
+    if "mode" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN mode TEXT NOT NULL DEFAULT 'simulated'")
+    if "git_sha" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN git_sha TEXT")
+    if "hardware_fingerprint" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN hardware_fingerprint TEXT")
+    if "model_sha256" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN model_sha256 TEXT")
+    if "cuda_visible_devices" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN cuda_visible_devices TEXT")
+    if "load_avg" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN load_avg TEXT")
+    if "cmd_line" not in existing_trials_cols:
+        cur.execute("ALTER TABLE trials ADD COLUMN cmd_line TEXT")
     conn.commit()
 
     all_stage_results = []
@@ -1236,16 +1420,27 @@ def run_mab_multicontext_search(
             is_p1 = (point.rank == 1)
             bandit.update(config, reward, is_pareto_front=is_p1)
 
-            cur.execute("""
-                INSERT INTO mab_evaluations (
-                    timestamp, model_name, context_length, trial_index, config_json,
-                    pp_tps, tg_tps, ttft_ms, mem_gb, reward, pareto_rank, mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now(timezone.utc).isoformat(), model_name, ctx_len, trial,
+            ts_iso = datetime.now(timezone.utc).isoformat()
+            git_sha_val = get_git_sha()
+            hw_fp_val = get_hardware_fingerprint(hw)
+            model_sha_val = get_model_sha256(model_path, model_name)
+            cuda_vis_val = "" if config.get("n_gpu_layers", 0) <= 0 else os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+            load_avg_val = get_load_avg()
+            cmd_line_val = " ".join(build_trial_cmd(config, model_path, ctx_len, hw, draft_model_path=draft_model_path))
+            row_values = (
+                ts_iso, model_name, ctx_len, trial,
                 json.dumps(config), metrics["pp_tps"], metrics["tg_tps"],
-                metrics["ttft_ms"], metrics["mem_gb"], reward, point.rank, mode
-            ))
+                metrics["ttft_ms"], metrics["mem_gb"], reward, point.rank, mode,
+                git_sha_val, hw_fp_val, model_sha_val, cuda_vis_val, load_avg_val, cmd_line_val
+            )
+            for tbl_name in ("mab_evaluations", "trials"):
+                cur.execute(f"""
+                    INSERT INTO {tbl_name} (
+                        timestamp, model_name, context_length, trial_index, config_json,
+                        pp_tps, tg_tps, ttft_ms, mem_gb, reward, pareto_rank, mode,
+                        git_sha, hardware_fingerprint, model_sha256, cuda_visible_devices, load_avg, cmd_line
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, row_values)
 
         conn.commit()
 

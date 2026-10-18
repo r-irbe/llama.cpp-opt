@@ -590,7 +590,7 @@ static ggml_tensor * dsv4_build_attn(
         int            n_compressed,
         ggml_cgraph  * gf) {
     const bool v_trans = v->nb[1] > v->nb[2];
-    const int64_t n_stream = k->ne[3];
+    const int64_t n_stream = std::max<int64_t>(k->ne[3], kq_mask ? kq_mask->ne[3] : 1);
 
     if (n_stream > 1) {
         GGML_ASSERT(q->ne[2] % n_stream == 0);
@@ -600,17 +600,19 @@ static ggml_tensor * dsv4_build_attn(
         for (int64_t s = 0; s < n_stream; ++s) {
             ggml_tensor * q_s = ggml_view_3d(ctx, q, q->ne[0], q->ne[1], n_tokens_stream,
                     q->nb[1], q->nb[2], s*n_tokens_stream*q->nb[2]);
-            ggml_tensor * k_s = ggml_view_4d(ctx, k, k->ne[0], k->ne[1], k->ne[2], 1,
-                    k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
-            ggml_tensor * v_s = ggml_view_4d(ctx, v, v->ne[0], v->ne[1], v->ne[2], 1,
-                    v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]);
+            ggml_tensor * k_s = k->ne[3] > 1 ? ggml_view_4d(ctx, k, k->ne[0], k->ne[1], k->ne[2], 1,
+                    k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]) : k;
+            ggml_tensor * v_s = v->ne[3] > 1 ? ggml_view_4d(ctx, v, v->ne[0], v->ne[1], v->ne[2], 1,
+                    v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]) : v;
             ggml_tensor * mask_s = kq_mask;
-            if (ggml_is_matrix(kq_mask)) {
-                mask_s = ggml_view_2d(ctx, kq_mask, kq_mask->ne[0], n_tokens_stream,
-                        kq_mask->nb[1], s*n_tokens_stream*kq_mask->nb[1]);
-            } else {
-                mask_s = ggml_view_2d(ctx, kq_mask, kq_mask->ne[0], kq_mask->ne[1],
-                        kq_mask->nb[1], s*kq_mask->nb[3]);
+            if (kq_mask != nullptr) {
+                if (kq_mask->ne[3] > 1) {
+                    mask_s = ggml_view_2d(ctx, kq_mask, kq_mask->ne[0], kq_mask->ne[1],
+                            kq_mask->nb[1], s*kq_mask->nb[3]);
+                } else if (ggml_is_matrix(kq_mask) && n_stream > 1 && kq_mask->ne[1] % n_stream == 0) {
+                    mask_s = ggml_view_2d(ctx, kq_mask, kq_mask->ne[0], n_tokens_stream,
+                            kq_mask->nb[1], s*n_tokens_stream*kq_mask->nb[1]);
+                }
             }
 
             ggml_tensor * cur_s = dsv4_build_attn(ctx, hparams, cparams,
@@ -643,12 +645,12 @@ static ggml_tensor * dsv4_build_attn(
             v = ggml_cast(ctx, v, GGML_TYPE_F16);
         }
 
-        if (kq_mask->type == GGML_TYPE_F32) {
+        if (kq_mask && kq_mask->type == GGML_TYPE_F32) {
             kq_mask = ggml_cast(ctx, kq_mask, GGML_TYPE_F16);
         }
 
         ggml_tensor * selected = nullptr;
-        if (n_compressed > 0) {
+        if (n_compressed > 0 && kq_mask != nullptr) {
             int n_compressed_padded = GGML_PAD(n_compressed, 256);
             if (n_compressed_padded < kq_mask->ne[0]) {
                 selected = ggml_mask_to_index(ctx, kq_mask, n_compressed_padded);
@@ -1398,6 +1400,9 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
                     read_idxs, raw_kq_n_kv, n_tokens, extra_k->ne[3], cb, il);
             raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
+        }
+        if (raw_mask->ne[3] != extra_k->ne[3]) {
+            raw_mask = dsv4_repeat_streams(ctx0, raw_mask, extra_k->ne[3]);
         }
         if (!cparams.flash_attn && raw_compacted && raw_mask->ne[1] != n_tokens) {
             // non-FA masks are unpadded; drop the win mask's token padding before the concat
@@ -2317,6 +2322,9 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
             raw_mask = dsv4_build_raw_mask_view(llm, mask_views, KQ_mask,
                     read_idxs, raw_kq_n_kv, n_tokens, extra_k->ne[3], cb, il);
             raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
+        }
+        if (raw_mask->ne[3] != extra_k->ne[3]) {
+            raw_mask = dsv4_repeat_streams(ctx0, raw_mask, extra_k->ne[3]);
         }
         if (!cparams.flash_attn && raw_compacted && raw_mask->ne[1] != n_tokens) {
             raw_mask = ggml_view_2d(ctx0, raw_mask, raw_mask->ne[0], n_tokens, raw_mask->nb[1], 0);
