@@ -290,7 +290,7 @@ struct llama_mmap::impl {
 
     impl(struct llama_file * file, size_t prefetch, bool numa, [[maybe_unused]] bool use_thp) {
         size = file->size();
-        int fd = file->file_id();
+        fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -393,6 +393,9 @@ struct llama_mmap::impl {
         GGML_ASSERT(last >= first);
 
 #ifdef __linux__
+        if (fd >= 0) {
+            posix_fadvise(fd, first, len, POSIX_FADV_DONTNEED);
+        }
         if (madvise((uint8_t *) addr + first, len, MADV_DONTNEED)) {
             LLAMA_LOG_WARN("warning: madvise(..., MADV_DONTNEED) failed: %s\n", strerror(errno));
         }
@@ -408,6 +411,11 @@ struct llama_mmap::impl {
             return;
         }
 
+#ifdef __linux__
+        if (fd >= 0) {
+            posix_fadvise(fd, first, len, POSIX_FADV_RANDOM);
+        }
+#endif
         if (int err = posix_madvise((uint8_t *) addr + first, len, POSIX_MADV_RANDOM)) {
             LLAMA_LOG_WARN("warning: posix_madvise(..., POSIX_MADV_RANDOM) failed: %s\n", strerror(err));
         }
@@ -422,6 +430,11 @@ struct llama_mmap::impl {
             return;
         }
 
+#ifdef __linux__
+        if (fd >= 0) {
+            posix_fadvise(fd, first, len, POSIX_FADV_WILLNEED);
+        }
+#endif
         if (posix_madvise((uint8_t *) addr + first, len, POSIX_MADV_WILLNEED)) {
             LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
                     strerror(errno));
@@ -631,6 +644,7 @@ struct llama_mmap::impl {
     void * addr;
     size_t size;
     size_t mapped_page_size = 0;
+    int fd = -1;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa, bool use_thp) :

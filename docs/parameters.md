@@ -226,11 +226,11 @@ MLA models already have the cache compressed, it doesn't really makes sense to c
 | `--yarn-orig-ctx N` | Original training context limit for YaRN | loaded from model | Base pre-trained context size (e.g. `4096`, `8192`, `32768`). |
 | `--yarn-ext-factor N` | YaRN extrapolation mix factor | -1.0 | Controls blending between interpolation and extrapolation (0.0 = full interpolation). |
 | `--yarn-attn-factor N` | YaRN attention temperature scale factor | -1.0 | Scales attention scores to prevent entropy collapse at high context. |
-| `-unreal, --unreal-filter` | Enable UNREAL model-internal evidence selection | disabled | **Not implemented**: parsed into `gpt_params::unreal_filter`, but no code in `src/` or the server reads it (`common/unreal-selector.h` is used by a unit test only), so enabling it changes nothing. See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md). |
-| `--no-unreal-filter` | Disable UNREAL evidence filtering | enabled | Default behavior (the feature itself is not wired up). |
-| `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Parsed only; the value is not consumed. |
-| `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Parsed only; the value is not consumed. |
-| `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Parsed only; the value is not consumed. |
+| `-unreal, --unreal-filter` | Enable UNREAL model-internal evidence selection | disabled | Enables streaming late-interaction MaxSim evidence selection (`common/unreal-selector.h`) in `llama-cli` and `llama-server`. Filters long prompts down to top evidence chunks before slot ingestion, enabling virtual contexts up to 10M tokens within a physical context window. Grounded in Kinderman et al. (NVIDIA Research 2026, arXiv:2610.08463). |
+| `--no-unreal-filter` | Disable UNREAL evidence filtering | enabled | Default behavior. Passes the full prompt directly without evidence selection. |
+| `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Chunk size ($T$) in tokens for exact-cover context partitioning. |
+| `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Number of top-scoring evidence chunks ($n$) to select via late-interaction MaxSim and BM25 lexical boost. |
+| `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Minimum prompt length ($N^*$) required to trigger UNREAL filtering. $0$ uses automatic theoretical break-even calculation. |
 | `--no-context-shift` | Disable context-shift | - |  |
 | `--context-shift` | Set context-shift | on | auto / on / off / 0 / 1 [PR 973](https://github.com/ikawrakow/ik_llama.cpp/pull/973) |
 
