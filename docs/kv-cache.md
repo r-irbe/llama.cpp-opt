@@ -41,7 +41,7 @@ For a 70B parameter model with 128k context length:
 
 ## 3. ZDD / SDD Sparse Block Compression (prototype, not wired up)
 
-> **Status at HEAD:** `--zdd-sparse-kv` / `--no-zdd-sparse-kv` CLI flags, `gpt_params.zdd_sparse_kv`, `llama_context_params.zdd_sparse_kv`, `src/llama-kv-zdd.h`, and `tests/test-kv-zdd.cpp` are wired and tested. Attention kernel block-skipping in `src/llama-graph.cpp` remains deferred; see [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
+> **Status at HEAD:** `--zdd-sparse-kv` / `--no-zdd-sparse-kv` CLI flags, `gpt_params.zdd_sparse_kv`, `llama_context_params.zdd_sparse_kv`, `src/llama-kv-zdd.h`, and `tests/test-kv-zdd.cpp` are wired and tested. The mask hook is live: inactive blocks are `-INF`-filled in the KQ mask at the `src/llama.cpp` input stage (`set_inputs`) via the `llama-graph.cpp` mask builder. Attention-kernel block-skipping in `ggml` (CPU/CUDA) remains deferred; `src/llama-build-context.cpp:2166-2169` currently builds and discards an unused mask copy (dead call). See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
 
 In long-context generation (>64k tokens), attention matrices exhibit extreme sparsity: $>85\%$ of 64-token key-value blocks have cumulative attention weights $< 10^{-4}$ and contribute negligibly to final token logits.
 
