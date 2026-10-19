@@ -927,10 +927,18 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
         purge_page_cache()
         enforce_thermal_cooldown()
 
+    child_env = os.environ.copy()
+    is_cpu_baseline = (track and "cpu" in track.lower()) or any(
+        cmd[i] in ("-ngl", "--n-gpu-layers") and i + 1 < len(cmd) and str(cmd[i + 1]) == "0"
+        for i in range(len(cmd))
+    )
+    if is_cpu_baseline:
+        child_env["CUDA_VISIBLE_DEVICES"] = ""
+
     snap0 = read_numastat()
     t0 = time.perf_counter()
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, env=child_env)
         t1 = time.perf_counter()
         snap1 = read_numastat()
         delta = compute_numastat_delta(snap0, snap1)

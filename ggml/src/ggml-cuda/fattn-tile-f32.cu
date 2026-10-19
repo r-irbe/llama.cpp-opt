@@ -142,6 +142,19 @@ static __global__ void flash_attn_tile_ext_f32(
 
     const int k_start = parallel_blocks == 1 ? 0 : ip*FATTN_KQ_STRIDE_TILE_F32;
     for (int k_VKQ_0 = k_start; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE_TILE_F32) {
+        if (zdd_skip && mask != nullptr) {
+            const int ncols_valid = ne01 > ic0 ? (ne01 - ic0 < ncols ? ne01 - ic0 : ncols) : 0;
+            if (ncols_valid > 0) {
+                const int k = threadIdx.x;
+                const float m_first = __half2float(maskh[k_VKQ_0 + k]);
+                const float m_last  = __half2float(maskh[(ncols_valid - 1)*stride_mask + k_VKQ_0 + k]);
+                const bool is_inf   = m_first <= -65000.0f && m_last <= -65000.0f;
+                if (__all_sync(0xFFFFFFFF, is_inf)) {
+                    continue;
+                }
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
 
         float kqmax_new[ncols/nwarps];

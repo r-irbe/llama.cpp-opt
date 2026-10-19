@@ -202,6 +202,27 @@ static __global__ void flash_attn_vec_ext_f16(
              // Increment pointers after each loop:
              K += gridDim.y*Dk*nb11, V += gridDim.y*Dk*nb21, maskh += gridDim.y*Dk) {
 
+        if (zdd_skip && mask != nullptr) {
+            const int ncols_valid = ne01 > ic0 ? (ne01 - ic0 < ncols ? ne01 - ic0 : ncols) : 0;
+            if (ncols_valid > 0) {
+                bool all_inf = true;
+                for (int k = threadIdx.x; k < Dk; k += WARP_SIZE) {
+                    if (FATTN_KQ_STRIDE % Dk != 0 && k_VKQ_0 + k >= ne11) {
+                        break;
+                    }
+                    const float m_first = __half2float(maskh[k]);
+                    const float m_last  = __half2float(maskh[(ncols_valid - 1)*ne11 + k]);
+                    if (m_first > -65000.0f || m_last > -65000.0f) {
+                        all_inf = false;
+                        break;
+                    }
+                }
+                if (__all_sync(0xFFFFFFFF, all_inf)) {
+                    continue;
+                }
+            }
+        }
+
         // For unknown reasons using a half array of size 1 for kqmax_new causes a performance regression,
         // see https://github.com/ggerganov/llama.cpp/pull/7061 .
         // Therefore this variable is defined twice but only used once (so that the compiler can optimize out the unused variable).

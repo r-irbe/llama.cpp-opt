@@ -29108,7 +29108,7 @@ typedef int ggml_lock_t;
 
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
+static void set_numa_thread_affinity(int thread_n, int n_threads) {
     if (!ggml_is_numa()) {
         return;
     }
@@ -29120,12 +29120,29 @@ static void set_numa_thread_affinity(int thread_n) {
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
         case GGML_NUMA_STRATEGY_MIRROR:
-            // run thread on node_num thread_n / (threads per node)
-            node_num = thread_n % g_state.numa.n_nodes;
+        case GGML_NUMA_STRATEGY_EXPERT:
+            // Contiguous block pinning across active NUMA nodes:
+            // run thread on node_num = thread_n / (threads per node)
+            {
+                const int n_nodes = (int) g_state.numa.n_nodes;
+                const int eff_threads = n_threads > 0 ? n_threads : n_nodes;
+                const int threads_per_node = (eff_threads + n_nodes - 1) / n_nodes;
+                node_num = (threads_per_node > 0 ? (thread_n / threads_per_node) : thread_n) % n_nodes;
+            }
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
-            // run thread on current_node
-            node_num = g_state.numa.current_node;
+            // Run thread on current_node, spilling cleanly across neighbor nodes
+            // when thread_n >= current_node_cpus instead of stacking all threads on one node.
+            {
+                const uint32_t cur_node = g_state.numa.current_node < g_state.numa.n_nodes
+                    ? g_state.numa.current_node : 0;
+                const uint32_t cur_cpus = g_state.numa.nodes[cur_node].n_cpus;
+                if (cur_cpus > 0 && thread_n >= (int) cur_cpus) {
+                    node_num = (int) ((cur_node + ((uint32_t) thread_n / cur_cpus)) % g_state.numa.n_nodes);
+                } else {
+                    node_num = (int) cur_node;
+                }
+            }
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
@@ -29207,7 +29224,7 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(int thread_n, int n_threads) { UNUSED(thread_n); UNUSED(n_threads); }
 static void clear_numa_thread_affinity(void) {}
 static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
 #endif
@@ -29709,7 +29726,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
 
-    set_numa_thread_affinity(state->ith);
+    set_numa_thread_affinity(state->ith, state->shared->n_threads);
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
 
     struct ggml_compute_params params = {

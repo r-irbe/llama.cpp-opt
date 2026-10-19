@@ -195,34 +195,26 @@ static __global__ void flash_attn_ext_f16(
     // Iterate over ne11 == previous tokens:
     for (int k_VKQ_0 = ip*FATTN_KQ_STRIDE; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE) {
         // ZDD sparse KV skip: skip fully-masked 256-token chunks (4 x 64-token blocks).
-        // The mask is row-uniform for the ZDD fill (identical -inf columns for every
-        // query row), so scanning query row 0 of this block is sufficient. Two cases:
-        //   1. Causal tail (k_VKQ_0 >= ic0 + ncols_valid): every valid row sees -inf via
-        //      causality alone; no mask read needed.
-        //   2. Interior (chunk max KV <= ic0): no causal -inf can appear in query row 0's
-        //      chunk, so any -inf there is the uniform ZDD fill; row 0 all -inf implies
-        //      all rows all -inf. Skipped chunks contribute exactly zero (exp(-inf) = 0),
-        //      so the online-softmax state is untouched and results stay bit-exact.
-        // The whole decision is block-uniform (every thread evaluates the same row-0
-        // data), so the __syncthreads() inside the loop body stays legal.
+        // Checking row 0 and row (ncols_valid - 1) of this block's mask slice covers both
+        // row-uniform ZDD -inf fills and the causal horizon (for any n_past) without
+        // conflating batch-local query index ic0 with absolute KV position.
+        // Every warp evaluates the exact same mask addresses and reduces via __all_sync,
+        // keeping the continue decision uniform across the threadblock for __syncthreads().
         if (zdd_skip && mask != nullptr) {
             const int ncols_valid = ne01 > ic0 ? (ne01 - ic0 < ncols ? ne01 - ic0 : ncols) : 0;
-            if (ncols_valid > 0 && k_VKQ_0 >= ic0 + ncols_valid) {
-                continue; // uniform decision: causal tail only
-            }
-            if (ncols_valid > 0 && k_VKQ_0 + FATTN_KQ_STRIDE <= ic0 + 1) {
-                // interior chunk: skip only if query row 0's chunk is entirely -inf
+            if (ncols_valid > 0) {
+                const int stride_mask = nb31 / sizeof(half);
                 bool all_inf = true;
                 for (int k = threadIdx.x; k < FATTN_KQ_STRIDE; k += WARP_SIZE) {
-                    const float m = __half2float(maskh[k_VKQ_0 + k]);
-                    if (m > -65000.0f) { // not f16 -inf (f16 -inf < -65504 when widened)
+                    const float m_first = __half2float(maskh[k_VKQ_0 + k]);
+                    const float m_last  = __half2float(maskh[(ncols_valid - 1)*stride_mask + k_VKQ_0 + k]);
+                    if (m_first > -65000.0f || m_last > -65000.0f) { // not f16 -inf
                         all_inf = false;
                         break;
                     }
                 }
-                all_inf = __all_sync(0xFFFFFFFF, all_inf);
-                if (all_inf) {
-                    continue; // uniform decision across the block
+                if (__all_sync(0xFFFFFFFF, all_inf)) {
+                    continue;
                 }
             }
         }

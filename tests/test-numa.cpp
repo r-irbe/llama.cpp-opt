@@ -492,6 +492,30 @@ int main() {
         }
     }
 
+    printf("ggml_numa_init GGML_NUMA_STRATEGY_EXPERT and contiguous compute affinity\n");
+    {
+        ggml_numa_init(GGML_NUMA_STRATEGY_EXPERT);
+        check(ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_EXPERT, "ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_EXPERT");
+        struct ggml_init_params params = { 16 * 1024 * 1024, NULL, false };
+        struct ggml_context * ctx = ggml_init(params);
+        check(ctx != NULL, "ggml_init for expert NUMA test succeeds");
+        if (ctx) {
+            struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+            struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+            memset(a->data, 0, ggml_nbytes(a));
+            memset(b->data, 0, ggml_nbytes(b));
+            struct ggml_tensor * c = ggml_mul_mat(ctx, a, b);
+            struct ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, c);
+            struct ggml_cplan plan = ggml_graph_plan(gf, 8);
+            std::vector<uint8_t> work(plan.work_size + 64);
+            plan.work_data = work.data();
+            enum ggml_status st = ggml_graph_compute(gf, &plan);
+            check(st == GGML_STATUS_SUCCESS, "ggml_graph_compute under GGML_NUMA_STRATEGY_EXPERT succeeds");
+            ggml_free(ctx);
+        }
+    }
+
     printf("topology of this machine\n");
     for (const auto & n : topology()) {
         printf("  node %d: %zu cpus, %d cores, %zu MiB total, %zu MiB free\n",
