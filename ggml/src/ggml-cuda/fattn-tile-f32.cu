@@ -77,7 +77,8 @@ static __global__ void flash_attn_tile_ext_f32(
         const int ne0,
         const int ne1,
         const int ne2,
-        const int ne3) {
+        const int ne3,
+        const int zdd_skip) {
 
     // Skip unused kernel variants for faster compilation:
     if (use_softcap && !(D == 128 || D == 256)) {

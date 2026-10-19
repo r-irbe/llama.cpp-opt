@@ -2243,6 +2243,11 @@ static ggml_tensor * llm_build_kqv(
         if (n_swa > 0 && !kv.cells_disordered) {
             ((int32_t *)cur->op_params)[4] = n_swa;
         }
+        // Enable ZDD sparse KV skip: set op_params[5] = 1 when zdd_sparse_kv is active.
+        // This allows the wmma FA kernel to skip fully-masked 64-token blocks.
+        if (cparams.zdd_sparse_kv) {
+            ((int32_t *)cur->op_params)[5] = 1;
+        }
 
         // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
         // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
@@ -3493,6 +3498,11 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 }
                 if (n_swa > 0 && !lctx.kv_self.cells_disordered) {
                     ((int32_t *)cur->op_params)[4] = n_swa;
+                }
+                // Enable ZDD sparse KV skip: set op_params[5] = 1 when zdd_sparse_kv is active.
+                // This allows the wmma FA kernel to skip fully-masked 64-token blocks.
+                if (cparams.zdd_sparse_kv) {
+                    ((int32_t *)cur->op_params)[5] = 1;
                 }
                 // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
                 if (should_use_f32_precision) {

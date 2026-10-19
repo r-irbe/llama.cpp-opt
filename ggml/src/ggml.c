@@ -11145,6 +11145,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     ggml_set_op_params(result, params, sizeof(params));
 
     ggml_set_op_params_i32(result, 4, 0);
+    ggml_set_op_params_i32(result, 5, 0); // ZDD sparse KV skip flag (0 = disabled, 1 = enabled)
 
     result->op   = GGML_OP_FLASH_ATTN_EXT;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;

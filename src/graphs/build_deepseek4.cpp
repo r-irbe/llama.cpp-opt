@@ -662,6 +662,11 @@ static ggml_tensor * dsv4_build_attn(
         ggml_tensor * cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, "fattn", il);
+        // Enable ZDD sparse KV skip: set op_params[5] = 1 when zdd_sparse_kv is active.
+        // This allows the wmma FA kernel to skip fully-masked 64-token blocks.
+        if (cparams.zdd_sparse_kv) {
+            cur->op_params[5] = 1;
+        }
         // DSV4 uses the generic CPU FA path here for numerical correctness.
         if (selected) {
             cur->src[5] = selected;

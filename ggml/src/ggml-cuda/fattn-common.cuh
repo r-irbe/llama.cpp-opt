@@ -55,7 +55,8 @@ typedef void (* fattn_kernel_t)(
         const int ne0,
         const int ne1,
         const int ne2,
-        const int ne3);
+        const int ne3,
+        const int zdd_skip);
 
 typedef half (*vec_dot_KQ_f16_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -835,6 +836,9 @@ void launch_fattn(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
+    // ZDD sparse KV skip flag set on the FA op (op_params[5]); only meaningful with a mask.
+    const int zdd_skip = mask ? (int) KQV->op_params[5] : 0;
+
     fattn_kernel<<<blocks_num, block_dim, shmem, main_stream>>>(
         (const char *) Q->data,
         K_data,
@@ -849,7 +853,8 @@ void launch_fattn(
         Q->nb[1], Q->nb[2], Q->nb[3],
         nb11, nb12, nb13,
         nb21, nb22, nb23,
-        KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3]
+        KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3],
+        zdd_skip
     );
     CUDA_CHECK(cudaGetLastError());
 

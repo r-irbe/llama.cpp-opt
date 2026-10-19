@@ -53,7 +53,8 @@ static __global__ void flash_attn_ext_f16(
         const int ne0,
         const int ne1,
         const int ne2,
-        const int ne3) {
+        const int ne3,
+        const int zdd_skip) {
 #ifdef FP16_MMA_AVAILABLE
     static_assert(Dk == Dv || (Dk == 192 && Dv == 128) || (Dk == 576 && Dv == 512));
     // Skip unused kernel variants for faster compilation:
@@ -193,6 +194,39 @@ static __global__ void flash_attn_ext_f16(
 
     // Iterate over ne11 == previous tokens:
     for (int k_VKQ_0 = ip*FATTN_KQ_STRIDE; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE) {
+        // ZDD sparse KV skip: skip fully-masked 256-token chunks (4 x 64-token blocks).
+        // The mask is row-uniform for the ZDD fill (identical -inf columns for every
+        // query row), so scanning query row 0 of this block is sufficient. Two cases:
+        //   1. Causal tail (k_VKQ_0 >= ic0 + ncols_valid): every valid row sees -inf via
+        //      causality alone; no mask read needed.
+        //   2. Interior (chunk max KV <= ic0): no causal -inf can appear in query row 0's
+        //      chunk, so any -inf there is the uniform ZDD fill; row 0 all -inf implies
+        //      all rows all -inf. Skipped chunks contribute exactly zero (exp(-inf) = 0),
+        //      so the online-softmax state is untouched and results stay bit-exact.
+        // The whole decision is block-uniform (every thread evaluates the same row-0
+        // data), so the __syncthreads() inside the loop body stays legal.
+        if (zdd_skip && mask != nullptr) {
+            const int ncols_valid = ne01 > ic0 ? (ne01 - ic0 < ncols ? ne01 - ic0 : ncols) : 0;
+            if (ncols_valid > 0 && k_VKQ_0 >= ic0 + ncols_valid) {
+                continue; // uniform decision: causal tail only
+            }
+            if (ncols_valid > 0 && k_VKQ_0 + FATTN_KQ_STRIDE <= ic0 + 1) {
+                // interior chunk: skip only if query row 0's chunk is entirely -inf
+                bool all_inf = true;
+                for (int k = threadIdx.x; k < FATTN_KQ_STRIDE; k += WARP_SIZE) {
+                    const float m = __half2float(maskh[k_VKQ_0 + k]);
+                    if (m > -65000.0f) { // not f16 -inf (f16 -inf < -65504 when widened)
+                        all_inf = false;
+                        break;
+                    }
+                }
+                all_inf = __all_sync(0xFFFFFFFF, all_inf);
+                if (all_inf) {
+                    continue; // uniform decision across the block
+                }
+            }
+        }
+
         // Calculate tile of KQ:
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < FATTN_KQ_STRIDE; i_KQ_0 += KQ_stride_tc) {
