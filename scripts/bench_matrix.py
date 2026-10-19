@@ -928,9 +928,13 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
         enforce_thermal_cooldown()
 
     child_env = os.environ.copy()
-    is_cpu_baseline = (track and "cpu" in track.lower()) or any(
-        cmd[i] in ("-ngl", "--n-gpu-layers") and i + 1 < len(cmd) and str(cmd[i + 1]) == "0"
-        for i in range(len(cmd))
+    is_cpu_baseline = (
+        (track and "cpu" in track.lower())
+        or any(str(arg) in ("-ngl=0", "--n-gpu-layers=0") for arg in cmd)
+        or any(
+            cmd[i] in ("-ngl", "--n-gpu-layers") and i + 1 < len(cmd) and str(cmd[i + 1]) == "0"
+            for i in range(len(cmd))
+        )
     )
     if is_cpu_baseline:
         child_env["CUDA_VISIBLE_DEVICES"] = ""

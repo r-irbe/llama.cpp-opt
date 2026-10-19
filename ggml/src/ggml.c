@@ -4938,6 +4938,7 @@ static uint32_t ggml_get_numa_affinity(void) {
 
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     if (g_state.numa.n_nodes > 0) {
+        g_state.numa.numa_strategy = numa_flag;
         fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
 
         return;
@@ -29117,30 +29118,62 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
     int rv;
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
 
+    uint32_t active_nodes[GGML_NUMA_MAX_NODES];
+    int n_active = 0;
+    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+        if (g_state.numa.nodes[n].n_cpus > 0) {
+            active_nodes[n_active++] = n;
+        }
+    }
+    if (n_active <= 0) {
+        return;
+    }
+
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
         case GGML_NUMA_STRATEGY_MIRROR:
         case GGML_NUMA_STRATEGY_EXPERT:
-            // Contiguous block pinning across active NUMA nodes:
-            // run thread on node_num = thread_n / (threads per node)
+            // Contiguous block pinning across active NUMA nodes without starving tail nodes
+            // when n_threads is not evenly divisible by n_active.
             {
-                const int n_nodes = (int) g_state.numa.n_nodes;
-                const int eff_threads = n_threads > 0 ? n_threads : n_nodes;
-                const int threads_per_node = (eff_threads + n_nodes - 1) / n_nodes;
-                node_num = (threads_per_node > 0 ? (thread_n / threads_per_node) : thread_n) % n_nodes;
+                const int eff_threads = n_threads > 0 ? n_threads : n_active;
+                int active_idx;
+                if (eff_threads >= n_active && thread_n >= 0 && thread_n < eff_threads) {
+                    active_idx = (int) (((int64_t) thread_n * n_active) / eff_threads);
+                } else {
+                    active_idx = (thread_n >= 0 ? thread_n : 0) % n_active;
+                }
+                node_num = (int) active_nodes[active_idx % n_active];
             }
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
-            // Run thread on current_node, spilling cleanly across neighbor nodes
+            // Run thread on current_node, spilling cleanly across active neighbor nodes
             // when thread_n >= current_node_cpus instead of stacking all threads on one node.
             {
-                const uint32_t cur_node = g_state.numa.current_node < g_state.numa.n_nodes
-                    ? g_state.numa.current_node : 0;
-                const uint32_t cur_cpus = g_state.numa.nodes[cur_node].n_cpus;
-                if (cur_cpus > 0 && thread_n >= (int) cur_cpus) {
-                    node_num = (int) ((cur_node + ((uint32_t) thread_n / cur_cpus)) % g_state.numa.n_nodes);
-                } else {
-                    node_num = (int) cur_node;
+                int start_idx = 0;
+                for (int i = 0; i < n_active; ++i) {
+                    if (active_nodes[i] == g_state.numa.current_node) {
+                        start_idx = i;
+                        break;
+                    }
+                }
+                uint32_t total_active_cpus = 0;
+                for (int i = 0; i < n_active; ++i) {
+                    total_active_cpus += g_state.numa.nodes[active_nodes[i]].n_cpus;
+                }
+                uint32_t rem = thread_n > 0 ? (uint32_t) thread_n : 0;
+                if (total_active_cpus > 0) {
+                    rem %= total_active_cpus;
+                }
+                node_num = (int) active_nodes[start_idx];
+                for (int i = 0; i < n_active; ++i) {
+                    const uint32_t cand = active_nodes[(start_idx + i) % n_active];
+                    const uint32_t cand_cpus = g_state.numa.nodes[cand].n_cpus;
+                    if (rem < cand_cpus) {
+                        node_num = (int) cand;
+                        break;
+                    }
+                    rem -= cand_cpus;
                 }
             }
             break;

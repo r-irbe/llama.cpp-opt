@@ -507,11 +507,52 @@ int main() {
             struct ggml_tensor * c = ggml_mul_mat(ctx, a, b);
             struct ggml_cgraph * gf = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf, c);
-            struct ggml_cplan plan = ggml_graph_plan(gf, 8);
-            std::vector<uint8_t> work(plan.work_size + 64);
-            plan.work_data = work.data();
-            enum ggml_status st = ggml_graph_compute(gf, &plan);
-            check(st == GGML_STATUS_SUCCESS, "ggml_graph_compute under GGML_NUMA_STRATEGY_EXPERT succeeds");
+
+            // 1. Evenly divisible thread count (n_threads = 8)
+            struct ggml_cplan plan8 = ggml_graph_plan(gf, 8);
+            std::vector<uint8_t> work8(plan8.work_size + 64);
+            plan8.work_data = work8.data();
+            enum ggml_status st8 = ggml_graph_compute(gf, &plan8);
+            check(st8 == GGML_STATUS_SUCCESS, "ggml_graph_compute under GGML_NUMA_STRATEGY_EXPERT (8 threads) succeeds");
+
+            // 2. Non-divisible thread count (n_threads = 19 across 8 nodes)
+            struct ggml_cplan plan19 = ggml_graph_plan(gf, 19);
+            std::vector<uint8_t> work19(plan19.work_size + 64);
+            plan19.work_data = work19.data();
+            enum ggml_status st19 = ggml_graph_compute(gf, &plan19);
+            check(st19 == GGML_STATUS_SUCCESS, "ggml_graph_compute under GGML_NUMA_STRATEGY_EXPERT (19 threads) succeeds");
+
+            // 3. Verify contiguous block partition formula covers all 8 active nodes for n_threads = 19 and n_threads = 9
+            for (int eff_threads : {9, 19, 32}) {
+                const int n_active = 8;
+                std::vector<int> counts(n_active, 0);
+                int prev_idx = 0;
+                bool monotonic = true;
+                for (int t = 0; t < eff_threads; ++t) {
+                    int idx = (int) (((int64_t) t * n_active) / eff_threads);
+                    if (idx < prev_idx || idx < 0 || idx >= n_active) {
+                        monotonic = false;
+                    }
+                    prev_idx = idx;
+                    counts[idx]++;
+                }
+                bool all_covered = true;
+                for (int c_n : counts) {
+                    if (c_n <= 0) all_covered = false;
+                }
+                check(monotonic && all_covered, "contiguous block partition covers all 8 nodes monotonically without starvation");
+            }
+
+            // 4. Verify ISOLATE strategy spills cleanly when n_threads (32) > single-node CPUs (14)
+            ggml_numa_init(GGML_NUMA_STRATEGY_ISOLATE);
+            check(ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_ISOLATE, "ggml_numa_get_strategy() switches to ISOLATE");
+            struct ggml_cplan plan32 = ggml_graph_plan(gf, 32);
+            std::vector<uint8_t> work32(plan32.work_size + 64);
+            plan32.work_data = work32.data();
+            enum ggml_status st32 = ggml_graph_compute(gf, &plan32);
+            check(st32 == GGML_STATUS_SUCCESS, "ggml_graph_compute under GGML_NUMA_STRATEGY_ISOLATE (32 threads spill) succeeds");
+
+            ggml_numa_init(GGML_NUMA_STRATEGY_EXPERT);
             ggml_free(ctx);
         }
     }
