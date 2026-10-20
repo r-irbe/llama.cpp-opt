@@ -964,9 +964,10 @@ def plan_npmc_repack(model_info: Dict[str, Any],
     """
     raw_tensors = model_info["tensors"]
 
-    # 1. Categorize tensors into Dense/Critical vs MoE Expert
+    # 1. Categorize tensors into Dense/Critical vs MoE Expert vs Deferred PLE/Engram
     dense_tensors = []
     moe_tensors = []
+    deferred_ple_tensors = []
     aliased_tensors = []
 
     for t in raw_tensors:
@@ -997,7 +998,9 @@ def plan_npmc_repack(model_info: Dict[str, Any],
         else:
             t_copy["needs_intra_row_pad"] = False
 
-        if is_moe_tensor(name):
+        if "engram_embd" in name or "per_layer_token_embd" in name:
+            deferred_ple_tensors.append(t_copy)
+        elif is_moe_tensor(name):
             moe_tensors.append(t_copy)
         else:
             dense_tensors.append(t_copy)
@@ -1013,8 +1016,8 @@ def plan_npmc_repack(model_info: Dict[str, Any],
             return (expert, layer, subrole)
         moe_tensors.sort(key=key_expert_first)
 
-    # 3. Assemble target tensor sequence: Dense tensors first, MoE expert block second
-    ordered_tensors = dense_tensors + moe_tensors
+    # 3. Assemble target tensor sequence: Dense first, MoE second, Deferred PLE/Engram tail third
+    ordered_tensors = dense_tensors + moe_tensors + deferred_ple_tensors
 
     if embed_superblock and len(ordered_tensors) > 0:
         anchor_name = moe_tensors[0]["name"] if len(moe_tensors) > 0 else ordered_tensors[0]["name"]
