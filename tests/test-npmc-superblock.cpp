@@ -153,7 +153,54 @@ static void test_edge_cases_and_validation() {
     reinterpret_cast<Superblock2MiBHeader *>(sb->data)->magic ^= 1ULL;
     assert(!sb->view().valid());
 
-    printf("    [OK] Edge cases (empty active set, invalid bitplane invariant, unsorted IDs, corrupt magic) verified.\n");
+    // Reject words_per_expert == 0 and num_experts == 0
+    assert(!pack_superblock_2mib(*sb, 4096u, 0u, {5u}, {{}}));
+    assert(!pack_superblock_2mib(*sb, 0u, 1u, {}, {}));
+
+    // Re-pack valid superblock and probe structural alignment/bounds checks
+    assert(pack_superblock_2mib(*sb, 256u, 2u, {5u, 128u}, {{{1ULL, 0ULL}, {0ULL, 1ULL}}, {{3ULL, 0ULL}, {0ULL, 4ULL}}}));
+    assert(sb->view().valid());
+    assert(!sb->view().is_expert_active(256u));
+
+    // Reject 64-byte aligned (not 128-byte aligned) base pointer
+    alignas(128) static uint8_t raw_buf[SUPERBLOCK_2MIB_BYTES + 128u];
+    std::memcpy(raw_buf + 64u, sb->data, SUPERBLOCK_2MIB_BYTES);
+    Superblock2MiBView misaligned_view(raw_buf + 64u, SUPERBLOCK_2MIB_BYTES);
+    assert(!misaligned_view.valid());
+
+    // Reject truncated stream_a_bytes
+    auto * hdr = reinterpret_cast<Superblock2MiBHeader *>(sb->data);
+    const uint32_t orig_a_bytes = hdr->stream_a_bytes;
+    hdr->stream_a_bytes = sizeof(llama::veb::BitwiseVeb4096) + sizeof(EliasFanoHeader) - 1u;
+    assert(!sb->view().valid());
+    hdr->stream_a_bytes = orig_a_bytes;
+    assert(sb->view().valid());
+
+    // Reject truncated stream_b_bytes
+    const uint32_t orig_b_bytes = hdr->stream_b_bytes;
+    hdr->stream_b_bytes = orig_b_bytes - 1u;
+    assert(!sb->view().valid());
+    hdr->stream_b_bytes = orig_b_bytes;
+    assert(sb->view().valid());
+
+    // Reject overlapping Stream A and Stream B
+    const uint32_t orig_b_off = hdr->stream_b_offset;
+    hdr->stream_b_offset = hdr->stream_a_offset;
+    assert(!sb->view().valid());
+    hdr->stream_b_offset = orig_b_off;
+    assert(sb->view().valid());
+
+    // Reject corrupted EliasFanoHeader low_bits >= 64
+    auto * ef_hdr = reinterpret_cast<EliasFanoHeader *>(
+        sb->data + hdr->stream_a_offset + sizeof(llama::veb::BitwiseVeb4096)
+    );
+    const uint32_t orig_lb = ef_hdr->low_bits;
+    ef_hdr->low_bits = 64u;
+    assert(!sb->view().valid());
+    ef_hdr->low_bits = orig_lb;
+    assert(sb->view().valid());
+
+    printf("    [OK] Edge cases (empty active set, invalid bitplane, unsorted IDs, alignment, truncated streams, EF bounds) verified.\n");
 }
 
 int main() {

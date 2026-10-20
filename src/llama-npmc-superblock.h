@@ -63,7 +63,16 @@ public:
         : hdr_(hdr), lower_(lower), upper_(upper) {}
 
     inline bool valid() const noexcept {
-        return hdr_ != nullptr && (hdr_->count == 0u || (lower_ != nullptr && upper_ != nullptr));
+        if (hdr_ == nullptr) return false;
+        if (hdr_->low_bits >= 64u) return false;
+        const uint64_t expected_mask = (hdr_->low_bits == 0u) ? 0ULL : ((1ULL << hdr_->low_bits) - 1ULL);
+        if (hdr_->low_mask != expected_mask) return false;
+        if (hdr_->count == 0u) return true;
+        if (lower_ == nullptr || upper_ == nullptr) return false;
+        const size_t min_lower_words = (static_cast<size_t>(hdr_->count) * hdr_->low_bits + 63u) / 64u;
+        if (hdr_->lower_words_count < min_lower_words) return false;
+        if (hdr_->upper_words_count == 0u) return false;
+        return true;
     }
 
     inline uint32_t size() const noexcept {
@@ -291,15 +300,23 @@ public:
 
     inline bool valid() const noexcept {
         if (!base_ || size_ < SUPERBLOCK_2MIB_BYTES) return false;
-        if ((reinterpret_cast<uintptr_t>(base_) & 63u) != 0u) return false;
+        if ((reinterpret_cast<uintptr_t>(base_) & 127u) != 0u) return false;
         const auto * hdr = header();
         if (hdr->magic != LEANGRPH_V3_MAGIC || hdr->version != LEANGRPH_V3_VERSION) return false;
-        if (hdr->num_experts > MAX_SUPERBLOCK_EXPERTS || hdr->active_experts > hdr->num_experts) return false;
+        if (hdr->num_experts == 0u || hdr->num_experts > MAX_SUPERBLOCK_EXPERTS || hdr->active_experts > hdr->num_experts) return false;
+        if (hdr->words_per_expert == 0u) return false;
         if (hdr->stream_a_offset < sizeof(Superblock2MiBHeader)) return false;
         if ((hdr->stream_a_offset & 127u) != 0u) return false;
-        if (static_cast<size_t>(hdr->stream_a_offset) + hdr->stream_a_bytes > size_) return false;
+        const size_t stream_a_end = static_cast<size_t>(hdr->stream_a_offset) + hdr->stream_a_bytes;
+        if (stream_a_end > size_) return false;
         if (hdr->stream_a_bytes < sizeof(llama::veb::BitwiseVeb4096) + sizeof(EliasFanoHeader)) return false;
         if ((hdr->stream_b_offset & 63u) != 0u) return false;
+        if (static_cast<size_t>(hdr->stream_b_offset) < stream_a_end) return false;
+        const size_t expected_b_bytes =
+            static_cast<size_t>(hdr->active_experts) *
+            static_cast<size_t>(hdr->words_per_expert) *
+            sizeof(TernaryBitplane64);
+        if (hdr->stream_b_bytes < expected_b_bytes) return false;
         if (static_cast<size_t>(hdr->stream_b_offset) + hdr->stream_b_bytes > size_) return false;
         return elias_fano().valid() && elias_fano().size() == hdr->active_experts;
     }
@@ -319,7 +336,8 @@ public:
     }
 
     inline bool is_expert_active(uint32_t expert_id) const noexcept {
-        if (expert_id >= MAX_SUPERBLOCK_EXPERTS) return false;
+        const auto * hdr = header();
+        if (expert_id >= hdr->num_experts || expert_id >= MAX_SUPERBLOCK_EXPERTS) return false;
         const auto * veb = veb_mask();
         const uint32_t c = (expert_id >> 6) & 63u;
         const uint32_t b = expert_id & 63u;
@@ -388,7 +406,8 @@ inline bool pack_superblock_2mib(
     const std::vector<uint32_t> & active_expert_ids,
     const std::vector<std::vector<TernaryBitplane64>> & expert_weights
 ) {
-    if (num_experts > MAX_SUPERBLOCK_EXPERTS) return false;
+    if (num_experts == 0u || num_experts > MAX_SUPERBLOCK_EXPERTS) return false;
+    if (words_per_expert == 0u) return false;
     if (active_expert_ids.size() != expert_weights.size()) return false;
     const uint32_t m = static_cast<uint32_t>(active_expert_ids.size());
     for (uint32_t i = 0; i < m; ++i) {
