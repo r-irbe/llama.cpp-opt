@@ -39,9 +39,9 @@ For a 70B parameter model with 128k context length:
 
 ---
 
-## 3. ZDD / SDD Sparse Block Compression (prototype, not wired up)
+## 3. ZDD / SDD Sparse Block Compression (`--zdd-sparse-kv`)
 
-> **Status at HEAD:** `--zdd-sparse-kv` / `--no-zdd-sparse-kv` CLI flags, `gpt_params.zdd_sparse_kv`, `llama_context_params.zdd_sparse_kv`, `src/llama-kv-zdd.h`, and `tests/test-kv-zdd.cpp` are wired and tested. The mask hook is live: inactive blocks are `-INF`-filled in the KQ mask at the `src/llama.cpp` input stage (`set_inputs`) via the `llama-graph.cpp` mask builder. Attention-kernel block-skipping in `ggml` (CPU/CUDA) remains deferred; `src/llama-build-context.cpp:2166-2169` currently builds and discards an unused mask copy (dead call). See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
+> **Status at HEAD:** `--zdd-sparse-kv` / `--no-zdd-sparse-kv` CLI flags, `gpt_params.zdd_sparse_kv`, `llama_context_params.zdd_sparse_kv`, `src/llama-kv-zdd.h`, and `tests/test-kv-zdd.cpp` are wired and tested. Inactive 64-token KV blocks are `-INF`-filled in the KQ mask at `src/llama.cpp` (`set_inputs`, for both single-token decode and multi-token prefill) via `llama-graph.cpp`, and `src/llama-build-context.cpp` sets `op_params[5] = 1` on `ggml_flash_attn_ext`. All 6 CUDA FlashAttention kernel families (`fattn-wmma-f16.cuh`, `fattn-tile-f16.cu`, `fattn-tile-f32.cu`, `fattn-vec-f16.cuh`, `fattn-vec-f32.cuh`, `fattn-mma-f16.cuh`) perform sound 2D CTA tile skipping when every `(q, k)` cell in a tile has `mask == -INFINITY`. See [`docs/UNIMPLEMENTED.md`](./UNIMPLEMENTED.md).
 
 In long-context generation (>64k tokens), attention matrices exhibit extreme sparsity: $>85\%$ of 64-token key-value blocks have cumulative attention weights $< 10^{-4}$ and contribute negligibly to final token logits.
 

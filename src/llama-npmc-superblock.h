@@ -464,4 +464,79 @@ inline bool pack_superblock_2mib(
     return true;
 }
 
+/// NVIDIA Ada Lovelace (sm_89) 2:4 Structured Sparsity 4-Bit Nibble Metadata Codec.
+/// Packs two strictly ordered non-zero indices (0 <= idx0 < idx1 < 4) per 4-element quad
+/// into a 4-bit nibble: (idx0 & 3) | ((idx1 & 3) << 2), matching mma.sp.sync.aligned.m16n8k32.
+struct Sparse24Metadata {
+    static inline bool encode_quad(uint8_t idx0, uint8_t idx1, uint8_t & out_nibble) noexcept {
+        if (idx0 >= idx1 || idx1 >= 4u) return false;
+        out_nibble = static_cast<uint8_t>((idx0 & 0x3u) | ((idx1 & 0x3u) << 2u));
+        return true;
+    }
+
+    static inline void decode_quad(uint8_t nibble, uint8_t & idx0, uint8_t & idx1) noexcept {
+        idx0 = static_cast<uint8_t>(nibble & 0x3u);
+        idx1 = static_cast<uint8_t>((nibble >> 2u) & 0x3u);
+    }
+
+    static inline bool is_valid_nibble(uint8_t nibble) noexcept {
+        uint8_t idx0 = 0u, idx1 = 0u;
+        decode_quad(nibble, idx0, idx1);
+        return idx0 < idx1 && idx1 < 4u;
+    }
+
+    template <typename T>
+    static inline void reconstruct_quad(const T compressed[2], uint8_t nibble, T out_dense[4]) noexcept {
+        out_dense[0] = T(0);
+        out_dense[1] = T(0);
+        out_dense[2] = T(0);
+        out_dense[3] = T(0);
+        uint8_t idx0 = 0u, idx1 = 0u;
+        decode_quad(nibble, idx0, idx1);
+        if (idx0 < idx1 && idx1 < 4u) {
+            out_dense[idx0] = compressed[0];
+            out_dense[idx1] = compressed[1];
+        }
+    }
+};
+
+/// Certified CROWN / LiRPA Affine Interval Bound Propagation (Galois interval abstraction).
+/// Given an input interval box [lower[j], upper[j]] and affine layer (weights[j], bias),
+/// computes sound lower and upper output bounds in O(d) time:
+///   L = bias + sum_j (max(w_j, 0) * lower[j] + min(w_j, 0) * upper[j])
+///   U = bias + sum_j (max(w_j, 0) * upper[j] + min(w_j, 0) * lower[j])
+struct CrownInterval {
+    int64_t lower;
+    int64_t upper;
+
+    inline bool valid() const noexcept {
+        return lower <= upper;
+    }
+
+    inline bool contains(int64_t x) const noexcept {
+        return lower <= x && x <= upper;
+    }
+};
+
+inline CrownInterval crown_affine_interval(
+    const int64_t * weights,
+    const CrownInterval * inputs,
+    size_t dim,
+    int64_t bias
+) noexcept {
+    int64_t low = bias;
+    int64_t high = bias;
+    for (size_t j = 0; j < dim; ++j) {
+        const int64_t w = weights[j];
+        if (w >= 0) {
+            low  += w * inputs[j].lower;
+            high += w * inputs[j].upper;
+        } else {
+            low  += w * inputs[j].upper;
+            high += w * inputs[j].lower;
+        }
+    }
+    return CrownInterval{low, high};
+}
+
 } // namespace llama::npmc

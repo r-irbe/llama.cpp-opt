@@ -172,4 +172,67 @@ inline void set_gpu_kv_l2_persistence(
     CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr));
 }
 
+// ============================================================================
+// Register-Resident Warp-Cooperative vEB Priority Queue (1024-Key Universe)
+// ============================================================================
+// Each of the 32 warp lanes holds a 32-bit word (`lane_word`), spanning 1,024 keys
+// with 0 bytes of shared memory. Uses __ballot_sync, __ffs, __clz, and __shfl_sync.
+
+__device__ __forceinline__ int warp_veb_find_min(uint32_t lane_word) {
+    const uint32_t summary = __ballot_sync(0xFFFFFFFFu, lane_word != 0u);
+    if (summary == 0u) {
+        return -1;
+    }
+    const int min_cluster = __ffs(summary) - 1;
+    const uint32_t winner_word = __shfl_sync(0xFFFFFFFFu, lane_word, min_cluster);
+    const int min_bit = __ffs(winner_word) - 1;
+    return (min_cluster << 5) | min_bit;
+}
+
+__device__ __forceinline__ int warp_veb_find_max(uint32_t lane_word) {
+    const uint32_t summary = __ballot_sync(0xFFFFFFFFu, lane_word != 0u);
+    if (summary == 0u) {
+        return -1;
+    }
+    const int max_cluster = 31 - __clz(summary);
+    const uint32_t winner_word = __shfl_sync(0xFFFFFFFFu, lane_word, max_cluster);
+    const int max_bit = 31 - __clz(winner_word);
+    return (max_cluster << 5) | max_bit;
+}
+
+__device__ __forceinline__ uint32_t warp_veb_insert(uint32_t lane_word, int key, int lane_id) {
+    const int target_lane = (key >> 5) & 31;
+    const int target_bit  = key & 31;
+    if (lane_id == target_lane) {
+        lane_word |= (1u << target_bit);
+    }
+    return lane_word;
+}
+
+__device__ __forceinline__ uint32_t warp_veb_erase(uint32_t lane_word, int key, int lane_id) {
+    const int target_lane = (key >> 5) & 31;
+    const int target_bit  = key & 31;
+    if (lane_id == target_lane) {
+        lane_word &= ~(1u << target_bit);
+    }
+    return lane_word;
+}
+
+// ============================================================================
+// Dual-Bitplane Ternary POPCNT Dot-Product Primitive (sm_89)
+// ============================================================================
+// Evaluates the inner product of 64 ternary weights and 64 ternary activations
+// in {-1, 0, +1} encoded as disjoint (pos_mask, neg_mask) bitplanes via __popcll.
+
+__device__ __forceinline__ int32_t ternary_bitplane_dot64_device(
+    uint64_t w_pos,
+    uint64_t w_neg,
+    uint64_t a_pos,
+    uint64_t a_neg
+) {
+    const uint64_t same_sign = (w_pos & a_pos) | (w_neg & a_neg);
+    const uint64_t opp_sign  = (w_pos & a_neg) | (w_neg & a_pos);
+    return __popcll(same_sign) - __popcll(opp_sign);
+}
+
 } // namespace ggml::cuda::kv

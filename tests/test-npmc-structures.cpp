@@ -215,6 +215,53 @@ int main() {
               << (int)decompressed[1] << ", " << (int)decompressed[2] << ", " << (int)decompressed[3] << "\n";
     std::cout << "  In-Warp Streaming rANS Decompression Engine PASSED OK.\n\n";
 
+    // -------------------------------------------------------------------------------------
+    // Test 7: Continuous 2D Hilbert Fractal Curve (Bijection & Unit-Step Continuity)
+    // -------------------------------------------------------------------------------------
+    std::cout << "[7] Testing Continuous 2D Hilbert Fractal Curve (L_max = 1.000)...\n";
+    const uint32_t hilbert_n = 64;
+    if (!hilbert_curve_2d::verify_unit_step_continuity(hilbert_n)) {
+        std::cerr << "FAIL: Hilbert curve violated unit Manhattan step continuity!\n";
+        return 1;
+    }
+    for (uint32_t x = 0; x < hilbert_n; ++x) {
+        for (uint32_t y = 0; y < hilbert_n; ++y) {
+            const uint64_t d = hilbert_curve_2d::encode_2d(hilbert_n, x, y);
+            uint32_t rx = 0, ry = 0;
+            hilbert_curve_2d::decode_2d(hilbert_n, d, rx, ry);
+            if (rx != x || ry != y) {
+                std::cerr << "FAIL: Hilbert 2D roundtrip mismatch at (" << x << ", " << y << ")!\n";
+                return 1;
+            }
+        }
+    }
+    std::cout << "  Hilbert 64x64 bijection and Manhattan step continuity (|dx|+|dy| == 1) PASSED OK.\n\n";
+
+    // -------------------------------------------------------------------------------------
+    // Test 8: SIMD-BP128 64-Byte Aligned Delta Bit-Packer (PackedWarpBlock32)
+    // -------------------------------------------------------------------------------------
+    std::cout << "[8] Testing SIMD-BP128 64-Byte Aligned Delta Bit-Packer (PackedWarpBlock32)...\n";
+    uint32_t mono_ids[32];
+    uint32_t unpacked_ids[32];
+    mono_ids[0] = 1024u;
+    for (uint32_t i = 1; i < 32; ++i) {
+        mono_ids[i] = mono_ids[i - 1] + ((i % 5u) + 1u);
+    }
+    PackedWarpBlock32 packed_block;
+    if (!packed_block.pack(mono_ids) || packed_block.bit_width != 3u) {
+        std::cerr << "FAIL: PackedWarpBlock32 failed to pack with expected bit_width=3!\n";
+        return 1;
+    }
+    packed_block.unpack(unpacked_ids);
+    for (uint32_t i = 0; i < 32; ++i) {
+        if (unpacked_ids[i] != mono_ids[i]) {
+            std::cerr << "FAIL: PackedWarpBlock32 mismatch at lane " << i << "!\n";
+            return 1;
+        }
+    }
+    std::cout << "  PackedWarpBlock32 bit_width=" << (int)packed_block.bit_width
+              << " Hillis-Steele prefix-sum reconstruction PASSED OK.\n\n";
+
     std::cout << "=================================================================\n";
     std::cout << "  ALL GGUF-X / NPMC DISCRETE MATHEMATICAL TESTS PASSED (100%)    \n";
     std::cout << "=================================================================\n";

@@ -498,3 +498,149 @@ private:
     std::array<tans_dec_symbol, NUM_STATES> dec_table_;
 };
 
+// =========================================================================================
+// 6. Continuous 2D Hilbert Fractal Space-Filling Curve (NPMC 2D Tile Ordering)
+// Grounded in Hilbert (1891) and Moon et al. (2001): maps 2D tile coordinates (x, y) on an
+// n x n power-of-two grid to a 1D index d in [0, n^2) with strict Manhattan step continuity
+// (|x_{d+1} - x_d| + |y_{d+1} - y_d| == 1, L_max = 1.000), eliminating the diagonal quadrant
+// jumps of Morton Z-order curves during 2D sparse tile streaming.
+// =========================================================================================
+
+class hilbert_curve_2d {
+public:
+    static inline uint64_t encode_2d(uint32_t n, uint32_t x, uint32_t y) noexcept {
+        uint64_t d = 0;
+        for (uint32_t s = n >> 1; s > 0; s >>= 1) {
+            const uint32_t rx = (x & s) > 0 ? 1u : 0u;
+            const uint32_t ry = (y & s) > 0 ? 1u : 0u;
+            d += static_cast<uint64_t>(s) * static_cast<uint64_t>(s) * ((3u * rx) ^ ry);
+            rotate_quadrant(s, x, y, rx, ry);
+        }
+        return d;
+    }
+
+    static inline void decode_2d(uint32_t n, uint64_t d, uint32_t & x, uint32_t & y) noexcept {
+        uint64_t t = d;
+        x = 0;
+        y = 0;
+        for (uint32_t s = 1; s < n; s <<= 1) {
+            const uint32_t rx = static_cast<uint32_t>(1u & (t >> 1));
+            const uint32_t ry = static_cast<uint32_t>(1u & (t ^ rx));
+            rotate_quadrant(s, x, y, rx, ry);
+            x += s * rx;
+            y += s * ry;
+            t >>= 2;
+        }
+    }
+
+    static inline bool verify_unit_step_continuity(uint32_t n) noexcept {
+        if (n == 0 || (n & (n - 1)) != 0) return false;
+        const uint64_t total = static_cast<uint64_t>(n) * static_cast<uint64_t>(n);
+        uint32_t px = 0, py = 0;
+        decode_2d(n, 0, px, py);
+        for (uint64_t d = 1; d < total; ++d) {
+            uint32_t cx = 0, cy = 0;
+            decode_2d(n, d, cx, cy);
+            const uint32_t dx = (cx > px) ? (cx - px) : (px - cx);
+            const uint32_t dy = (cy > py) ? (cy - py) : (py - cy);
+            if (dx + dy != 1u) return false;
+            px = cx;
+            py = cy;
+        }
+        return true;
+    }
+
+private:
+    static inline void rotate_quadrant(uint32_t n, uint32_t & x, uint32_t & y, uint32_t rx, uint32_t ry) noexcept {
+        if (ry == 0u) {
+            if (rx == 1u) {
+                x = (n - 1u) - x;
+                y = (n - 1u) - y;
+            }
+            const uint32_t tmp = x;
+            x = y;
+            y = tmp;
+        }
+    }
+};
+
+// =========================================================================================
+// 7. SIMD-BP128 64-Byte Cache-Line Aligned Branchless Delta Bit-Packer (32-Lane Warp Block)
+// Grounded in Lemire & Boytsov (2015) SIMD-BP128: compresses 32 monotone uint32_t IDs
+// (active KV block indices or token positions) into a base value, uniform bit_width in [0..32],
+// and packed delta bit-planes, reconstructing via 5-stage Hillis-Steele inclusive prefix sum.
+// =========================================================================================
+
+struct alignas(64) PackedWarpBlock32 {
+    uint32_t base{0};
+    uint8_t  bit_width{0};
+    uint8_t  reserved[27]{};
+    std::array<uint32_t, 32> payload{};
+
+    inline bool pack(const uint32_t values[32]) noexcept {
+        if (!values) return false;
+        uint32_t deltas[32];
+        base = values[0];
+        deltas[0] = 0u;
+        uint32_t max_delta = 0u;
+        for (size_t i = 1; i < 32; ++i) {
+            if (values[i] < values[i - 1]) return false; // requires monotone non-decreasing sequence
+            deltas[i] = values[i] - values[i - 1];
+            if (deltas[i] > max_delta) max_delta = deltas[i];
+        }
+        bit_width = (max_delta == 0u) ? 0u : static_cast<uint8_t>(32 - __builtin_clz(max_delta));
+        payload.fill(0u);
+        if (bit_width == 0u) return true;
+
+        for (size_t i = 0; i < 32; ++i) {
+            const uint32_t v = deltas[i];
+            const size_t bit_pos = i * static_cast<size_t>(bit_width);
+            const size_t word_idx = bit_pos >> 5;
+            const size_t bit_off  = bit_pos & 31u;
+            payload[word_idx] |= (v << bit_off);
+            if (bit_off + bit_width > 32u && (word_idx + 1u) < payload.size()) {
+                payload[word_idx + 1u] |= (v >> (32u - bit_off));
+            }
+        }
+        return true;
+    }
+
+    inline void unpack(uint32_t out_values[32]) const noexcept {
+        if (!out_values) return;
+        const uint32_t bw = bit_width;
+        const uint64_t mask = (bw >= 32u) ? 0xFFFFFFFFULL : ((1ULL << bw) - 1ULL);
+
+        for (size_t lane = 0; lane < 32; ++lane) {
+            if (bw == 0u) {
+                out_values[lane] = 0u;
+                continue;
+            }
+            const size_t bit_pos = lane * static_cast<size_t>(bw);
+            const size_t word_idx = bit_pos >> 5;
+            const size_t bit_off  = bit_pos & 31u;
+            uint64_t raw = static_cast<uint64_t>(payload[word_idx]) >> bit_off;
+            if (bit_off + bw > 32u && (word_idx + 1u) < payload.size()) {
+                raw |= (static_cast<uint64_t>(payload[word_idx + 1u]) << (32u - bit_off));
+            }
+            out_values[lane] = static_cast<uint32_t>(raw & mask);
+        }
+
+        // 5-stage Hillis-Steele inclusive prefix sum across the 32 warp lanes
+        for (size_t stride = 1; stride < 32; stride <<= 1) {
+            uint32_t next[32];
+            for (size_t i = 0; i < 32; ++i) {
+                next[i] = out_values[i] + ((i >= stride) ? out_values[i - stride] : 0u);
+            }
+            for (size_t i = 0; i < 32; ++i) {
+                out_values[i] = next[i];
+            }
+        }
+
+        for (size_t i = 0; i < 32; ++i) {
+            out_values[i] += base;
+        }
+    }
+};
+static_assert(sizeof(PackedWarpBlock32) % 64 == 0, "PackedWarpBlock32 must be 64-byte cache-line aligned");
+
+

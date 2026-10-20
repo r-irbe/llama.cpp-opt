@@ -6,6 +6,7 @@
 #include "llama-mmap.h"
 #include "llama-arch.h"
 #include "llama-hparams.h"
+#include "llama-npmc-superblock.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -101,6 +102,9 @@ struct llama_model_loader {
     // GGUF-X / NPMC unpadded tensor dimensions for DRAM bank aliasing transparency
     std::unordered_map<std::string, int64_t> unpadded_dim0;
 
+    // GGUF-X / NPMC v3 2 MiB Superblock tensor registry (key: tensor name -> superblock version)
+    std::unordered_map<std::string, uint32_t> npmc_superblock_tensors;
+
     bool has_unpadded_dim0(const std::string & name) const {
         return unpadded_dim0.find(name) != unpadded_dim0.end();
     }
@@ -109,6 +113,19 @@ struct llama_model_loader {
         auto it = unpadded_dim0.find(name);
         return it != unpadded_dim0.end() ? it->second : -1;
     }
+
+    bool has_npmc_superblock(const std::string & name) const {
+        return npmc_superblock_tensors.find(name) != npmc_superblock_tensors.end();
+    }
+
+    uint32_t get_npmc_superblock_version(const std::string & name) const {
+        auto it = npmc_superblock_tensors.find(name);
+        return it != npmc_superblock_tensors.end() ? it->second : 0u;
+    }
+
+    llama::npmc::Superblock2MiBView get_npmc_superblock_view(const std::string & name) const;
+
+    static llama::npmc::Superblock2MiBView get_npmc_superblock_view(const struct ggml_tensor * tensor);
 
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,

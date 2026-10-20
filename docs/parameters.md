@@ -231,7 +231,7 @@ MLA models already have the cache compressed, it doesn't really makes sense to c
 | `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Chunk size ($T$) in tokens for exact-cover context partitioning. |
 | `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Number of top-scoring evidence chunks ($n$) to select via late-interaction MaxSim and BM25 lexical boost. |
 | `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Minimum prompt length ($N^*$) required to trigger UNREAL filtering. $0$ uses automatic theoretical break-even calculation. |
-| `--zdd-sparse-kv` | Enable ZDD sparse KV block selection | disabled | Enables Minato ZDD decision-diagram indexing over 64-token KV blocks (`src/llama-kv-zdd.h`). Inactive blocks are filled with `-INF` in the KQ attention mask (`src/llama.cpp` input stage). Attention kernels do not yet skip the zero-weight blocks, so memory or bandwidth savings are not realised at this commit. [EXPERIMENTAL] |
+| `--zdd-sparse-kv` | Enable ZDD sparse KV block selection | disabled | Enables Minato ZDD decision-diagram indexing over 64-token KV blocks (`src/llama-kv-zdd.h`). Inactive blocks are filled with `-INF` in the KQ attention mask (`src/llama.cpp` input stage) and skipped across all 6 CUDA FlashAttention kernel families (`op_params[5] == 1`). |
 | `--no-zdd-sparse-kv` | Disable ZDD sparse KV block selection | enabled | Default behavior (`include/llama.h` `zdd_sparse_kv = false`). The environment variable `LLAMA_KV_ZDD_SKIP` also enables the hook without the flag. |
 | `--no-context-shift` | Disable context-shift | - |  |
 | `--context-shift` | Set context-shift | on | auto / on / off / 0 / 1 [PR 973](https://github.com/ikawrakow/ik_llama.cpp/pull/973) |

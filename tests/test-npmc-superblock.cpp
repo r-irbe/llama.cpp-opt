@@ -203,12 +203,57 @@ static void test_edge_cases_and_validation() {
     printf("    [OK] Edge cases (empty active set, invalid bitplane, unsorted IDs, alignment, truncated streams, EF bounds) verified.\n");
 }
 
+static void test_sparse24_and_crown_interval() {
+    printf("[3] Testing 2:4 Structured Sparsity Codec & CROWN Affine Interval Bounds...\n");
+
+    // Exhaustively verify all 6 valid (idx0, idx1) pairs in a 4-element quad
+    size_t valid_count = 0;
+    for (uint8_t nibble = 0; nibble < 16u; ++nibble) {
+        if (Sparse24Metadata::is_valid_nibble(nibble)) {
+            valid_count++;
+            uint8_t i0 = 0, i1 = 0;
+            Sparse24Metadata::decode_quad(nibble, i0, i1);
+            uint8_t reencoded = 0;
+            assert(Sparse24Metadata::encode_quad(i0, i1, reencoded));
+            assert(reencoded == nibble);
+
+            const int32_t comp[2] = {11, -7};
+            int32_t dense[4] = {0, 0, 0, 0};
+            Sparse24Metadata::reconstruct_quad(comp, nibble, dense);
+            assert(dense[i0] == 11 && dense[i1] == -7);
+            int32_t comp_dot = comp[0] * dense[i0] + comp[1] * dense[i1];
+            int32_t full_dot = 0;
+            for (int k = 0; k < 4; ++k) full_dot += dense[k] * dense[k];
+            assert(comp_dot == full_dot);
+        }
+    }
+    assert(valid_count == 6u);
+
+    // Verify CROWN affine interval bound soundness across all 2^4 = 16 hypercube vertices
+    const int64_t weights[4] = {5, -3, 0, 8};
+    const CrownInterval box[4] = {{-10, 4}, {-6, 12}, {-100, 100}, {1, 9}};
+    const int64_t bias = -15;
+    const CrownInterval bounds = crown_affine_interval(weights, box, 4u, bias);
+    assert(bounds.valid());
+
+    for (int mask = 0; mask < 16; ++mask) {
+        int64_t val = bias;
+        for (int j = 0; j < 4; ++j) {
+            const int64_t xj = (mask & (1 << j)) ? box[j].upper : box[j].lower;
+            val += weights[j] * xj;
+        }
+        assert(bounds.contains(val));
+    }
+    printf("    [OK] Sparse24Metadata (6/16 valid nibbles) and CROWN interval soundness verified.\n");
+}
+
 int main() {
     printf("=================================================================\n");
     printf("  TEST: Zero-Copy NPMC / .leangrph v3 Superblock2MiB & Ternary   \n");
     printf("=================================================================\n");
     test_zero_copy_stream_a_and_b();
     test_edge_cases_and_validation();
+    test_sparse24_and_crown_interval();
     printf("=================================================================\n");
     printf("[OK] ALL NPMC SUPERBLOCK2MIB TESTS PASSED!\n");
     printf("=================================================================\n");

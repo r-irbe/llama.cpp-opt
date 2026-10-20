@@ -452,8 +452,10 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     fver = (enum llama_fver) gguf_get_version(meta);
 
     // Scan GGUF metadata for GGUF-X / NPMC unpadded tensor dimensions (breaking DRAM bank aliasing)
+    // and NPMC v3 2 MiB Superblock tensor declarations (npmc.superblock.<tensor_name>)
     {
         const std::string unpad_prefix = "npmc.unpadded_dim0.";
+        const std::string sb_prefix    = "npmc.superblock.";
         for (int i = 0; i < n_kv; ++i) {
             const char * key = gguf_get_key(meta, i);
             if (strncmp(key, unpad_prefix.c_str(), unpad_prefix.size()) == 0) {
@@ -473,6 +475,22 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
                     unpadded_dim0[tensor_name] = val;
                     LLAMA_LOG_INFO("%s: GGUF-X bank-aliasing padding detected for '%s': unpadded dim0 = %" PRId64 "\n",
                                    __func__, tensor_name.c_str(), val);
+                }
+            } else if (strncmp(key, sb_prefix.c_str(), sb_prefix.size()) == 0) {
+                std::string tensor_name = key + sb_prefix.size();
+                uint32_t ver = 0u;
+                enum gguf_type type = gguf_get_kv_type(meta, i);
+                if (type == GGUF_TYPE_UINT32) {
+                    ver = gguf_get_val_u32(meta, i);
+                } else if (type == GGUF_TYPE_INT32) {
+                    ver = (uint32_t) gguf_get_val_i32(meta, i);
+                } else if (type == GGUF_TYPE_UINT64) {
+                    ver = (uint32_t) gguf_get_val_u64(meta, i);
+                }
+                if (ver > 0u) {
+                    npmc_superblock_tensors[tensor_name] = ver;
+                    LLAMA_LOG_INFO("%s: GGUF-X NPMC Superblock v%u registered for '%s'\n",
+                                   __func__, ver, tensor_name.c_str());
                 }
             }
         }
@@ -1406,6 +1424,36 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
         }
     }
     return nullptr;
+}
+
+llama::npmc::Superblock2MiBView llama_model_loader::get_npmc_superblock_view(const struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->data) {
+        return llama::npmc::Superblock2MiBView(nullptr, 0);
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes < llama::npmc::SUPERBLOCK_2MIB_BYTES) {
+        return llama::npmc::Superblock2MiBView(nullptr, 0);
+    }
+    return llama::npmc::Superblock2MiBView(static_cast<const uint8_t *>(tensor->data), nbytes);
+}
+
+llama::npmc::Superblock2MiBView llama_model_loader::get_npmc_superblock_view(const std::string & name) const {
+    const llama_tensor_weight * w = get_weight(name.c_str());
+    if (!w || !w->tensor) {
+        return llama::npmc::Superblock2MiBView(nullptr, 0);
+    }
+    const size_t nbytes = ggml_nbytes(w->tensor);
+    if (nbytes < llama::npmc::SUPERBLOCK_2MIB_BYTES) {
+        return llama::npmc::Superblock2MiBView(nullptr, 0);
+    }
+    if (w->tensor->data != nullptr) {
+        return llama::npmc::Superblock2MiBView(static_cast<const uint8_t *>(w->tensor->data), nbytes);
+    }
+    if (w->idx < mappings.size() && mappings[w->idx] != nullptr) {
+        const uint8_t * base = static_cast<const uint8_t *>(mappings[w->idx]->addr()) + w->offs;
+        return llama::npmc::Superblock2MiBView(base, nbytes);
+    }
+    return llama::npmc::Superblock2MiBView(nullptr, 0);
 }
 
 const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {
