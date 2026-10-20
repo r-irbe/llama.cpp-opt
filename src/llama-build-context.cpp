@@ -254,7 +254,7 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     // (decode returns 1 == "failed to eval") BEFORE any kr_l graph is built, identically with or
     // without the indexer. This block is therefore correct-and-dormant: it never executes on the
     // current MLA path, but keeps the indexer keys consistent the instant MLA K-shift is ever enabled.
-    // It is NOT a way for the indexer to desync — the shift simply does not happen for MLA.
+    // It is NOT a way for the indexer to desync -- the shift simply does not happen for MLA.
     if (model.arch == LLM_ARCH_GLM_DSA && hparams.indexer_head_size > 0 && !kv_self.kr_l.empty()) {
         const int64_t head_size = hparams.indexer_head_size;
         const int64_t rope_dim  = n_rot;              // n_embd_head_qk_rope (indexer pe dims)
@@ -2163,11 +2163,6 @@ static ggml_tensor * llm_build_kqv(
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
 
-    if (cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) {
-        std::vector<uint8_t> zdd_skip_mask;
-        llm_build_context::llama_graph_build_zdd_skip_mask(lctx, kv, n_kv, zdd_skip_mask);
-    }
-
     if (lctx.paged_kv) {
         llm_build_context::llama_graph_stream_paged_kv(lctx, kv, n_kv, il);
     }
@@ -2245,7 +2240,7 @@ static ggml_tensor * llm_build_kqv(
         }
         // Enable ZDD sparse KV skip: set op_params[5] = 1 when zdd_sparse_kv is active.
         // This allows the wmma FA kernel to skip fully-masked 64-token blocks.
-        if (cparams.zdd_sparse_kv) {
+        if (cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) {
             ((int32_t *)cur->op_params)[5] = 1;
         }
 
@@ -3501,7 +3496,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 }
                 // Enable ZDD sparse KV skip: set op_params[5] = 1 when zdd_sparse_kv is active.
                 // This allows the wmma FA kernel to skip fully-masked 64-token blocks.
-                if (cparams.zdd_sparse_kv) {
+                if (cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) {
                     ((int32_t *)cur->op_params)[5] = 1;
                 }
                 // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA

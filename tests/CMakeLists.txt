@@ -300,5 +300,8 @@ target_include_directories(test-bitwise-veb PRIVATE ${PROJECT_SOURCE_DIR}/common
 target_link_libraries(test-bitwise-veb PRIVATE common)
 add_test(NAME test-bitwise-veb COMMAND $<TARGET_FILE:test-bitwise-veb>)
 
-
+add_executable(test-npmc-superblock test-npmc-superblock.cpp)
+target_include_directories(test-npmc-superblock PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-npmc-superblock PRIVATE common)
+add_test(NAME test-npmc-superblock COMMAND $<TARGET_FILE:test-npmc-superblock>)
 

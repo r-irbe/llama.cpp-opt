@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -664,7 +665,7 @@ static ggml_tensor * dsv4_build_attn(
         cb(cur, "fattn", il);
         // Enable ZDD sparse KV skip: set op_params[5] = 1 when zdd_sparse_kv is active.
         // This allows the wmma FA kernel to skip fully-masked 64-token blocks.
-        if (cparams.zdd_sparse_kv) {
+        if (cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) {
             cur->op_params[5] = 1;
         }
         // DSV4 uses the generic CPU FA path here for numerical correctness.

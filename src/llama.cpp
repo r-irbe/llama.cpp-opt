@@ -6677,23 +6677,24 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 }
             }
-                if ((cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) &&
-                    n_kv > (int64_t)(36 * llama::kv::zdd::KV_BLOCK_TOKENS)) {
-                    std::vector<uint8_t> zdd_skip_mask;
-                    if (llm_build_context::llama_graph_build_zdd_skip_mask(lctx, mask_kv_self, (int32_t)n_kv, zdd_skip_mask)) {
-                        const ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
-                        const uint32_t blk_sz = llama::kv::zdd::KV_BLOCK_TOKENS;
-                        for (size_t b = 0; b < zdd_skip_mask.size(); ++b) {
-                            if (zdd_skip_mask[b] == 0) {
-                                const int64_t i_start = (int64_t)b * blk_sz;
-                                const int64_t i_end   = std::min<int64_t>(n_kv, i_start + blk_sz);
-                                for (int j = 0; j < n_tokens; ++j) {
-                                    if (data) {
-                                        std::fill(data + j * n_kv + i_start, data + j * n_kv + i_end, -INFINITY);
-                                    }
-                                    if (data_f16) {
-                                        std::fill(data_f16 + j * n_kv + i_start, data_f16 + j * n_kv + i_end, h_inf);
-                                    }
+            }
+
+            if ((cparams.zdd_sparse_kv || std::getenv("LLAMA_KV_ZDD_SKIP") != nullptr) &&
+                n_kv > (int64_t)(36 * llama::kv::zdd::KV_BLOCK_TOKENS)) {
+                std::vector<uint8_t> zdd_skip_mask;
+                if (llm_build_context::llama_graph_build_zdd_skip_mask(lctx, mask_kv_self, (int32_t)n_kv, zdd_skip_mask)) {
+                    const ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
+                    const uint32_t blk_sz = llama::kv::zdd::KV_BLOCK_TOKENS;
+                    for (size_t b = 0; b < zdd_skip_mask.size(); ++b) {
+                        if (zdd_skip_mask[b] == 0) {
+                            const int64_t i_start = (int64_t)b * blk_sz;
+                            const int64_t i_end   = std::min<int64_t>(n_kv, i_start + blk_sz);
+                            for (int j = 0; j < n_tokens; ++j) {
+                                if (data) {
+                                    std::fill(data + j * n_kv + i_start, data + j * n_kv + i_end, -INFINITY);
+                                }
+                                if (data_f16) {
+                                    std::fill(data_f16 + j * n_kv + i_start, data_f16 + j * n_kv + i_end, h_inf);
                                 }
                             }
                         }
