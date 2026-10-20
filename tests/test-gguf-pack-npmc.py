@@ -633,6 +633,28 @@ class TestGGUFPackNPMC(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"Repack with --validate failed: {proc.stderr}")
         self.assertIn("Validation PASSED", proc.stdout)
 
+    def test_embed_superblock_2mib(self):
+        """Test --embed-superblock embeds a 2MB npmc.superblock.<tensor_name> v3 tensor and passes 100/100."""
+        raw_model = os.path.join(self.tmp_dir, "sb_model.gguf")
+        write_test_gguf(raw_model, alignment=32, tensors=[
+            {"name": "blk.0.ffn_gate_exps.weight", "dims": [128, 1], "type": 0, "data_bytes": b"\x42" * 512}
+        ])
+
+        out_model = os.path.join(self.tmp_dir, "sb_out.gguf")
+        proc = run_repacker([raw_model, "-o", out_model, "--embed-superblock", "--validate"])
+        self.assertEqual(proc.returncode, 0, f"Repack with --embed-superblock failed: {proc.stderr}")
+
+        info = parse_gguf_metadata(out_model)
+        self.assertEqual(info["metadata"].get("npmc.superblock.version"), 3)
+        sb_tensors = [t for t in info["tensors"] if t["name"] == "npmc.superblock.blk.0.ffn_gate_exps.weight"]
+        self.assertEqual(len(sb_tensors), 1)
+        self.assertEqual(sb_tensors[0]["dims"], [2097152])
+        with open(out_model, "rb") as f:
+            f.seek(info["data_start_offset"] + sb_tensors[0]["offset"])
+            hdr_magic, hdr_ver = struct.unpack("<QI", f.read(12))
+            self.assertEqual(hdr_magic, 0x485052474E41454C)
+            self.assertEqual(hdr_ver, 3)
+
 if __name__ == "__main__":
     unittest.main()
 

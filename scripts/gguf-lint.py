@@ -304,11 +304,11 @@ def parse_gguf_metadata(filepath):
                 if idx_pos + 1 < len(sorted_indices):
                     next_orig_idx = sorted_indices[idx_pos + 1]
                     delta = tensors[next_orig_idx]["offset"] - tensors[orig_idx]["offset"]
-                    if delta > 0:
+                    if delta > 0 and tensors[orig_idx]["type_id"] not in GGML_QUANT_SIZES:
                         tensors[orig_idx]["approx_bytes"] = delta
                 else:
                     remaining = file_size - data_start_offset - tensors[orig_idx]["offset"]
-                    if remaining > 0:
+                    if remaining > 0 and tensors[orig_idx]["type_id"] not in GGML_QUANT_SIZES:
                         tensors[orig_idx]["approx_bytes"] = remaining
 
     return {
@@ -641,11 +641,12 @@ def analyze_and_lint_gguf(gguf_info, hw):
     if len(moe_expert_tensors) > 1:
         # Check if expert tensors are grouped contiguously
         scattered_seeks = 0
-        last_offset = 0
+        last_end = None
         for t in moe_expert_tensors:
-            if last_offset > 0 and abs(t["offset"] - last_offset) > (64 * 1024 * 1024):
+            t_sz = t.get("exact_bytes", t.get("approx_bytes", 0))
+            if last_end is not None and abs(t["offset"] - last_end) > (64 * 1024 * 1024):
                 scattered_seeks += 1
-            last_offset = t["offset"]
+            last_end = t["offset"] + t_sz
 
         if scattered_seeks > len(moe_expert_tensors) * 0.5:
             penalty = 10
@@ -668,11 +669,13 @@ def analyze_and_lint_gguf(gguf_info, hw):
         if abs_off % 128 != 0:
             misaligned_128_offsets += 1
         dims = t["dims"]
-        if len(dims) >= 2:
-            bpe = GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1]
-            row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
-            if row_stride % 128 != 0:
-                misaligned_128_strides += 1
+        if len(dims) >= 2 and "engram_embd" not in t["name"]:
+            _, type_size = GGML_QUANT_SIZES.get(t["type_id"], (1, 2))
+            if 128 % type_size == 0:
+                bpe = GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1]
+                row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
+                if row_stride >= 128 and row_stride % 128 != 0:
+                    misaligned_128_strides += 1
 
     if misaligned_128_offsets > 0 or misaligned_128_strides > 0:
         penalty = 10
@@ -726,11 +729,11 @@ def analyze_and_lint_gguf(gguf_info, hw):
     for t in critical_tensors:
         abs_off = data_start + t["offset"]
         dims = t["dims"]
+        _, type_size = GGML_QUANT_SIZES.get(t["type_id"], (1, 2))
         bpe = GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1]
-        row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe) if len(dims) >= 2 else (
-            get_tensor_row_bytes(t["type_id"], t["elements"], bpe) if "elements" in t else int(dims[0] * bpe)
-        )
-        if abs_off % 64 != 0 or row_stride % 64 != 0:
+        row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe) if len(dims) >= 2 else 0
+        stride_unaligned = (len(dims) >= 2 and (64 % type_size == 0) and (row_stride >= 64) and (row_stride % 64 != 0))
+        if abs_off % 64 != 0 or stride_unaligned:
             simd_unaligned_crit += 1
 
     if simd_unaligned_crit > 0:

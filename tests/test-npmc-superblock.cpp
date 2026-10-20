@@ -9,7 +9,11 @@
 
 #include "llama-npmc-superblock.h"
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -247,6 +251,131 @@ static void test_sparse24_and_crown_interval() {
     printf("    [OK] Sparse24Metadata (6/16 valid nibbles) and CROWN interval soundness verified.\n");
 }
 
+static void test_npmc_format_benchmarks() {
+    printf("[4] Benchmarking NPMC / .leangrph v3 Superblock2MiB vs Baseline GGUF Layouts...\n");
+    using clock_t = std::chrono::steady_clock;
+
+    // 4.1: Active Expert Lookup: BitwiseVeb4096 + EliasFanoView O(1) vs Linear Scan (U=4096, m=32 active)
+    auto sb = std::make_unique<Superblock2MiB>();
+    const uint32_t num_experts = 4096u;
+    const uint32_t words_per_expert = 64u; // 64 * 64 = 4096 trits/expert
+    std::vector<uint32_t> active_ids;
+    std::vector<std::vector<TernaryBitplane64>> weights(32u, std::vector<TernaryBitplane64>(words_per_expert));
+    for (uint32_t i = 0; i < 32u; ++i) {
+        active_ids.push_back(i * 127u + 3u);
+        for (uint32_t w = 0; w < words_per_expert; ++w) {
+            weights[i][w] = {0x5555555555555555ULL, 0x2222222222222222ULL};
+        }
+    }
+    const bool packed_ok = pack_superblock_2mib(*sb, num_experts, words_per_expert, active_ids, weights);
+    assert(packed_ok);
+    Superblock2MiBView view = sb->view();
+    assert(view.valid());
+
+    // Dense table representing baseline linear descriptor scan over 4096 experts
+    std::vector<uint32_t> baseline_ids(num_experts);
+    for (uint32_t i = 0; i < num_experts; ++i) baseline_ids[i] = i;
+
+    const size_t lookup_iters = 500000u;
+    volatile uintptr_t sink_ptr = 0;
+    auto t0 = clock_t::now();
+    for (size_t it = 0; it < lookup_iters; ++it) {
+        const uint32_t q = active_ids[it & 31u];
+        const TernaryBitplane64 * p = view.expert_bitplanes(q);
+        sink_ptr ^= reinterpret_cast<uintptr_t>(p);
+    }
+    auto t1 = clock_t::now();
+    const double veb_ef_ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / static_cast<double>(lookup_iters);
+
+    volatile size_t sink_idx = 0;
+    auto t2 = clock_t::now();
+    for (size_t it = 0; it < lookup_iters; ++it) {
+        const uint32_t q = active_ids[it & 31u];
+        size_t found = 0;
+        for (size_t j = 0; j < num_experts; ++j) {
+            if (baseline_ids[j] == q) { found = j; break; }
+        }
+        sink_idx += found;
+    }
+    auto t3 = clock_t::now();
+    const double linear_ns = std::chrono::duration<double, std::nano>(t3 - t2).count() / static_cast<double>(lookup_iters);
+
+    // 4.2: TernaryBitplane64::dot_popcount (2-bitplane POPCNT) vs INT8 Scalar/SIMD Dot Product
+    std::vector<TernaryBitplane64> act_planes(words_per_expert, {0x3333333333333333ULL, 0x4444444444444444ULL});
+    std::vector<int8_t> w_i8(words_per_expert * 64u, 1);
+    std::vector<int8_t> a_i8(words_per_expert * 64u, -1);
+    const size_t dot_iters = 200000u;
+    const double total_trits = static_cast<double>(dot_iters) * static_cast<double>(words_per_expert * 64u);
+
+    volatile int32_t dot_sink = 0;
+    const TernaryBitplane64 * w_planes = view.expert_bitplanes_by_rank(0);
+    auto t4 = clock_t::now();
+    for (size_t it = 0; it < dot_iters; ++it) {
+        dot_sink += TernaryBitplane64::dot_popcount(w_planes, act_planes.data(), words_per_expert);
+    }
+    auto t5 = clock_t::now();
+    const double popcnt_sec = std::chrono::duration<double>(t5 - t4).count();
+    const double popcnt_gelem_s = (total_trits / 1e9) / popcnt_sec;
+
+    auto t6 = clock_t::now();
+    for (size_t it = 0; it < dot_iters; ++it) {
+        int32_t acc = 0;
+        for (size_t k = 0; k < words_per_expert * 64u; ++k) {
+            acc += static_cast<int32_t>(w_i8[k]) * static_cast<int32_t>(a_i8[k]);
+        }
+        dot_sink += acc;
+    }
+    auto t7 = clock_t::now();
+    const double i8_sec = std::chrono::duration<double>(t7 - t6).count();
+    const double i8_gelem_s = (total_trits / 1e9) / i8_sec;
+
+    // 4.3: DRAM Bank Power-of-Two Stride Aliasing (65536B) vs NPMC Padded Stride (65664B = +128B)
+    const size_t n_rows = 512u;
+    const size_t aliased_stride = 65536u;
+    const size_t padded_stride  = 65536u + 128u;
+    std::vector<uint8_t> buf_aliased(n_rows * aliased_stride, 1u);
+    std::vector<uint8_t> buf_padded(n_rows * padded_stride, 1u);
+    const size_t strided_passes = 200u;
+    const size_t cols_sampled = 64u; // 64 cache lines per row across all 512 rows (column-major bank conflict pattern)
+
+    volatile uint64_t mem_sink = 0;
+    auto t8 = clock_t::now();
+    for (size_t p = 0; p < strided_passes; ++p) {
+        uint64_t s = 0;
+        for (size_t c = 0; c < cols_sampled; ++c) {
+            const size_t col_off = (c * 1024u) & (aliased_stride - 1u);
+            for (size_t r = 0; r < n_rows; ++r) {
+                s += *reinterpret_cast<const uint64_t *>(&buf_aliased[r * aliased_stride + col_off]);
+            }
+        }
+        mem_sink += s;
+    }
+    auto t9 = clock_t::now();
+    const double aliased_ms = std::chrono::duration<double, std::milli>(t9 - t8).count();
+
+    auto t10 = clock_t::now();
+    for (size_t p = 0; p < strided_passes; ++p) {
+        uint64_t s = 0;
+        for (size_t c = 0; c < cols_sampled; ++c) {
+            const size_t col_off = (c * 1024u) & (aliased_stride - 1u);
+            for (size_t r = 0; r < n_rows; ++r) {
+                s += *reinterpret_cast<const uint64_t *>(&buf_padded[r * padded_stride + col_off]);
+            }
+        }
+        mem_sink += s;
+    }
+    auto t11 = clock_t::now();
+    const double padded_ms = std::chrono::duration<double, std::milli>(t11 - t10).count();
+
+    printf("    * Active Expert Lookup (U=4096): BitwiseVeb4096+EliasFano = %.2f ns/op vs Linear = %.2f ns/op (%.1fx speedup)\n",
+           veb_ef_ns, linear_ns, linear_ns / (veb_ef_ns > 0.0 ? veb_ef_ns : 1.0));
+    printf("    * Ternary Bitplane GEMV (4096 trits): POPCNT = %.2f Gelem/s vs INT8 = %.2f Gelem/s (%.2fx speedup, 4.0x memory compression)\n",
+           popcnt_gelem_s, i8_gelem_s, popcnt_gelem_s / (i8_gelem_s > 0.0 ? i8_gelem_s : 1.0));
+    printf("    * DRAM Bank-Conflict Strided Gather (512 rows x 64KB): Aliased(65536B) = %.2f ms vs Padded(65664B) = %.2f ms (%.2fx speedup)\n",
+           aliased_ms, padded_ms, aliased_ms / (padded_ms > 0.0 ? padded_ms : 1.0));
+    (void)sink_ptr; (void)sink_idx; (void)dot_sink; (void)mem_sink;
+}
+
 int main() {
     printf("=================================================================\n");
     printf("  TEST: Zero-Copy NPMC / .leangrph v3 Superblock2MiB & Ternary   \n");
@@ -254,6 +383,7 @@ int main() {
     test_zero_copy_stream_a_and_b();
     test_edge_cases_and_validation();
     test_sparse24_and_crown_interval();
+    test_npmc_format_benchmarks();
     printf("=================================================================\n");
     printf("[OK] ALL NPMC SUPERBLOCK2MIB TESTS PASSED!\n");
     printf("=================================================================\n");

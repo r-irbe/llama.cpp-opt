@@ -1595,8 +1595,9 @@ void llama_model_loader::done_getting_tensors() const {
         LLAMA_LOG_WARN("%s: skipped %d unused tensors (%.1f MiB) -- e.g. a NextN/MTP head when MTP is not requested; per-tensor detail at debug log level\n",
                 __func__, n_skipped, size_skipped / 1024.0 / 1024.0);
     }
-    if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    const int expected_tensors = n_tensors - static_cast<int>(npmc_superblock_tensors.size());
+    if (n_created != n_tensors && n_created != expected_tensors) {
+        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, expected_tensors, n_created));
     }
 }
 

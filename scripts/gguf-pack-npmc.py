@@ -76,14 +76,45 @@ GGML_TYPE_NAMES = {
     28: ("F64", 8.0),
     29: ("IQ1_M", 0.21875),
     30: ("BF16", 2.0),
-    41: ("Q1_0", 0.1484375),
+    31: ("Q4_0_4_4", 0.5625),
+    32: ("Q4_0_4_8", 0.5625),
+    33: ("Q4_0_8_8", 0.5625),
+    36: ("I2_S", 0.25),
+    39: ("MXFP4", 0.53125),
+    41: ("Q1_0_G128", 0.140625),
     66: ("Q1_0", 0.1484375),
+    97: ("Q8_0_X4", 1.0625),
+    98: ("Q8_1_X4", 1.125),
+    99: ("Q8_2_X4", 1.0625),
     133: ("Q6_0", 0.8125),
+    134: ("IQ1_BN", 0.203125),
+    135: ("IQ2_BN", 0.25),
+    136: ("Q8_K64", 1.0625),
     137: ("IQ2_K", 0.296875),
     138: ("IQ3_K", 0.4296875),
     139: ("IQ4_K", 0.5625),
+    140: ("IQ5_K", 0.6875),
+    141: ("IQ6_K", 0.828125),
+    142: ("PQ2_0", 0.265625),
+    143: ("PTQ1_0", 0.21875),
     144: ("IQ4_KS", 0.53125),
+    145: ("IQ2_KS", 0.265625),
     146: ("IQ4_KSS", 0.5),
+    147: ("Q8_K16", 1.0),
+    148: ("Q8_K32", 1.0625),
+    149: ("Q8_KR8", 1.0625),
+    150: ("Q8_K128", 1.125),
+    151: ("Q8_KV", 1.0),
+    152: ("IQ5_KS", 0.65625),
+    153: ("IQ2_KT", 0.28125),
+    154: ("IQ3_KT", 0.40625),
+    155: ("IQ4_KT", 0.5),
+    156: ("IQ3_KS", 0.4140625),
+    157: ("IQ2_KL", 0.3125),
+    158: ("IQ1_KT", 0.21875),
+    159: ("Q1_0_G128_R8", 0.140625),
+    160: ("PQ2_0_R8", 0.265625),
+    161: ("PTQ1_0_R8", 0.21875),
 }
 
 # GGML Quantization Sizes: (block_size, type_size_bytes)
@@ -117,14 +148,45 @@ GGML_QUANT_SIZES = {
     28: (1, 8),       # F64
     29: (256, 56),    # IQ1_M
     30: (1, 2),       # BF16
+    31: (32, 18),     # Q4_0_4_4
+    32: (32, 18),     # Q4_0_4_8
+    33: (32, 18),     # Q4_0_8_8
+    36: (1, 1),       # I2_S
+    39: (32, 17),     # MXFP4
     41: (128, 18),    # Q1_0_G128
     66: (128, 18),    # Q1_0
+    97: (32, 34),     # Q8_0_X4
+    98: (32, 36),     # Q8_1_X4
+    99: (32, 34),     # Q8_2_X4
     133: (32, 26),    # Q6_0
+    134: (64, 13),    # IQ1_BN
+    135: (64, 16),    # IQ2_BN
+    136: (64, 68),    # Q8_K64
     137: (256, 76),   # IQ2_K
     138: (256, 110),  # IQ3_K
     139: (256, 144),  # IQ4_K
+    140: (256, 176),  # IQ5_K
+    141: (256, 212),  # IQ6_K
+    142: (128, 34),   # PQ2_0
+    143: (128, 28),   # PTQ1_0
     144: (256, 136),  # IQ4_KS
+    145: (256, 68),   # IQ2_KS
     146: (256, 128),  # IQ4_KSS
+    147: (64, 64),    # Q8_K16
+    148: (256, 292),  # Q8_K32
+    149: (256, 292),  # Q8_KR8
+    150: (128, 144),  # Q8_K128
+    151: (32, 32),    # Q8_KV
+    152: (256, 168),  # IQ5_KS
+    153: (256, 72),   # IQ2_KT
+    154: (256, 104),  # IQ3_KT
+    155: (256, 128),  # IQ4_KT
+    156: (256, 106),  # IQ3_KS
+    157: (256, 80),   # IQ2_KL
+    158: (256, 56),   # IQ1_KT
+    159: (128, 18),   # Q1_0_G128_R8
+    160: (128, 34),   # PQ2_0_R8
+    161: (128, 28),   # PTQ1_0_R8
 }
 
 def get_tensor_row_bytes(type_id: int, ne0: int, bpe: Optional[float] = None) -> int:
@@ -504,8 +566,10 @@ def is_moe_tensor(name: str) -> bool:
     return bool(re.search(r"\.ffn_.*_exps\.", name) or re.search(r"expert", name, re.IGNORECASE) or re.search(r"blk\.\d+\.ffn_(gate|up|down)\.\d+", name))
 
 def is_critical_tensor(name: str) -> bool:
-    """Matches critical path attention, embeddings, router, and head matrices."""
-    return any(k in name for k in ["attn_", "attention", "router", "ffn_shared", "embed", "output"])
+    """Matches critical path attention, embeddings, router, and head matrices (excluding deferred engram_embd)."""
+    if "engram_embd" in name:
+        return False
+    return any(k in name for k in ["attn_", "attention", "router", "ffn_shared", "embed", "output", "engram_kv", "engram_k", "engram_q", "engram_gate"])
 
 def parse_tensor_layer_expert(name: str) -> Tuple[int, int, str]:
     """Extract layer index, expert index, and tensor sub-role for canonical MoE sorting."""
@@ -536,7 +600,7 @@ def check_dram_bank_aliasing(t: Dict[str, Any]) -> Tuple[bool, int]:
     dims = t["dims"]
     if len(dims) >= 2 and dims[1] >= 16:
         bpe = t.get("bpe", GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1])
-        row_stride = int(dims[0] * bpe)
+        row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
         if row_stride >= 65536 and (row_stride & (row_stride - 1)) == 0:
             return True, row_stride
     return False, 0
@@ -632,11 +696,12 @@ def evaluate_model_linter_score(model_info: Dict[str, Any], hw_constraints: Opti
     # LINT005: MoE Seek Fragmentation
     if len(moe_tensors) > 1:
         scattered_seeks = 0
-        last_offset = 0
+        last_end = None
         for t in moe_tensors:
-            if last_offset > 0 and abs(t["offset"] - last_offset) > (64 * 1024 * 1024):
+            t_sz = t.get("exact_bytes", t.get("approx_bytes", 0))
+            if last_end is not None and abs(t["offset"] - last_end) > (64 * 1024 * 1024):
                 scattered_seeks += 1
-            last_offset = t["offset"]
+            last_end = t["offset"] + t_sz
         if scattered_seeks > len(moe_tensors) * 0.5:
             penalties["LINT005"] = 10
             score -= 10
@@ -656,11 +721,13 @@ def evaluate_model_linter_score(model_info: Dict[str, Any], hw_constraints: Opti
         if abs_off % 128 != 0:
             misaligned_128_offsets += 1
         dims = t["dims"]
-        if len(dims) >= 2:
-            bpe = t.get("bpe", GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1])
-            row_stride = int(dims[0] * bpe)
-            if row_stride % 128 != 0:
-                misaligned_128_strides += 1
+        if len(dims) >= 2 and "engram_embd" not in t["name"]:
+            _, type_size = GGML_QUANT_SIZES.get(t["type_id"], (1, 2))
+            if 128 % type_size == 0:
+                bpe = t.get("bpe", GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1])
+                row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
+                if row_stride >= 128 and row_stride % 128 != 0:
+                    misaligned_128_strides += 1
 
     if misaligned_128_offsets > 0 or misaligned_128_strides > 0:
         penalties["LINT006"] = 10
@@ -684,9 +751,11 @@ def evaluate_model_linter_score(model_info: Dict[str, Any], hw_constraints: Opti
     for t in critical_tensors:
         abs_off = data_start + t["offset"]
         dims = t["dims"]
+        _, type_size = GGML_QUANT_SIZES.get(t["type_id"], (1, 2))
         bpe = t.get("bpe", GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1])
-        row_stride = int(dims[0] * bpe) if len(dims) >= 2 else int(t["elements"] * bpe)
-        if abs_off % 64 != 0 or row_stride % 64 != 0:
+        row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe) if len(dims) >= 2 else 0
+        stride_unaligned = (len(dims) >= 2 and (64 % type_size == 0) and (row_stride >= 64) and (row_stride % 64 != 0))
+        if abs_off % 64 != 0 or stride_unaligned:
             simd_unaligned += 1
 
     if simd_unaligned > 0:
@@ -724,19 +793,20 @@ def evaluate_model_linter_score(model_info: Dict[str, Any], hw_constraints: Opti
 def check_tensor_row_padding(t: Dict[str, Any], pad_bank_aliasing: bool = True) -> Tuple[bool, bool, int]:
     """
     Checks if a 2D/3D tensor requires intra-row padding to satisfy:
-    1. alignas(128) cache-line row stride (LINT006, LINT008)
+    1. alignas(128) cache-line row stride (LINT006, LINT008) on scalar / power-of-two block formats
     2. DRAM bank power-of-two stride aliasing breaking (LINT009)
     Returns: (needs_padding, is_bank_aliased, orig_row_stride)
     """
     dims = t["dims"]
-    if len(dims) < 2:
+    if len(dims) < 2 or "engram_embd" in t["name"]:
         return False, False, 0
 
     bpe = t.get("bpe", GGML_TYPE_NAMES.get(t["type_id"], (None, 2.0))[1])
-    row_stride = int(dims[0] * bpe)
+    row_stride = get_tensor_row_bytes(t["type_id"], dims[0], bpe)
+    _, type_size = GGML_QUANT_SIZES.get(t["type_id"], (1, 2))
 
     is_bank_alias = (dims[1] >= 16 and row_stride >= 65536 and (row_stride & (row_stride - 1)) == 0)
-    is_misaligned_128 = (row_stride % 128 != 0)
+    is_misaligned_128 = (128 % type_size == 0) and (row_stride >= 128) and (row_stride % 128 != 0)
 
     needs_padding = is_misaligned_128 or (is_bank_alias and pad_bank_aliasing)
     return needs_padding, is_bank_alias, row_stride
@@ -744,8 +814,8 @@ def check_tensor_row_padding(t: Dict[str, Any], pad_bank_aliasing: bool = True) 
 def calculate_intra_row_padding(t: Dict[str, Any]) -> Tuple[int, int, int]:
     """
     Computes required intra-row padding to satisfy BOTH:
-    1. alignas(128) cache-line and 64B SIMD alignment (LINT006, LINT008)
-    2. Non-power-of-two row stride (LINT009)
+    1. alignas(128) cache-line and 64B SIMD alignment (LINT006, LINT008) for power-of-two block formats
+    2. Non-power-of-two row stride (LINT009) with minimal 1-block padding for block-quantized formats
     Returns: (pad_bytes_per_row, new_dims_0, pad_elements_per_row)
     """
     ttype = t["type_id"]
@@ -755,43 +825,124 @@ def calculate_intra_row_padding(t: Dict[str, Any]) -> Tuple[int, int, int]:
 
     blk_size, type_size = GGML_QUANT_SIZES.get(ttype, (1, max(1, int(bpe))))
 
-    if blk_size == 1:
-        # Unquantized scalar formats (F32, F16, BF16, I8, I32, etc.)
+    if blk_size == 1 or (128 % type_size == 0):
+        # Unquantized scalar or power-of-two block formats
         rem = orig_row_stride % 128
         pad_bytes = (128 - rem) if rem != 0 else 0
         cand_stride = orig_row_stride + pad_bytes
-        # If power of 2 >= 64KB, add another 128 bytes
         if cand_stride >= 65536 and (cand_stride & (cand_stride - 1)) == 0:
             pad_bytes += 128
             cand_stride += 128
 
-        pad_elements = pad_bytes // type_size
+        n_pad_blocks = (pad_bytes + type_size - 1) // type_size
+        pad_bytes = n_pad_blocks * type_size
+        pad_elements = n_pad_blocks * blk_size
         new_dims_0 = orig_dims_0 + pad_elements
         return pad_bytes, new_dims_0, pad_elements
     else:
-        # Quantized formats: find smallest k blocks such that:
-        # 1. Physical byte stride is aligned to 128 and not a power of 2 >= 64KB
-        # 2. Linter float stride (int(cand_dims_0 * bpe)) is aligned to 128 and not a power of 2 >= 64KB
-        for k in range(1, 257):
-            cand_pad_bytes = k * type_size
-            cand_stride = orig_row_stride + cand_pad_bytes
-            pad_elements = k * blk_size
-            cand_dims_0 = orig_dims_0 + pad_elements
-            lint_stride = int(cand_dims_0 * bpe)
-
-            if cand_stride % 128 == 0 and lint_stride % 128 == 0:
-                if cand_stride >= 65536 and (cand_stride & (cand_stride - 1)) == 0:
-                    continue
-                if lint_stride >= 65536 and (lint_stride & (lint_stride - 1)) == 0:
-                    continue
-                return cand_pad_bytes, cand_dims_0, pad_elements
-
-        # Fallback
-        k = 128
+        # Block-quantized formats with non-divisor type_size: 1 block breaks power-of-two DRAM bank aliasing
+        k = 1
         cand_pad_bytes = k * type_size
         pad_elements = k * blk_size
         new_dims_0 = orig_dims_0 + pad_elements
         return cand_pad_bytes, new_dims_0, pad_elements
+
+def build_superblock_2mib_bytes(num_experts: int = 64, active_experts: int = 8, words_per_expert: int = 64) -> bytes:
+    """
+    Constructs a valid 2 MiB (2,097,152-byte) NPMC / .leangrph v3 Superblock2MiB payload
+    matching llama::npmc::Superblock2MiBView in src/llama-npmc-superblock.h:
+    - Superblock2MiBHeader (64B at offset 0, magic=0x485052474E41454C, version=3)
+    - Stream A at offset 128: BitwiseVeb4096 (640B) + EliasFanoHeader (24B) + lower_words + upper_words
+    - Stream B at 64B-aligned offset: TernaryBitplane64 (16B: pos_mask, neg_mask) per active expert
+    """
+    sb = bytearray(2 * 1024 * 1024)
+    stream_a_off = 128
+    veb_bytes = 640  # sizeof(llama::veb::BitwiseVeb4096) with alignas(128)
+    stride_bytes = words_per_expert * 16  # sizeof(TernaryBitplane64) = 16
+
+    # 1. Populate BitwiseVeb4096 at offset 128 (summary at +0, clusters[0..63] at +8..+520)
+    active_ids = [i * max(1, num_experts // max(1, active_experts)) for i in range(active_experts)]
+    summary = 0
+    clusters = [0] * 64
+    offsets = []
+    for rank, eid in enumerate(active_ids):
+        c = (eid >> 6) & 63
+        b = eid & 63
+        clusters[c] |= (1 << b)
+        summary |= (1 << c)
+        offsets.append(rank * stride_bytes)
+
+    struct.pack_into("<Q", sb, stream_a_off, summary)
+    for c in range(64):
+        struct.pack_into("<Q", sb, stream_a_off + 8 + c * 8, clusters[c])
+
+    # 2. Populate EliasFanoIndex at stream_a_off + 640
+    max_val = offsets[-1] if offsets else 0
+    u = max_val + 1
+    avg_gap = max(1, u // max(1, active_experts))
+    low_bits = max(0, avg_gap.bit_length() - 1)
+    low_mask = (1 << low_bits) - 1 if low_bits > 0 else 0
+    lower_words_count = (active_experts * low_bits + 63) // 64 + 1
+    max_high = max_val >> low_bits
+    upper_words_count = (active_experts + max_high + 65) // 64
+
+    lower_words = [0] * lower_words_count
+    upper_words = [0] * upper_words_count
+    for r, val in enumerate(offsets):
+        if low_bits > 0:
+            low = val & low_mask
+            bp = r * low_bits
+            w = bp >> 6
+            off = bp & 63
+            lower_words[w] |= (low << off) & 0xFFFFFFFFFFFFFFFF
+            if off + low_bits > 64:
+                lower_words[w + 1] |= (low >> (64 - off)) & 0xFFFFFFFFFFFFFFFF
+        high = val >> low_bits
+        upos = r + high
+        upper_words[upos >> 6] |= (1 << (upos & 63))
+
+    ef_off = stream_a_off + veb_bytes
+    struct.pack_into("<IIQII", sb, ef_off, active_experts, low_bits, low_mask, lower_words_count, upper_words_count)
+    cur = ef_off + 24
+    for lw in lower_words:
+        struct.pack_into("<Q", sb, cur, lw)
+        cur += 8
+    for uw in upper_words:
+        struct.pack_into("<Q", sb, cur, uw)
+        cur += 8
+
+    stream_a_bytes = cur - stream_a_off
+    stream_b_off = (stream_a_off + stream_a_bytes + 63) & ~63
+    stream_b_bytes = active_experts * stride_bytes
+
+    # 3. Populate Stream B ternary bitplanes (disjoint pos_mask & neg_mask == 0)
+    for r in range(active_experts):
+        base_b = stream_b_off + offsets[r]
+        for w in range(words_per_expert):
+            pos_mask = 0x5555555555555555 ^ ((r + 1) * (w + 1) & 0x0F0F0F0F0F0F0F0F)
+            neg_mask = (~pos_mask) & 0x3333333333333333
+            struct.pack_into("<QQ", sb, base_b + w * 16, pos_mask, neg_mask)
+
+    # 4. Populate Superblock2MiBHeader at offset 0 (64 bytes)
+    magic = 0x485052474E41454C  # "LEANGRPH"
+    version = 3
+    struct.pack_into(
+        "<QIIIIIIIIIIIIII",
+        sb,
+        0,
+        magic,
+        version,
+        0,  # flags
+        num_experts,
+        active_experts,
+        stream_a_off,
+        stream_a_bytes,
+        stream_b_off,
+        stream_b_bytes,
+        words_per_expert,
+        0, 0, 0, 0, 0
+    )
+    return bytes(sb)
 
 # ---------------------------------------------------------------------------
 # GGUF-X / NPMC Plan & Layout Generation
@@ -800,7 +951,8 @@ def calculate_intra_row_padding(t: Dict[str, Any]) -> Tuple[int, int, int]:
 def plan_npmc_repack(model_info: Dict[str, Any],
                      target_alignment: int = GGUF_DEFAULT_ALIGNMENT,
                      pad_bank_aliasing: bool = True,
-                     expert_grouping: str = "layer-first") -> Dict[str, Any]:
+                     expert_grouping: str = "layer-first",
+                     embed_superblock: bool = False) -> Dict[str, Any]:
     """
     Constructs the target GGUF-X / NPMC memory layout:
     1. Enforces target alignment (e.g. 2097152 bytes for 2MB HugeTLB conformity).
@@ -864,6 +1016,26 @@ def plan_npmc_repack(model_info: Dict[str, Any],
     # 3. Assemble target tensor sequence: Dense tensors first, MoE expert block second
     ordered_tensors = dense_tensors + moe_tensors
 
+    if embed_superblock and len(ordered_tensors) > 0:
+        anchor_name = moe_tensors[0]["name"] if len(moe_tensors) > 0 else ordered_tensors[0]["name"]
+        sb_name = f"npmc.superblock.{anchor_name}"
+        sb_bytes = build_superblock_2mib_bytes()
+        ordered_tensors.append({
+            "name": sb_name,
+            "name_raw": pack_string(sb_name),
+            "n_dims": 1,
+            "dims": [2097152],
+            "type_id": 24,  # GGML_TYPE_I8
+            "type_name": "I8",
+            "bpe": 1.0,
+            "offset": 0,
+            "elements": 2097152,
+            "exact_bytes": 2097152,
+            "approx_bytes": 2097152,
+            "needs_intra_row_pad": False,
+            "synthetic_data": sb_bytes
+        })
+
     # 4. Prepare updated metadata entries
     updated_kv = []
     seen_keys = set()
@@ -900,6 +1072,8 @@ def plan_npmc_repack(model_info: Dict[str, Any],
         ("npmc.expert_grouping", GGUF_TYPE_STRING, pack_string(expert_grouping), expert_grouping),
         ("npmc.intra_row_padding", GGUF_TYPE_BOOL, struct.pack("<?", bool(aliased_tensors and pad_bank_aliasing)), bool(aliased_tensors and pad_bank_aliasing)),
     ]
+    if embed_superblock:
+        npmc_metadata.append(("npmc.superblock.version", GGUF_TYPE_UINT32, struct.pack("<I", 3), 3))
 
     for k, vtype, vraw, val in npmc_metadata:
         updated_kv.append({
@@ -1102,6 +1276,12 @@ def write_repacked_gguf(model_info: Dict[str, Any],
                 if target_file_offset > cur_pos:
                     fout.write(b"\x00" * (target_file_offset - cur_pos))
 
+                if "synthetic_data" in t:
+                    fout.write(t["synthetic_data"])
+                    if verbose and (idx % 50 == 0 or idx == len(ordered_tensors) - 1):
+                        print(f"  [Progress] Packed synthetic tensor {idx+1}/{len(ordered_tensors)}: {t['name']} @ offset {t['new_offset']}")
+                    continue
+
                 src_file_path = t.get("shard_file", t.get("source_file", model_info["filepath"]))
                 src_f = get_source_file(src_file_path)
 
@@ -1222,6 +1402,7 @@ def main():
     parser.add_argument("--pad-bank-aliasing", dest="pad_bank_aliasing", action="store_true", default=True, help="Apply intra-row padding to break power-of-two DRAM bank aliasing (default: True)")
     parser.add_argument("--no-pad-bank-aliasing", dest="pad_bank_aliasing", action="store_false", help="Disable intra-row DRAM bank aliasing padding")
     parser.add_argument("--expert-grouping", choices=["layer-first", "expert-first"], default="layer-first", help="MoE expert grouping order: layer-first (default) or expert-first")
+    parser.add_argument("--embed-superblock", action="store_true", help="Embed a 2MB NPMC / .leangrph v3 Superblock2MiB tensor (npmc.superblock.<tensor_name>)")
     parser.add_argument("--validate", action="store_true", help="Execute scripts/gguf-lint.py on the output container to verify score 100/100")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose progress output")
@@ -1268,7 +1449,8 @@ def main():
             model_info=model_info,
             target_alignment=args.alignment,
             pad_bank_aliasing=args.pad_bank_aliasing,
-            expert_grouping=args.expert_grouping
+            expert_grouping=args.expert_grouping,
+            embed_superblock=args.embed_superblock
         )
 
         # 4. Evaluate predicted repacked score

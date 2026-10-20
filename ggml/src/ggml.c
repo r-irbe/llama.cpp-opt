@@ -1723,6 +1723,23 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    [GGML_TYPE_Q1_0] = {
+        .type_name                = "q1_0",
+        .blck_size                = QK1_0_G128,
+        .type_size                = sizeof(block_q1_0_g128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q1_0_g128,
+        .from_float               = quantize_row_q1_0_g128,
+        .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_ref,
+        .vec_dot                  = vec_dot_q1_0_g128_q8_0,
+#if defined __AVX2__
+        .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+#else
+        .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+#endif
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_Q1_0_G128_R8] = {
         .type_name                = "q1_0_g128_r8",
         .blck_size                = QK1_0_G128,
@@ -31817,6 +31834,9 @@ static size_t gguf_type_size(enum gguf_type type) {
 }
 
 static void gguf_tensor_info_sanitize(struct gguf_tensor_info * info) {
+    if (info->type == GGML_TYPE_Q1_0) {
+        info->type = GGML_TYPE_Q1_0_G128;
+    }
     GGML_ASSERT(info->n_dims <= GGML_MAX_DIMS);
     GGML_ASSERT(0 <= info->type && info->type < GGML_TYPE_COUNT);
 
@@ -32140,7 +32160,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
                 (int64_t) info->ne[3];
 
             const int64_t blck = ggml_row_blck_size(info->type);
-            if (info->ne[0] % blck != 0) {
+            if (blck <= 0 || info->ne[0] % blck != 0) {
                 fprintf(stderr, "%s: tensor '%s' of type %d (%s) row length (%" PRId64 ") is not a multiple of block size (%" PRId64 ")\n",
                         __func__, info->name.data, (int) info->type, ggml_type_name(info->type), info->ne[0], blck);
                 fclose(file);
