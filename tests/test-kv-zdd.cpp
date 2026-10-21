@@ -121,7 +121,34 @@ int main() {
     // Middle block (e.g. block 100) outside sink & window must be skipped
     assert(skip_mask[100] == 0);
     assert(!ZddAttentionBlockSkipper::is_block_active(100, active_blocks));
-    printf("[OK] Verified ZDD Attention Kernel Block Skipping: active blocks retained, inactive skipped.\n");
+
+    // Verify 64-token FP16 (-INFINITY = 0xFC00) block skip mask invariant (16 x uint64_t words = 0xFC00FC00FC00FC00ULL)
+    std::vector<uint16_t> fp16_mask(total_tokens, 0x0000u);
+    for (uint32_t b = 0; b < total_blocks; ++b) {
+        if (skip_mask[b] == 0) {
+            for (uint32_t t = 0; t < KV_BLOCK_TOKENS; ++t) {
+                fp16_mask[b * KV_BLOCK_TOKENS + t] = 0xFC00u; // -INFINITY in IEEE 754 binary16
+            }
+        }
+    }
+    uint32_t skipped_blocks_64 = 0;
+    for (uint32_t ic = 0; ic < total_tokens; ++ic) {
+        if (((ic & 63u) == 0u) && (ic + 64u <= total_tokens)) {
+            const uint64_t * mp64 = reinterpret_cast<const uint64_t *>(&fp16_mask[ic]);
+            uint64_t diff = 0ULL;
+            for (int w = 0; w < 16; ++w) {
+                diff |= (mp64[w] ^ 0xFC00FC00FC00FC00ULL);
+            }
+            if (diff == 0ULL) {
+                skipped_blocks_64++;
+                ic += 63u;
+                continue;
+            }
+        }
+    }
+    assert(skipped_blocks_64 == total_blocks - active_blocks.size());
+    printf("[OK] Verified ZDD Attention Kernel Block Skipping: %u / %u 64-token blocks skipped in O(1).\n",
+           skipped_blocks_64, total_blocks);
 
     printf("=================================================================\n");
     printf("[OK] ALL ZDD KV CACHE & DLX MOE TESTS PASSED SUCCESSFULLY!\n");

@@ -168,6 +168,9 @@ option(GGML_SYCL                            "ggml: use SYCL"                    
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
+option(GGML_RUST_MMAP_ENGINE                "ggml: link optional rust-mmap-engine FFI library" OFF)
+set   (GGML_RUST_MMAP_ENGINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../rust-mmap-engine" CACHE PATH
+                                            "ggml: path to rust-mmap-engine root")
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
@@ -192,6 +195,21 @@ find_package(Threads REQUIRED)
 #
 
 add_subdirectory(src)
+
+if (GGML_RUST_MMAP_ENGINE)
+    target_compile_definitions(ggml PUBLIC GGML_USE_RUST_MMAP_ENGINE)
+    target_include_directories(ggml PUBLIC "${GGML_RUST_MMAP_ENGINE_DIR}/include")
+    find_library(GGML_RUST_MMAP_ENGINE_LIB
+        NAMES rust_mmap_engine librust_mmap_engine.a librust_mmap_engine.so
+        PATHS "${GGML_RUST_MMAP_ENGINE_DIR}/target/release"
+        NO_DEFAULT_PATH)
+    if (GGML_RUST_MMAP_ENGINE_LIB)
+        target_link_libraries(ggml PUBLIC "${GGML_RUST_MMAP_ENGINE_LIB}")
+    else()
+        target_link_directories(ggml PUBLIC "${GGML_RUST_MMAP_ENGINE_DIR}/target/release")
+        target_link_libraries(ggml PUBLIC rust_mmap_engine)
+    endif()
+endif()
 
 #
 # tests and examples

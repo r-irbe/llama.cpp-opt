@@ -623,6 +623,18 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // GGUF-X / NPMC v3 2 MiB Superblock tensor registry (key: tensor name -> superblock version)
+    std::unordered_map<std::string, uint32_t> npmc_superblock_tensors;
+
+    bool has_npmc_superblock(const std::string & name) const {
+        return npmc_superblock_tensors.find(name) != npmc_superblock_tensors.end();
+    }
+
+    uint32_t get_npmc_superblock_version(const std::string & name) const {
+        auto it = npmc_superblock_tensors.find(name);
+        return it != npmc_superblock_tensors.end() ? it->second : 0u;
+    }
+
     // layer -> buffer type mapping
     struct layer_buft {
         layer_buft() : buft_matrix(nullptr), buft(nullptr) {}
@@ -756,6 +768,25 @@ struct llama_model {
 // from the current wk_b/wv_b tensor data (hot-swap support). Defined in
 // llama.cpp next to llm_prepare_mla.
 bool llm_refresh_computed_wkv_b(llama_model & model, int il);
+
+// Live MoE Superblock2MiBView dispatch helper: inspects an expert tensor for a valid
+// NPMC / .leangrph v3 superblock header, resolves active expert byte offset via
+// Superblock2MiBView::lookup_expert_offset(expert_id), and evaluates 2-bitplane ternary
+// GEMV via Superblock2MiBView::gemv_popcnt when activations are provided.
+bool llama_graph_dispatch_npmc_superblock(
+    const struct ggml_tensor * expert_tensor,
+    uint32_t expert_id,
+    const void * activations_bitplanes,
+    size_t num_words,
+    int32_t * out_dot,
+    uint64_t * out_expert_offset = nullptr
+);
+
+// Sets dst->op_params[5] = 1 on a FlashAttention tensor when ZDD sparse KV skipping is enabled.
+void llama_graph_apply_zdd_fattn_op_params(
+    struct ggml_tensor * dst,
+    bool zdd_sparse_kv
+);
 
 struct llama_lora_weight {
     struct ggml_tensor * a = nullptr;

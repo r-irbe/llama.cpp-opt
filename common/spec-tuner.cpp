@@ -31,10 +31,46 @@ int spec_tuner_coord::select_epsilon_greedy(double epsilon) const {
     return best_idx;
 }
 
+int spec_tuner_coord::select_thompson_sampling() const {
+    if (arms.empty()) {
+        return 0;
+    }
+    static thread_local std::mt19937 rng(std::random_device{}());
+
+    int chosen_idx = best_idx;
+    double best_sample = -1e30;
+
+    for (int i = 0; i < (int)arms.size(); ++i) {
+        const auto & arm = arms[i];
+        double sample = arm.Q;
+        if (arm.N == 0) {
+            std::normal_distribution<double> dist(0.0, 100.0);
+            sample = dist(rng);
+        } else if (arm.N == 1) {
+            const double prior_sigma = std::max(1.0, std::fabs(arm.Q) * 0.25);
+            std::normal_distribution<double> dist(arm.Q, prior_sigma);
+            sample = dist(rng);
+        } else {
+            const double var = std::max(1e-4, arm.M2 / (double)(arm.N - 1));
+            const double sigma = std::sqrt(var / (double)arm.N);
+            std::normal_distribution<double> dist(arm.Q, sigma);
+            sample = dist(rng);
+        }
+        if (i == 0 || sample > best_sample) {
+            best_sample = sample;
+            chosen_idx  = i;
+        }
+    }
+    return chosen_idx;
+}
+
 void spec_tuner_coord::update(double reward) {
     auto & arm = arms[current_idx];
     arm.N += 1;
-    arm.Q += (reward - arm.Q) / arm.N;
+    const double delta = reward - arm.Q;
+    arm.Q += delta / arm.N;
+    const double delta2 = reward - arm.Q;
+    arm.M2 += delta * delta2;
 
     double best_Q = -1e30;
     for (int i = 0; i < (int)arms.size(); i++) {
@@ -47,8 +83,9 @@ void spec_tuner_coord::update(double reward) {
 
 void spec_tuner_coord::reset_scores() {
     for (auto & arm : arms) {
-        arm.Q = 0.0;
-        arm.N = 0;
+        arm.Q  = 0.0;
+        arm.N  = 0;
+        arm.M2 = 0.0;
     }
     current_idx = user_idx;
     best_idx    = user_idx;
@@ -110,6 +147,9 @@ void spec_tuner::reset_exploration() {
     cooldown = cooldown_max;
     step_ema = 0.0;
     n_calls = 0;
+    ema_accept_rate = 0.0;
+    ema_token_entropy = 0.0;
+    entropy_gated = false;
 }
 
 void spec_tuner::write_best(common_params_speculative & params) const {
@@ -152,6 +192,9 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
     n_resets   = 0;
     t_tuner_us = 0;
     last_n_drafted = 0;
+    ema_accept_rate = 0.0;
+    ema_token_entropy = 0.0;
+    entropy_gated = false;
 
     // all types get n_max
     // For simplicity we will create a fixed grid of possible values
@@ -270,20 +313,43 @@ int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
         }
     }
 
-    int best_idx = -1;
+    static thread_local std::mt19937 rng(std::random_device{}());
+
+    int best_mean_idx = -1;
+    int ts_best_idx   = -1;
+    double best_sample = -1e30;
+
     for (int i = 0; i < (int) coord.arms.size(); ++i) {
         if (dflash_quarantined[i]) {
             continue;
         }
-        if (best_idx < 0 || coord.arms[i].Q > coord.arms[best_idx].Q) {
-            best_idx = i;
+        if (best_mean_idx < 0 || coord.arms[i].Q > coord.arms[best_mean_idx].Q) {
+            best_mean_idx = i;
+        }
+        const auto & arm = coord.arms[i];
+        double sample = arm.Q;
+        if (arm.N >= 2) {
+            const double var = std::max(1e-4, arm.M2 / (double)(arm.N - 1));
+            const double sigma = std::sqrt(var / (double)arm.N);
+            std::normal_distribution<double> dist(arm.Q, sigma);
+            sample = dist(rng);
+        }
+        if (ts_best_idx < 0 || sample > best_sample) {
+            best_sample = sample;
+            ts_best_idx = i;
         }
     }
-    if (best_idx < 0) {
-        best_idx = 0;
+    if (best_mean_idx < 0) {
+        best_mean_idx = 0;
     }
-    coord.best_idx = best_idx;
-    return best_idx;
+    if (ts_best_idx < 0) {
+        ts_best_idx = best_mean_idx;
+    }
+    coord.best_idx = best_mean_idx;
+    if (ts_best_idx != best_mean_idx) {
+        dflash_last_exploratory = true;
+    }
+    return ts_best_idx;
 }
 
 void spec_tuner::update_dflash_quarantine() {
@@ -344,7 +410,16 @@ void spec_tuner::propose(common_params_speculative & params) {
                 n_exploratory_selections++;
             }
         } else {
-            coord.current_idx = coord.select_epsilon_greedy(epsilon);
+            bool all_have_variance = !coord.arms.empty();
+            for (const auto & arm : coord.arms) {
+                if (arm.N < 2) {
+                    all_have_variance = false;
+                    break;
+                }
+            }
+            coord.current_idx = all_have_variance
+                ? coord.select_thompson_sampling()
+                : coord.select_epsilon_greedy(epsilon);
         }
 
         float val = coord.arms[coord.current_idx].value;
@@ -355,6 +430,15 @@ void spec_tuner::propose(common_params_speculative & params) {
         else if (coord.name == "ngram_size_m")         params.ngram_size_m         = (uint16_t)val;
         else if (coord.name == "ngram_min_hits")       params.ngram_min_hits       = (uint16_t)val;
         else if (coord.name == "suffix_min_match_len") params.suffix_min_match_len = (int32_t)val;
+    }
+
+    // Unified online entropy & acceptance-rate gate across DFlash, DSpark, MTP, and CCD suffix-trie
+    if (entropy_gated && (
+            spec_type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+            spec_type == COMMON_SPECULATIVE_TYPE_DSPARK ||
+            spec_type == COMMON_SPECULATIVE_TYPE_MTP    ||
+            spec_type == COMMON_SPECULATIVE_TYPE_SUFFIX)) {
+        params.n_max = has_dflash_target_only_arm() ? 0 : std::min((int32_t)params.n_max, (int32_t)2);
     }
 
     enforce_constraints(params);
@@ -375,9 +459,31 @@ void spec_tuner::enforce_constraints(common_params_speculative & params) {
     if (params.ngram_min_hits < 1) params.ngram_min_hits = 1;
 }
 
+void spec_tuner::update_entropy_gate(float token_entropy) {
+    if (token_entropy < 0.0f) {
+        return;
+    }
+    if (ema_token_entropy <= 0.0) {
+        ema_token_entropy = (double)token_entropy;
+    } else {
+        ema_token_entropy = 0.2 * (double)token_entropy + 0.8 * ema_token_entropy;
+    }
+    entropy_gated = (ema_token_entropy > (double)entropy_gate_threshold) &&
+                    (n_calls < 4 || ema_accept_rate < 0.25);
+}
+
 void spec_tuner::accept_feedback(int n_accepted, int n_drafted, double step_tps) {
     int64_t t_start = ggml_time_us();
     n_calls++;
+
+    if (n_drafted > 0) {
+        const double step_accept = (double)std::max(0, n_accepted) / (double)n_drafted;
+        if (n_calls <= 1 && ema_accept_rate <= 0.0) {
+            ema_accept_rate = step_accept;
+        } else {
+            ema_accept_rate = 0.15 * step_accept + 0.85 * ema_accept_rate;
+        }
+    }
 
     // per-step TPS as reward: captures draft cost, verification cost, and acceptance benefit
     double reward = step_tps;

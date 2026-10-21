@@ -2883,19 +2883,25 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
     if (llm_arch_is_dsv4(arch)) {
         // mirrors llama_context::ensure_dsv4_cache_tensors
         constexpr uint32_t cache_pad = 256;
-        const uint32_t csa_ratio = hparams.dsv4_csa_ratio;
-        const uint32_t hca_ratio = hparams.dsv4_hca_ratio;
+        const uint32_t csa_ratio = hparams.dsv4_csa_ratio > 0 ? hparams.dsv4_csa_ratio : 16;
+        const uint32_t hca_ratio = hparams.dsv4_hca_ratio > 0 ? hparams.dsv4_hca_ratio : 64;
 
         const uint32_t n_stream = std::max<uint32_t>(1, n_seq_max);
         const uint32_t csa_kv = GGML_PAD(std::max<uint32_t>(1, (kv_size + csa_ratio - 1)/csa_ratio), cache_pad);
         const uint32_t hca_kv = GGML_PAD(std::max<uint32_t>(1, (kv_size + hca_ratio - 1)/hca_ratio), cache_pad);
-        const uint32_t ratio = hparams.dsv4_compress_ratios[(size_t) il];
-        const int64_t n_embd_head = hparams.n_embd_head_k(il);
-        const int64_t n_indexer_head = hparams.indexer_head_size;
+        const uint32_t ratio = hparams.dsv4_compress_ratios[(size_t) il] > 0
+            ? hparams.dsv4_compress_ratios[(size_t) il]
+            : csa_ratio;
+        const int64_t n_embd_head = hparams.n_embd_head_k(il) > 0
+            ? hparams.n_embd_head_k(il)
+            : (hparams.n_lora_kv > 0 ? (int64_t)(hparams.n_lora_kv + hparams.n_rot) : 512);
+        const uint32_t n_head_kv = std::max<uint32_t>(1, hparams.n_head_kv(il));
+        const int64_t n_indexer_head = hparams.indexer_head_size > 0 ? hparams.indexer_head_size : 128;
+        const ggml_type eff_idx_type_k = (idx_type_k == GGML_TYPE_F16 && ggml_is_quantized(type_k)) ? type_k : idx_type_k;
 
         const uint32_t raw_pad = llama_kv_cache::get_padding(flash_attn);
         const uint32_t k_rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress, n_ubatch, raw_pad, n_seq_max);
-        size_t size = ggml_row_size(type_k, n_embd_head) * hparams.n_head_kv(il) * k_rows;
+        size_t size = ggml_row_size(type_k, n_embd_head) * n_head_kv * k_rows;
         if (hparams.dsv4_shared_streams) {
             // readers alias their source, so only sources and key owners cost anything here
             const uint32_t n_rows = ratio == csa_ratio ? csa_kv : hca_kv;
@@ -2904,13 +2910,13 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
                 size += (size_t) n_embd_head * ratio * n_stream * sizeof(float) * 2;
             }
             if (hparams.dsv41_owns_index_k(il)) {
-                size += ggml_row_size(idx_type_k, n_indexer_head) * n_rows * n_stream;
+                size += ggml_row_size(eff_idx_type_k, n_indexer_head) * n_rows * n_stream;
             }
             return size;
         }
         if (ratio == csa_ratio) {
             size += ggml_row_size(type_k, n_embd_head) * csa_kv * n_stream;
-            size += ggml_row_size(idx_type_k, n_indexer_head) * csa_kv * n_stream;
+            size += ggml_row_size(eff_idx_type_k, n_indexer_head) * csa_kv * n_stream;
             size += (size_t) 2 * n_embd_head * 2 * csa_ratio * n_stream * sizeof(float) * 2;
             size += (size_t) 2 * n_indexer_head * 2 * csa_ratio * n_stream * sizeof(float) * 2;
         } else if (ratio == hca_ratio) {

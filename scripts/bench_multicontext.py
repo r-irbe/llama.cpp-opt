@@ -15,16 +15,229 @@ Key Features:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import re
+import resource
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+MODE_LIVE = "live"
+MODE_SIMULATED = "simulated"
+MODE_FAILED = "failed"
+RUN_MODES = (MODE_LIVE, MODE_SIMULATED, MODE_FAILED)
+
+_GIT_SHA_CACHE = None
+
+
+def get_git_sha() -> str:
+    """Return current git HEAD SHA for provenance tracking."""
+    global _GIT_SHA_CACHE
+    if _GIT_SHA_CACHE is not None:
+        return _GIT_SHA_CACHE
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        _GIT_SHA_CACHE = out if out else "unknown"
+    except Exception:
+        _GIT_SHA_CACHE = "unknown"
+    return _GIT_SHA_CACHE
+
+
+def get_binary_sha256(bin_path: str) -> str:
+    """Compute SHA-256 of the target binary if it exists on disk."""
+    if not bin_path:
+        return "missing"
+    p = Path(bin_path)
+    if not p.is_file():
+        resolved = shutil.which(str(bin_path))
+        if not resolved:
+            return "missing"
+        p = Path(resolved)
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "error"
+
+
+def detect_hardware_info() -> dict:
+    """Probe CPU, NUMA, RAM, and GPU topology for hardware provenance."""
+    info = {
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "cpu_brand": "unknown",
+        "cpu_cores": os.cpu_count() or 1,
+        "numa_nodes": 1,
+        "total_ram_gb": 0.0,
+        "gpu_name": "None",
+        "gpu_vram_gb": 0.0,
+    }
+    if info["os"] == "Linux":
+        try:
+            node_dirs = list(Path("/sys/devices/system/node").glob("node[0-9]*"))
+            if node_dirs:
+                info["numa_nodes"] = len(node_dirs)
+        except Exception:
+            pass
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                m = re.search(r"model name\s*:\s*(.+)", f.read())
+                if m:
+                    info["cpu_brand"] = m.group(1).strip()
+        except Exception:
+            pass
+        try:
+            with open("/proc/meminfo", "r") as f:
+                m = re.search(r"MemTotal:\s*(\d+)\s*kB", f.read())
+                if m:
+                    info["total_ram_gb"] = round(int(m.group(1)) / (1024 ** 2), 1)
+        except Exception:
+            pass
+        if shutil.which("nvidia-smi"):
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                lines = [l for l in out.splitlines() if l.strip()]
+                if lines:
+                    parts = lines[0].split(",")
+                    info["gpu_name"] = parts[0].strip()
+                    info["gpu_vram_gb"] = round(float(parts[1].strip()) / 1024.0, 1)
+            except Exception:
+                pass
+    return info
+
+
+def get_hardware_fingerprint(hw: dict = None) -> str:
+    """Return a concise, deterministic hardware topology fingerprint."""
+    if hw is None:
+        hw = detect_hardware_info()
+    return (
+        f"{hw.get('arch', 'unknown')}|{hw.get('cpu_brand', 'unknown')}|"
+        f"{hw.get('cpu_cores', 1)}c|numa={hw.get('numa_nodes', 1)}|"
+        f"ram={hw.get('total_ram_gb', 0.0)}G|gpu={hw.get('gpu_name', 'None')}({hw.get('gpu_vram_gb', 0.0)}G)"
+    )
+
+
+def _read_proc_vmhwm_kb(pid: int) -> int:
+    """Read VmHWM (Peak Resident Set Size) in kB from /proc/<pid>/status."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1])
+    except Exception:
+        pass
+    return 0
+
+
+class _RusagePopen(subprocess.Popen):
+    """Popen subclass that captures per-child resource usage via os.wait4 on POSIX."""
+
+    def __init__(self, *args, **kwargs):
+        self.rusage = None
+        super().__init__(*args, **kwargs)
+
+    def _try_wait(self, wait_flags):
+        if hasattr(os, "wait4"):
+            try:
+                pid, sts, ru = os.wait4(self.pid, wait_flags)
+                if pid == self.pid:
+                    self.rusage = ru
+                return (pid, sts)
+            except ChildProcessError:
+                return (self.pid, 0)
+        return super()._try_wait(wait_flags)
+
+
+def run_with_vmhwm_monitor(cmd, env=None, timeout=None):
+    """Run subprocess while polling /proc/<pid>/status and os.wait4 for peak VmHWM in kB."""
+    proc = _RusagePopen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    peak_kb = [0]
+    stop_evt = threading.Event()
+
+    def _poll():
+        while not stop_evt.is_set():
+            hwm = _read_proc_vmhwm_kb(proc.pid)
+            if hwm > peak_kb[0]:
+                peak_kb[0] = hwm
+            stop_evt.wait(0.01)
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
+    finally:
+        stop_evt.set()
+        t.join(timeout=1.0)
+
+    if getattr(proc, "rusage", None) is not None and getattr(proc.rusage, "ru_maxrss", 0) > 0:
+        ru_kb = int(proc.rusage.ru_maxrss)
+        if ru_kb > peak_kb[0]:
+            peak_kb[0] = ru_kb
+    elif peak_kb[0] == 0:
+        try:
+            ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+            if ru.ru_maxrss > 0:
+                peak_kb[0] = int(ru.ru_maxrss)
+        except Exception:
+            pass
+
+    return proc.returncode, stdout, stderr, peak_kb[0]
+
+
+def validate_stage_modes(stages: list, allow_mixed_modes: bool = False):
+    """Enforce provenance mode consistency across stages before exporting summaries."""
+    if not stages:
+        raise SystemExit("[REFUSED] No stage records found to summarize.")
+    modes = {s.get("mode") or "unspecified" for s in stages}
+    unknown_modes = sorted(m for m in modes if m not in RUN_MODES)
+    if unknown_modes and not allow_mixed_modes:
+        raise SystemExit(
+            f"[REFUSED] Stage records contain unknown/unspecified mode(s) {unknown_modes}. "
+            "Pass --allow-mixed-modes to override."
+        )
+    if MODE_FAILED in modes and not allow_mixed_modes:
+        raise SystemExit(
+            "[REFUSED] Cannot export multi-context summary containing 'failed' mode stage records. "
+            "Pass --allow-mixed-modes to override."
+        )
+    if len(modes) > 1 and not allow_mixed_modes:
+        raise SystemExit(
+            f"[REFUSED] Mixed execution modes detected in stage records ({sorted(modes)}). "
+            "Refusing to mix 'live' and 'simulated' records without --allow-mixed-modes."
+        )
+    return modes
 
 
 def parse_arguments():
@@ -33,8 +246,13 @@ def parse_arguments():
     )
     parser.add_argument(
         "-m", "--model",
-        required=True,
-        help="Path to GGUF model file or model identifier (for API endpoints)"
+        default=None,
+        help="Path to GGUF model file or model identifier (required unless --from-json is passed)"
+    )
+    parser.add_argument(
+        "--cli-bin",
+        default="./build/bin/llama-cli",
+        help="Path to llama-cli binary (default: ./build/bin/llama-cli)"
     )
     parser.add_argument(
         "--endpoint",
@@ -192,7 +410,17 @@ def parse_arguments():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Simulate execution without running binary"
+        help="Simulate execution (mode='simulated') without running binary"
+    )
+    parser.add_argument(
+        "--allow-mixed-modes",
+        action="store_true",
+        help="Allow mixing 'live' and 'simulated' stage records in summary/JSON export"
+    )
+    parser.add_argument(
+        "--from-json",
+        default=None,
+        help="Load existing stage records from JSON and validate/export summary"
     )
     parser.add_argument(
         "--output-md",
@@ -352,204 +580,252 @@ def query_openai_endpoint(endpoint: str, model: str, prompt: str, ctx_len: int, 
 def main():
     args = parse_arguments()
 
+    if not args.model and not args.from_json:
+        print("Error: the following arguments are required: -m/--model (unless --from-json is passed)", file=sys.stderr)
+        sys.exit(2)
+
     is_endpoint_mode = bool(args.endpoint)
-    if is_endpoint_mode:
-        model_basename = args.model.split("/")[-1]
-        model_path = args.model
-        file_size_gb = 0.0
-        is_huge_model = False
-    else:
-        model_path = Path(args.model).resolve()
-        if not model_path.exists() and not args.dry_run:
-            print(f"Error: Model file '{model_path}' not found.", file=sys.stderr)
-            sys.exit(1)
-        file_size_gb = (model_path.stat().st_size / (1024 ** 3)) if model_path.exists() else 0.0
-        is_huge_model = file_size_gb > 50.0
-        model_basename = model_path.stem
+    git_sha = get_git_sha()
+    binary_sha256 = "endpoint" if is_endpoint_mode else get_binary_sha256(args.cli_bin)
+    hw_info = detect_hardware_info()
+    hardware_fingerprint = get_hardware_fingerprint(hw_info)
 
-    try:
-        context_lengths = [int(c.strip()) for c in args.context_lengths.split(",") if c.strip()]
-    except ValueError:
-        print(f"Error: Invalid context lengths '{args.context_lengths}'. Expected comma-separated integers.", file=sys.stderr)
-        sys.exit(1)
-
-    total_stages = len(context_lengths)
-
-    print("================================================================================")
-    print(f"  STAGED MULTI-CONTEXT BENCHMARK: {model_basename}")
-    if is_endpoint_mode:
-        print(f"  Execution Target: OPENAI-COMPATIBLE API -> {args.endpoint}")
-    else:
-        print(f"  Model Size      : {file_size_gb:.1f} GiB ({'HUGE MODEL' if is_huge_model else 'STANDARD'})")
-
-    base_prompt = args.prompt
-    if args.prompt_file:
-        pf = Path(args.prompt_file).resolve()
-        if pf.exists():
-            with open(pf, "r", encoding="utf-8", errors="replace") as f:
-                base_prompt = f.read()
-            print(f"  Prompt Source   : FILE ({pf.name}, {len(base_prompt):,} chars)")
+    if args.from_json:
+        with open(args.from_json, "r", encoding="utf-8") as jf:
+            loaded = json.load(jf)
+        if isinstance(loaded, dict):
+            stage_results = loaded.get("stages", [])
+            total_elapsed = loaded.get("total_elapsed_sec", 0.0)
+            raw_model = args.model or loaded.get("model") or "loaded_model.gguf"
+            model_path = Path(raw_model) if not is_endpoint_mode else raw_model
+            model_basename = Path(str(raw_model)).stem
+            file_size_gb = float(loaded.get("file_size_gb", 0.0) or 0.0)
+            git_sha = loaded.get("git_sha") or (stage_results[0].get("git_sha") if stage_results else None) or git_sha
+            binary_sha256 = loaded.get("binary_sha256") or (stage_results[0].get("binary_sha256") if stage_results else None) or binary_sha256
+            hardware_fingerprint = loaded.get("hardware_fingerprint") or (stage_results[0].get("hardware_fingerprint") if stage_results else None) or hardware_fingerprint
         else:
-            print(f"Warning: Prompt file '{args.prompt_file}' not found, falling back to default.", file=sys.stderr)
-
-    print(f"  Context Stages  : {total_stages} Stages -> {[f'{c:,}' for c in context_lengths]}")
-    print(f"  Tokens / Stage  : {args.n_predict} Generated Tokens")
-    if not is_endpoint_mode:
-        print(f"  Offload Config  : -ngl {args.n_gpu_layers} | -sm {args.split_mode} | --numa {args.numa}")
-        print(f"  Streaming       : defer_ple={args.defer_ple} | defer_experts={args.defer_experts} | prefetch={args.prefetch_experts}")
-    print("================================================================================")
-
-    stage_results = []
-    total_benchmark_start = time.time()
-
-    for idx, ctx_len in enumerate(context_lengths, start=1):
-        eta_sec = estimate_stage_duration(ctx_len, args.n_predict, is_huge_model)
-        print(f"\n>>> [Stage {idx}/{total_stages}: Context = {ctx_len:,} Tokens] ETA: ~{eta_sec:.1f}s | Evaluating prompt processing & decode...")
-
-        # Scale prompt text safely within context budget (ctx_len - n_predict - margin)
-        safe_prompt_tokens = max(16, ctx_len - args.n_predict - 16)
-        target_chars = int(safe_prompt_tokens * 2.8)
-        if len(base_prompt) < target_chars:
-            multiplier = (target_chars // max(1, len(base_prompt))) + 1
-            stage_prompt = ("\n\n" + (base_prompt.strip() + " ") * multiplier)[:target_chars].strip()
-        else:
-            stage_prompt = base_prompt[:target_chars].strip()
-
-        stage_start = time.time()
+            stage_results = loaded
+            total_elapsed = 0.0
+            raw_model = args.model or "loaded_model.gguf"
+            model_path = Path(raw_model) if not is_endpoint_mode else raw_model
+            model_basename = Path(str(raw_model)).stem
+            file_size_gb = 0.0
+            if stage_results and isinstance(stage_results[0], dict):
+                git_sha = stage_results[0].get("git_sha") or git_sha
+                binary_sha256 = stage_results[0].get("binary_sha256") or binary_sha256
+                hardware_fingerprint = stage_results[0].get("hardware_fingerprint") or hardware_fingerprint
+        modes = validate_stage_modes(stage_results, allow_mixed_modes=args.allow_mixed_modes)
+    else:
         if is_endpoint_mode:
-            metrics = query_openai_endpoint(
-                endpoint=args.endpoint,
-                model=args.model,
-                prompt=stage_prompt,
-                ctx_len=ctx_len,
-                n_predict=args.n_predict,
-                timeout=max(300, int(eta_sec * 3.0))
-            )
-            elapsed = metrics.get("elapsed_sec", time.time() - stage_start)
-            if "error" in metrics:
-                print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] API ERROR: {metrics['error']}", file=sys.stderr)
-        elif args.dry_run:
-            time.sleep(0.1)
-            elapsed = 0.1
-            metrics = {
-                "pp_ms": round(15.0 + ctx_len * 0.05, 2),
-                "pp_tokens": len(stage_prompt.split()),
-                "pp_tps": round(1000.0 / (1.0 + ctx_len * 0.002), 2),
-                "tg_ms": round(args.n_predict * 60.0, 2),
-                "tg_tokens": args.n_predict,
-                "tg_tps": round(1000.0 / 60.0, 2),
-                "ttft_ms": round(15.0 + ctx_len * 0.05, 2)
-            }
+            model_basename = args.model.split("/")[-1]
+            model_path = args.model
+            file_size_gb = 0.0
+            is_huge_model = False
         else:
-            cmd = [
-                "./build/bin/llama-cli",
-                "-m", str(model_path),
-                "-p", stage_prompt,
-                "-n", str(args.n_predict),
-                "--temp", "0",
-                "-c", str(ctx_len),
-                "-b", str(args.batch_size),
-                "-ub", str(args.ubatch_size),
-                "-t", str(args.threads),
-                "-tb", str(args.threads_batch)
-            ]
-            if args.flash_attn:
-                cmd.extend(["-fa", "1"])
-            if args.n_gpu_layers > 0:
-                cmd.extend(["-ngl", str(args.n_gpu_layers)])
-            if args.split_mode:
-                cmd.extend(["-sm", args.split_mode])
-            if args.tensor_override:
-                cmd.extend(["-ot", args.tensor_override])
-            if args.numa:
-                cmd.extend(["--numa", args.numa])
-            if args.spec_type:
-                cmd.extend(["--spec-type", args.spec_type])
-            if args.model_draft:
-                cmd.extend(["-md", str(args.model_draft)])
-                if args.n_gpu_layers_draft is not None:
-                    cmd.extend(["-ngld", str(args.n_gpu_layers_draft)])
-            if args.draft is not None:
-                cmd.extend(["--draft", str(args.draft)])
-            if args.spec_autotune:
-                cmd.append("--spec-autotune")
-            if args.cache_type_k:
-                cmd.extend(["-ctk", args.cache_type_k])
-            if args.cache_type_v:
-                cmd.extend(["-ctv", args.cache_type_v])
-            if args.defer_ple:
-                cmd.append("--defer-ple")
-            if args.defer_experts:
-                cmd.append("--defer-experts")
-            if args.prefetch_experts:
-                cmd.append("-prexp")
-                cmd.extend(["-prexp-t", str(args.prefetch_threads)])
-            if args.rope_scaling:
-                cmd.extend(["--rope-scaling", args.rope_scaling])
-            if args.yarn_orig_ctx is not None:
-                cmd.extend(["--yarn-orig-ctx", str(args.yarn_orig_ctx)])
+            model_path = Path(args.model).resolve()
+            if not model_path.exists() and not args.dry_run:
+                print(f"Error: Model file '{model_path}' not found.", file=sys.stderr)
+                sys.exit(1)
+            file_size_gb = (model_path.stat().st_size / (1024 ** 3)) if model_path.exists() else 0.0
+            is_huge_model = file_size_gb > 50.0
+            model_basename = model_path.stem
+        try:
+            context_lengths = [int(c.strip()) for c in args.context_lengths.split(",") if c.strip()]
+        except ValueError:
+            print(f"Error: Invalid context lengths '{args.context_lengths}'. Expected comma-separated integers.", file=sys.stderr)
+            sys.exit(1)
 
-            env = os.environ.copy()
-            env["GGML_CUDA_NO_PINNED"] = "1"
-            timeout = max(300, int(eta_sec * 3.0))
+        total_stages = len(context_lengths)
 
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    errors="replace",
-                    timeout=timeout
+        print("================================================================================")
+        print(f"  STAGED MULTI-CONTEXT BENCHMARK: {model_basename}")
+        if is_endpoint_mode:
+            print(f"  Execution Target: OPENAI-COMPATIBLE API -> {args.endpoint}")
+        else:
+            print(f"  Model Size      : {file_size_gb:.1f} GiB ({'HUGE MODEL' if is_huge_model else 'STANDARD'})")
+        print(f"  Provenance      : mode={MODE_SIMULATED if args.dry_run else MODE_LIVE} | git_sha={git_sha[:12]} | bin_sha256={binary_sha256[:16]}")
+        print(f"  Hardware        : {hardware_fingerprint}")
+
+        base_prompt = args.prompt
+        if args.prompt_file:
+            pf = Path(args.prompt_file).resolve()
+            if pf.exists():
+                with open(pf, "r", encoding="utf-8", errors="replace") as f:
+                    base_prompt = f.read()
+                print(f"  Prompt Source   : FILE ({pf.name}, {len(base_prompt):,} chars)")
+            else:
+                print(f"Warning: Prompt file '{args.prompt_file}' not found, falling back to default.", file=sys.stderr)
+
+        print(f"  Context Stages  : {total_stages} Stages -> {[f'{c:,}' for c in context_lengths]}")
+        print(f"  Tokens / Stage  : {args.n_predict} Generated Tokens")
+        if not is_endpoint_mode:
+            print(f"  Offload Config  : -ngl {args.n_gpu_layers} | -sm {args.split_mode} | --numa {args.numa}")
+            print(f"  Streaming       : defer_ple={args.defer_ple} | defer_experts={args.defer_experts} | prefetch={args.prefetch_experts}")
+        print("================================================================================")
+
+        stage_results = []
+        total_benchmark_start = time.time()
+
+        for idx, ctx_len in enumerate(context_lengths, start=1):
+            eta_sec = estimate_stage_duration(ctx_len, args.n_predict, is_huge_model)
+            print(f"\n>>> [Stage {idx}/{total_stages}: Context = {ctx_len:,} Tokens] ETA: ~{eta_sec:.1f}s | Evaluating prompt processing & decode...")
+
+            # Scale prompt text safely within context budget (ctx_len - n_predict - margin)
+            safe_prompt_tokens = max(16, ctx_len - args.n_predict - 16)
+            target_chars = int(safe_prompt_tokens * 2.8)
+            if len(base_prompt) < target_chars:
+                multiplier = (target_chars // max(1, len(base_prompt))) + 1
+                stage_prompt = ("\n\n" + (base_prompt.strip() + " ") * multiplier)[:target_chars].strip()
+            else:
+                stage_prompt = base_prompt[:target_chars].strip()
+
+            stage_start = time.time()
+            vm_hwm_kb = 0
+            if is_endpoint_mode:
+                metrics = query_openai_endpoint(
+                    endpoint=args.endpoint,
+                    model=args.model,
+                    prompt=stage_prompt,
+                    ctx_len=ctx_len,
+                    n_predict=args.n_predict,
+                    timeout=max(300, int(eta_sec * 3.0))
                 )
-                elapsed = time.time() - stage_start
-                out = proc.stdout + proc.stderr
-                metrics = parse_llama_cli_output(out, elapsed, returncode=proc.returncode)
-            except subprocess.TimeoutExpired:
-                elapsed = time.time() - stage_start
-                print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] TIMEOUT after {elapsed:.1f}s", file=sys.stderr)
-                metrics = {"error": "TimeoutExpired", "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
-            except Exception as e:
-                elapsed = time.time() - stage_start
-                print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] ERROR: {e}", file=sys.stderr)
-                metrics = {"error": str(e), "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
+                elapsed = metrics.get("elapsed_sec", time.time() - stage_start)
+                stage_mode = MODE_FAILED if "error" in metrics else MODE_LIVE
+                if "error" in metrics:
+                    print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] API ERROR: {metrics['error']}", file=sys.stderr)
+            elif args.dry_run:
+                time.sleep(0.05)
+                elapsed = 0.05
+                stage_mode = MODE_SIMULATED
+                vm_hwm_kb = 0
+                metrics = {
+                    "pp_ms": round(15.0 + ctx_len * 0.05, 2),
+                    "pp_tokens": len(stage_prompt.split()),
+                    "pp_tps": round(1000.0 / (1.0 + ctx_len * 0.002), 2),
+                    "tg_ms": round(args.n_predict * 60.0, 2),
+                    "tg_tokens": args.n_predict,
+                    "tg_tps": round(1000.0 / 60.0, 2),
+                    "ttft_ms": round(15.0 + ctx_len * 0.05, 2)
+                }
+            else:
+                cmd = [
+                    args.cli_bin,
+                    "-m", str(model_path),
+                    "-p", stage_prompt,
+                    "-n", str(args.n_predict),
+                    "--temp", "0",
+                    "-c", str(ctx_len),
+                    "-b", str(args.batch_size),
+                    "-ub", str(args.ubatch_size),
+                    "-t", str(args.threads),
+                    "-tb", str(args.threads_batch)
+                ]
+                if args.flash_attn:
+                    cmd.extend(["-fa", "1"])
+                if args.n_gpu_layers > 0:
+                    cmd.extend(["-ngl", str(args.n_gpu_layers)])
+                if args.split_mode:
+                    cmd.extend(["-sm", args.split_mode])
+                if args.tensor_override:
+                    cmd.extend(["-ot", args.tensor_override])
+                if args.numa:
+                    cmd.extend(["--numa", args.numa])
+                if args.spec_type:
+                    cmd.extend(["--spec-type", args.spec_type])
+                if args.model_draft:
+                    cmd.extend(["-md", str(args.model_draft)])
+                    if args.n_gpu_layers_draft is not None:
+                        cmd.extend(["-ngld", str(args.n_gpu_layers_draft)])
+                if args.draft is not None:
+                    cmd.extend(["--draft", str(args.draft)])
+                if args.spec_autotune:
+                    cmd.append("--spec-autotune")
+                if args.cache_type_k:
+                    cmd.extend(["-ctk", args.cache_type_k])
+                if args.cache_type_v:
+                    cmd.extend(["-ctv", args.cache_type_v])
+                if args.defer_ple:
+                    cmd.append("--defer-ple")
+                if args.defer_experts:
+                    cmd.append("--defer-experts")
+                if args.prefetch_experts:
+                    cmd.append("-prexp")
+                    cmd.extend(["-prexp-t", str(args.prefetch_threads)])
+                if args.rope_scaling:
+                    cmd.extend(["--rope-scaling", args.rope_scaling])
+                if args.yarn_orig_ctx is not None:
+                    cmd.extend(["--yarn-orig-ctx", str(args.yarn_orig_ctx)])
 
-        if "error" in metrics:
-            print(
-                f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
-                f"FAILED in {elapsed:>5.2f}s | Error: {metrics['error']}"
-            )
-        else:
-            print(
-                f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
-                f"DONE in {elapsed:>5.2f}s (ETA: {eta_sec:>5.1f}s) | "
-                f"PP: {metrics['pp_tps']:>7.2f} t/s ({metrics['pp_ms']:>7.1f} ms) | "
-                f"TG: {metrics['tg_tps']:>5.2f} t/s ({metrics['tg_ms']:>6.1f} ms) | "
-                f"TTFT: {metrics['ttft_ms']:>7.1f} ms"
-            )
+                env = os.environ.copy()
+                env["GGML_CUDA_NO_PINNED"] = "1"
+                timeout = max(300, int(eta_sec * 3.0))
 
-        stage_results.append({
-            "stage": idx,
-            "context_length": ctx_len,
-            "elapsed_sec": round(elapsed, 2),
-            "eta_sec": eta_sec,
-            **metrics
-        })
+                try:
+                    returncode, stdout, stderr, vm_hwm_kb = run_with_vmhwm_monitor(
+                        cmd,
+                        env=env,
+                        timeout=timeout
+                    )
+                    elapsed = time.time() - stage_start
+                    out = stdout + stderr
+                    metrics = parse_llama_cli_output(out, elapsed, returncode=returncode)
+                    stage_mode = MODE_FAILED if "error" in metrics else MODE_LIVE
+                except subprocess.TimeoutExpired:
+                    elapsed = time.time() - stage_start
+                    stage_mode = MODE_FAILED
+                    print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] TIMEOUT after {elapsed:.1f}s", file=sys.stderr)
+                    metrics = {"error": "TimeoutExpired", "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
+                except Exception as e:
+                    elapsed = time.time() - stage_start
+                    stage_mode = MODE_FAILED
+                    print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] ERROR: {e}", file=sys.stderr)
+                    metrics = {"error": str(e), "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
 
-    total_elapsed = time.time() - total_benchmark_start
+            if "error" in metrics:
+                print(
+                    f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
+                    f"FAILED in {elapsed:>5.2f}s | mode={stage_mode} | Error: {metrics['error']}"
+                )
+            else:
+                print(
+                    f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] "
+                    f"DONE in {elapsed:>5.2f}s (ETA: {eta_sec:>5.1f}s) | mode={stage_mode} | "
+                    f"PP: {metrics['pp_tps']:>7.2f} t/s ({metrics['pp_ms']:>7.1f} ms) | "
+                    f"TG: {metrics['tg_tps']:>5.2f} t/s ({metrics['tg_ms']:>6.1f} ms) | "
+                    f"TTFT: {metrics['ttft_ms']:>7.1f} ms | VmHWM: {vm_hwm_kb:,} kB"
+                )
+
+            stage_results.append({
+                "stage": idx,
+                "context_length": ctx_len,
+                "elapsed_sec": round(elapsed, 2),
+                "eta_sec": eta_sec,
+                "mode": stage_mode,
+                "binary_sha256": binary_sha256,
+                "git_sha": git_sha,
+                "hardware_fingerprint": hardware_fingerprint,
+                "vm_hwm_kb": vm_hwm_kb,
+                **metrics
+            })
+
+        total_elapsed = time.time() - total_benchmark_start
+        modes = validate_stage_modes(stage_results, allow_mixed_modes=args.allow_mixed_modes)
+
+    mode_str = ", ".join(sorted(modes)) if modes else (MODE_SIMULATED if args.dry_run else MODE_LIVE)
+    peak_vm_hwm_kb = max((int(r.get("vm_hwm_kb", 0) or 0) for r in stage_results), default=0)
 
     print("\n================================================================================")
-    print(f"  MULTI-CONTEXT BENCHMARK COMPLETE: {total_stages} Stages in {total_elapsed:.2f}s")
+    print(f"  MULTI-CONTEXT BENCHMARK COMPLETE: {len(stage_results)} Stages in {total_elapsed:.2f}s (mode={mode_str})")
     print("================================================================================")
 
     print("\nSTAGE-BY-STAGE MULTI-CONTEXT SCALING SUMMARY:")
-    print("  Stage | Context Length | Elapsed |   Prompt (PP)   |  Generation (TG)  |    TTFT (ms)   ")
-    print("  ----- | -------------- | ------- | --------------- | ----------------- | ---------------")
+    print("  Stage | Context Length |   Mode    | Elapsed |   Prompt (PP)   |  Generation (TG)  |    TTFT (ms)   | VmHWM (kB) ")
+    print("  ----- | -------------- | --------- | ------- | --------------- | ----------------- | -------------- | ---------- ")
     for r in stage_results:
         print(
-            f"   {r['stage']:02d}   |   {r['context_length']:>10,d}   |  {r['elapsed_sec']:>4.1f}s  | "
-            f"{r['pp_tps']:>7.2f} tok/s  |   {r['tg_tps']:>5.2f} tok/s   |   {r['ttft_ms']:>8.1f} ms   "
+            f"   {r['stage']:02d}   |   {r['context_length']:>10,d}   | {r.get('mode', MODE_LIVE):>9s} |  {r['elapsed_sec']:>4.1f}s  | "
+            f"{r['pp_tps']:>7.2f} tok/s  |   {r['tg_tps']:>5.2f} tok/s   |   {r['ttft_ms']:>8.1f} ms  | {int(r.get('vm_hwm_kb', 0) or 0):>10,d}"
         )
     print("=" * 80)
 
@@ -562,6 +838,11 @@ def main():
         "",
         f"**Repository**: `ikawrakow/ik_llama.cpp` (`feat/numa-split`)  ",
         f"**Date**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}  ",
+        f"**Execution Mode**: `{mode_str}`  ",
+        f"**Git SHA**: `{git_sha}`  ",
+        f"**Binary SHA-256**: `{binary_sha256}`  ",
+        f"**Hardware Fingerprint**: `{hardware_fingerprint}`  ",
+        f"**Peak VmHWM**: `{peak_vm_hwm_kb:,} kB`  ",
         f"**Model Path**: `{model_path}` ({file_size_gb:.1f} GiB)  ",
         f"**Execution Flags**: `-ngl {args.n_gpu_layers} -sm {args.split_mode} --numa {args.numa} -t {args.threads} -tb {args.threads_batch}`  ",
         "",
@@ -569,13 +850,14 @@ def main():
         "",
         "## Multi-Context Scaling Across Progressive Sequence Lengths",
         "",
-        "| Stage | Context Length | Elapsed Time | Prompt Throughput (PP) | Prompt Latency | Generation Throughput (TG) | TTFT |",
-        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "| Stage | Context Length | Mode | Elapsed Time | Prompt Throughput (PP) | Prompt Latency | Generation Throughput (TG) | TTFT | Peak VmHWM (kB) |",
+        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     ]
     for r in stage_results:
         md_lines.append(
-            f"| {r['stage']:02d} | **{r['context_length']:,} tokens** | {r['elapsed_sec']:.2f}s | "
-            f"**{r['pp_tps']:.2f} tok/s** | {r['pp_ms']:.1f} ms | **{r['tg_tps']:.2f} tok/s** | {r['ttft_ms']:.1f} ms |"
+            f"| {r['stage']:02d} | **{r['context_length']:,} tokens** | `{r.get('mode', MODE_LIVE)}` | {r['elapsed_sec']:.2f}s | "
+            f"**{r['pp_tps']:.2f} tok/s** | {r['pp_ms']:.1f} ms | **{r['tg_tps']:.2f} tok/s** | {r['ttft_ms']:.1f} ms | "
+            f"`{int(r.get('vm_hwm_kb', 0) or 0):,}` |"
         )
 
     with open(out_md, "w", encoding="utf-8") as f:
@@ -583,10 +865,16 @@ def main():
     print(f"\n[REPORT] Saved Markdown Benchmark Report to: {out_md}")
 
     if args.output_json:
+        Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.output_json, "w", encoding="utf-8") as jf:
             json.dump({
                 "model": str(model_path),
                 "file_size_gb": file_size_gb,
+                "mode": mode_str,
+                "git_sha": git_sha,
+                "binary_sha256": binary_sha256,
+                "hardware_fingerprint": hardware_fingerprint,
+                "peak_vm_hwm_kb": peak_vm_hwm_kb,
                 "total_elapsed_sec": round(total_elapsed, 2),
                 "stages": stage_results
             }, jf, indent=2)

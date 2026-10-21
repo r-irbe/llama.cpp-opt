@@ -301,7 +301,7 @@ static ggml_tensor * dsv4_pad_raw_k_to(
         zero_row = ggml_cast(ctx, zero_row, GGML_TYPE_F32);
     }
     zero_row = ggml_scale(ctx, zero_row, 0.0f);
-    if (raw_k->type != zero_row->type && !ggml_is_quantized(raw_k->type)) {
+    if (raw_k->type != zero_row->type) {
         zero_row = ggml_cast(ctx, zero_row, raw_k->type);
     }
     ggml_tensor * zeros = ggml_repeat_4d(ctx, zero_row, zero_row->ne[0], zero_row->ne[1], n_pad, zero_row->ne[3]);
@@ -633,8 +633,12 @@ static ggml_tensor * dsv4_build_attn(
     const bool use_flash_attn = cparams.flash_attn &&
             (kq_mask == nullptr || kq_mask->ne[3] == 1);
     if (use_flash_attn) {
+        const bool same_kv = (k == v);
 
         if (v_trans) {
+            if (ggml_is_quantized(v->type)) {
+                v = ggml_cast(ctx, v, GGML_TYPE_F16);
+            }
             v = ggml_transpose(ctx, v);
         }
 
@@ -642,7 +646,9 @@ static ggml_tensor * dsv4_build_attn(
             k = ggml_cast(ctx, k, GGML_TYPE_F16);
         }
 
-        if (v->type == GGML_TYPE_F32) {
+        if (!v_trans && same_kv) {
+            v = k;
+        } else if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx, v, GGML_TYPE_F16);
         }
 
@@ -701,6 +707,9 @@ static ggml_tensor * dsv4_build_attn(
     cb(kq, "kq_soft_max", il);
 
     if (!v_trans) {
+        if (ggml_is_quantized(v->type)) {
+            v = ggml_cast(ctx, v, cparams.graph_attn_precision == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16);
+        }
         v = ggml_cont(ctx, ggml_transpose(ctx, v));
         cb(v, "v_cont", il);
     }
@@ -1427,8 +1436,16 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             raw_mask = ggml_cast(ctx0, raw_mask, extra_mask->type);
         }
         if (raw_k->type != extra_k->type) {
-            extra_k = ggml_cast(ctx0, extra_k, raw_k->type);
-            cb(extra_k, (tag + "_k_cast").c_str(), il);
+            const ggml_type target_k_type = cparams.flash_attn ? GGML_TYPE_F16
+                : (ggml_is_quantized(raw_k->type) ? extra_k->type : raw_k->type);
+            if (raw_k->type != target_k_type) {
+                raw_k = ggml_cast(ctx0, raw_k, target_k_type);
+                cb(raw_k, (tag + "_raw_k_cast").c_str(), il);
+            }
+            if (extra_k->type != target_k_type) {
+                extra_k = ggml_cast(ctx0, extra_k, target_k_type);
+                cb(extra_k, (tag + "_k_cast").c_str(), il);
+            }
         }
         ggml_tensor * k_all = ggml_concat(ctx0, raw_k, extra_k, 2);
         ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, extra_mask, 0);
@@ -1912,6 +1929,9 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     cb(inpL, "dsv4_dflash_hc_init", -1);
 
     auto build_attention = [&](int il, ggml_tensor * input, ggml_tensor * inp_pos) {
+        if (lctx.paged_kv) {
+            llm_build_context::llama_graph_stream_paged_kv(lctx, kv_self, (int32_t)n_kv, il);
+        }
         const auto & layer = model.layers[il];
         ggml_tensor * qr = llm_build_lora_mm(lctx, ctx0, layer.wq_a, input);
         qr = llm_build_norm(ctx0, qr, hparams, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, cb, il);
@@ -2354,8 +2374,16 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
             raw_mask = ggml_cast(ctx0, raw_mask, extra_mask->type);
         }
         if (raw_k->type != extra_k->type) {
-            extra_k = ggml_cast(ctx0, extra_k, raw_k->type);
-            cb(extra_k, (tag + "_k_cast").c_str(), il);
+            const ggml_type target_k_type = cparams.flash_attn ? GGML_TYPE_F16
+                : (ggml_is_quantized(raw_k->type) ? extra_k->type : raw_k->type);
+            if (raw_k->type != target_k_type) {
+                raw_k = ggml_cast(ctx0, raw_k, target_k_type);
+                cb(raw_k, (tag + "_raw_k_cast").c_str(), il);
+            }
+            if (extra_k->type != target_k_type) {
+                extra_k = ggml_cast(ctx0, extra_k, target_k_type);
+                cb(extra_k, (tag + "_k_cast").c_str(), il);
+            }
         }
         ggml_tensor * k_all = ggml_concat(ctx0, raw_k, extra_k, 2);
         ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, extra_mask, 0);

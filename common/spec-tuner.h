@@ -8,6 +8,7 @@ struct spec_tuner_arm {
     float  value;
     double Q     = 0.0; // mean per-step Tokens-Per-Second (TPS)
     int    N     = 0;
+    double M2    = 0.0; // Welford running sum of squared deviations for Thompson sampling
 };
 
 struct spec_tuner_coord {
@@ -18,6 +19,7 @@ struct spec_tuner_coord {
     int user_idx    = 0;
 
     int select_epsilon_greedy(double epsilon) const;
+    int select_thompson_sampling() const;
 
     void update(double reward);
 
@@ -68,12 +70,19 @@ struct spec_tuner {
     double   ema_tps         = 0.0;
     double   ema_alpha       = 0.3;
 
+    // online draft acceptance-rate and token-entropy gating (DFlash / DSpark / MTP / CCD)
+    double   ema_accept_rate        = 0.0;
+    double   ema_token_entropy      = 0.0;
+    float    entropy_gate_threshold = 3.5f;
+    bool     entropy_gated          = false;
+
     common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
     std::vector<spec_tuner_coord> coords;
 
     void init(common_speculative_type type, const common_params_speculative & user_params, const llama_model * model_tgt);
     void propose(common_params_speculative & params);
     void accept_feedback(int n_accepted, int n_drafted, double step_tps);
+    void update_entropy_gate(float token_entropy);
     void end_of_request(double slot_tps, int n_past, common_params_speculative & active_params);
     void enforce_constraints(common_params_speculative & params);
     void print_best() const;

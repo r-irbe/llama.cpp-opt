@@ -394,6 +394,63 @@ static void test_cohort_slot_cleansing() {
     check(slot.kv_cleansed,                "KV cache sequence removal confirmed (zero state leakage)");
 }
 
+static void test_cohort_cross_slot_donor_cloning() {
+    printf("\n=== Testing Cross-Slot Donor Prefix Lookup Across Busy & Idle Slots ===\n");
+
+    cohort_radix_trie trie;
+
+    struct donor_test_slot {
+        int id;
+        std::string cohort_id;
+        bool is_avail;
+        int n_past;
+        int cohort_reuse_count;
+        int64_t t_last_used;
+        bool available() const { return is_avail; }
+    };
+
+    // Slot 0: BUSY decoding a Cohort Alpha request with 6 tokens already in KV cache (n_past = 6)
+    // Slot 1: IDLE empty slot (n_past = 0) assigned to incoming sibling Cohort Alpha request
+    // Slot 2: BUSY decoding a Cohort Beta request (n_past = 6)
+    // Slot 3: BUSY Cohort Alpha slot whose KV cache only has 2 tokens materialized (n_past = 2)
+    std::vector<donor_test_slot> slots = {
+        { 0, "cohort_alpha", false, 6, 1, 2000 },
+        { 1, "",             true,  0, 0,  500 },
+        { 2, "cohort_beta",  false, 6, 2, 2500 },
+        { 3, "cohort_alpha", false, 2, 5, 3000 }
+    };
+
+    trie.insert_slot(0, { 101, 102, 103, 104, 105, 106 });
+    trie.insert_slot(2, { 101, 102, 103, 104, 105, 106 });
+    trie.insert_slot(3, { 101, 102, 103, 104, 105, 106 });
+
+    auto get_slot = [&](int id) -> const donor_test_slot* {
+        if (id >= 0 && id < (int)slots.size()) return &slots[id];
+        return nullptr;
+    };
+
+    // 1. Standard find_best_match requires slot->available(), so it returns -1 when Slot 0 is busy
+    auto idle_match = trie.find_best_match({ 101, 102, 103, 104, 105, 999 }, "cohort_alpha", 3, get_slot);
+    check(idle_match.slot_id == -1,
+          "find_best_match skips busy Slot 0 when selecting an idle execution slot");
+
+    // 2. find_best_donor_match locates busy Slot 0 (n_past=6 >= 5) for cross-slot KV cloning into Slot 1,
+    //    while skipping Slot 3 (n_past=2 < 5) and Slot 2 (cohort_beta != cohort_alpha)
+    auto donor_match = trie.find_best_donor_match({ 101, 102, 103, 104, 105, 999 }, "cohort_alpha", 3, get_slot, 1);
+    check(donor_match.slot_id == 0 && donor_match.matched_tokens == 5,
+          "find_best_donor_match selects busy Cohort Alpha donor Slot 0 (5 tokens, n_past >= 5)");
+
+    // 3. Verify strict cohort isolation on donor lookup: foreign tenant cannot clone from Slot 0 or Slot 2
+    auto foreign_donor = trie.find_best_donor_match({ 101, 102, 103, 104, 105, 999 }, "cohort_gamma", 3, get_slot, 1);
+    check(foreign_donor.slot_id == -1,
+          "find_best_donor_match enforces strict multi-tenant isolation against foreign cohort");
+
+    // 4. Verify untagged public request cannot clone from private cohort donor
+    auto public_donor = trie.find_best_donor_match({ 101, 102, 103, 104, 105, 999 }, "", 3, get_slot, 1);
+    check(public_donor.slot_id == -1,
+          "find_best_donor_match prevents untagged request from cloning private cohort KV cache");
+}
+
 int main() {
     printf("===================================================================\n");
     printf("   ik_llama.cpp - Prompt Prefix Sharing (PPS) Cohort Test Suite    \n");
@@ -407,6 +464,7 @@ int main() {
     test_cohort_idle_timeout_eviction();
     test_cohort_lru_lfu_hierarchy();
     test_cohort_slot_cleansing();
+    test_cohort_cross_slot_donor_cloning();
 
     printf("\n===================================================================\n");
     if (n_fail == 0) {

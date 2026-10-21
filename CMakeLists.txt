@@ -83,6 +83,7 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(GGML_RUST_MMAP_ENGINE "ggml: link optional rust-mmap-engine FFI library" OFF)
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -158,6 +159,11 @@ endif()
 #
 
 add_subdirectory(src)
+
+if (GGML_RUST_MMAP_ENGINE)
+    target_compile_definitions(llama PUBLIC GGML_USE_RUST_MMAP_ENGINE)
+    target_include_directories(llama PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../rust-mmap-engine/include")
+endif()
 
 #
 # install

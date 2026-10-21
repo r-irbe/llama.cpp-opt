@@ -122,7 +122,11 @@ static void test_zero_copy_stream_a_and_b() {
         }
         assert(got_pop == ref_pop);
         assert(got_i8 == ref_i8);
+        const uint64_t expected_off = static_cast<uint64_t>(view.header()->stream_b_offset) + r * expected_stride;
+        assert(view.lookup_expert_offset(active_ids[r]) == expected_off);
+        assert(view.gemv_popcnt(active_ids[r], act_planes.data(), words_per_expert) == ref_pop);
     }
+    assert(view.lookup_expert_offset(1u) == 0ULL);
     printf("    [OK] Zero-copy Stream A/B pointers, BitwiseVeb4096 + EliasFanoIndex, and popcount dot product verified.\n");
 }
 

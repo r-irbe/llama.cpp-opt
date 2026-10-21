@@ -13,11 +13,34 @@
 #include "fattn-mma-f16-interface.cuh"
 #include "fattn-new-mma.cuh"
 #include "fattn.cuh"
+#include "fattn-zdd-gpu.cuh"
 #include "dsa_attn.cuh"
 
 #include <cstdint>
 
 #define FATTN_KQ_STRIDE 256
+
+void ggml_cuda_fattn_zdd_configure_l2(
+        cudaStream_t stream,
+        const ggml_tensor * dst,
+        int device_id) {
+    if (!dst || device_id < 0 || device_id >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    void * target_ptr = (mask && mask->data) ? mask->data : ((K && K->data) ? K->data : nullptr);
+    size_t target_bytes = 0u;
+    if (mask && mask->data) {
+        target_bytes = ggml_nbytes(mask);
+    } else if (K && K->data) {
+        const size_t sink_bytes = static_cast<size_t>(4u * GPU_KV_BLOCK_SIZE) * K->nb[1];
+        target_bytes = std::min<size_t>(ggml_nbytes(K), sink_bytes);
+    }
+    if (target_ptr != nullptr && target_bytes > 0u) {
+        ggml::cuda::kv::set_gpu_kv_l2_persistence(stream, target_ptr, target_bytes, device_id);
+    }
+}
 
 static inline bool mma_better_than_turing(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > CC_TURING;
@@ -44,6 +67,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * mask = dst->src[3];
 
     ggml_cuda_set_device(ctx.device);
+    if (dst->op_params[5] != 0) {
+        ggml_cuda_fattn_zdd_configure_l2(ctx.stream(), dst, ctx.device);
+    }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];

@@ -45,7 +45,14 @@ int64_t llama_dsv4_idx_chunk_nodes(int64_t n_tokens, int64_t n_lid, int64_t n_in
 }
 
 static bool dsv4_cache_type_supported(ggml_type type) {
-    return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
+    return type == GGML_TYPE_F32 ||
+           type == GGML_TYPE_F16 ||
+           type == GGML_TYPE_BF16 ||
+           type == GGML_TYPE_Q8_0 ||
+           type == GGML_TYPE_Q4_0 ||
+           type == GGML_TYPE_Q4_1 ||
+           type == GGML_TYPE_Q5_0 ||
+           type == GGML_TYPE_Q5_1;
 }
 
 // Per-step capture is limited to the eight-row CSA/LID ring.
@@ -84,6 +91,7 @@ static ggml_backend_buffer_type_t llama_dsv4_layer_buft(const llama_context & lc
 }
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
+    ratio = std::max<uint32_t>(1, ratio);
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
@@ -943,12 +951,14 @@ static void dsv4_set_cand_pin(
 
 bool llama_context::ensure_dsv4_cache_tensors() {
     const int32_t n_layer = model.hparams.n_layer;
-    const int64_t n_embd_head = model.hparams.n_embd_head_k(0);
-    const int64_t n_indexer_head = model.hparams.indexer_head_size;
+    const int64_t n_embd_head = model.hparams.n_embd_head_k(0) > 0
+            ? model.hparams.n_embd_head_k(0)
+            : (model.hparams.n_lora_kv > 0 ? (int64_t)(model.hparams.n_lora_kv + model.hparams.n_rot) : 512);
+    const int64_t n_indexer_head = model.hparams.indexer_head_size > 0 ? model.hparams.indexer_head_size : 128;
     const uint32_t n_stream = std::max<uint32_t>(1, cparams.n_seq_max);
     const auto & hp = model.hparams;
-    const uint32_t csa_ratio = hp.dsv4_csa_ratio;
-    const uint32_t hca_ratio = hp.dsv4_hca_ratio;
+    const uint32_t csa_ratio = hp.dsv4_csa_ratio > 0 ? hp.dsv4_csa_ratio : 16;
+    const uint32_t hca_ratio = hp.dsv4_hca_ratio > 0 ? hp.dsv4_hca_ratio : 64;
     const uint32_t csa_kv = GGML_PAD(dsv4_comp_size(cparams.n_ctx, csa_ratio), 256u);
     const uint32_t hca_kv = GGML_PAD(dsv4_comp_size(cparams.n_ctx, hca_ratio), 256u);
     const bool     v41_separate = getenv("V41_SEPARATE") != nullptr;
@@ -993,8 +1003,13 @@ bool llama_context::ensure_dsv4_cache_tensors() {
     cache.lid_state_score.resize((size_t) n_layer, nullptr);
 
     auto alloc_tensor = [&](ggml_tensor * tensor, ggml_backend_buffer_type_t buft) -> bool {
-        const size_t tensor_bytes = ggml_backend_buft_get_alloc_size(buft, tensor);
+        size_t tensor_bytes = ggml_backend_buft_get_alloc_size(buft, tensor);
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, tensor_bytes);
+        if (buf == nullptr && !ggml_backend_buft_is_host(buft)) {
+            ggml_backend_buffer_type_t cpu_buft = llama_default_buffer_type_cpu(true);
+            tensor_bytes = ggml_backend_buft_get_alloc_size(cpu_buft, tensor);
+            buf = ggml_backend_buft_alloc_buffer(cpu_buft, tensor_bytes);
+        }
         if (buf == nullptr) {
             return false;
         }

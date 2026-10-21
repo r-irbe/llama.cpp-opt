@@ -363,6 +363,67 @@ int main() {
                   << (prompt_len / (ms / 1000.0)) / 1e6 << "M tokens/s scan) OK\n";
     }
 
+    // ---------------------------------------------------------------------------------
+    // 11. Pre-Pruning Global Aggregation Summary Header (Task 3.4b)
+    // ---------------------------------------------------------------------------------
+    std::cout << "\n[Step 11] Verifying UNREAL Pre-Pruning Global Aggregation Summary (80%+ pruned)...\n";
+    {
+        gpt_params params;
+        params.unreal_filter = true;
+        params.unreal_min_tokens = 2048;
+        params.unreal_chunk_size = 140;
+        params.unreal_top_n = 5; // Retain only 5 chunks out of >50 chunks (>90% pruned)
+
+        int prompt_len = 8192;
+        std::vector<llama_token> corpus(prompt_len, 200);
+        for (int i = 0; i < prompt_len; ++i) {
+            corpus[i] = (llama_token)(200 + (i % 300));
+        }
+
+        // Query at the end contains target tokens 7777 and 8888
+        int query_len = std::min(1024, std::max(32, prompt_len / 16));
+        int prefix_len = std::min(512, std::max(16, prompt_len / 32));
+        for (int i = prompt_len - query_len; i < prompt_len; ++i) {
+            corpus[i] = (i % 2 == 0) ? (llama_token)7777 : (llama_token)8888;
+        }
+
+        // Plant token 7777 exactly 3 times in each of 20 distinct context chunks (60 total occurrences)
+        // and token 8888 exactly 2 times in each of 15 distinct context chunks (30 total occurrences)
+        for (int c = 0; c < 20; ++c) {
+            int chunk_base = prefix_len + c * params.unreal_chunk_size;
+            corpus[chunk_base + 5]  = 7777;
+            corpus[chunk_base + 15] = 7777;
+            corpus[chunk_base + 25] = 7777;
+        }
+        for (int c = 10; c < 25; ++c) {
+            int chunk_base = prefix_len + c * params.unreal_chunk_size;
+            corpus[chunk_base + 40] = 8888;
+            corpus[chunk_base + 50] = 8888;
+        }
+
+        unreal::global_aggregation_summary summary;
+        auto filtered = unreal::filter_prompt(nullptr, corpus, params, &summary);
+
+        ASSERT_TRUE(summary.total_chunks_scanned >= 45);
+        ASSERT_TRUE(summary.retained_chunks == 5);
+        double prune_ratio = (double)summary.pruned_chunks / (double)summary.total_chunks_scanned;
+        ASSERT_TRUE(prune_ratio >= 0.80);
+
+        // Verify 100% exact global corpus counts even when >80% of chunks are pruned
+        ASSERT_TRUE(summary.get_corpus_count(7777) == 60);
+        ASSERT_TRUE(summary.get_chunk_frequency(7777) == 20);
+        ASSERT_TRUE(summary.get_corpus_count(8888) == 30);
+        ASSERT_TRUE(summary.get_chunk_frequency(8888) == 15);
+
+        std::string header = summary.format_header();
+        ASSERT_TRUE(header.find("7777:60(chunks:20)") != std::string::npos);
+        ASSERT_TRUE(header.find("8888:30(chunks:15)") != std::string::npos);
+
+        std::cout << "  " << header << "\n";
+        std::cout << "  Exact global corpus counts verified with " << (prune_ratio * 100.0)
+                  << "% chunks pruned OK\n";
+    }
+
     std::cout << "\n===================================================================\n";
     std::cout << "  ALL UNREAL SELECTOR TESTS PASSED WITH 100% SUCCESS               \n";
     std::cout << "===================================================================\n";

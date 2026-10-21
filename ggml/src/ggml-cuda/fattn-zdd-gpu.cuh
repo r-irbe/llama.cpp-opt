@@ -66,6 +66,7 @@ __global__ void evaluate_sparse_kv_blocks_simt_kernel(
     const uint32_t n_sink_blocks,
     const uint32_t n_window_blocks
 ) {
+    (void)query_vector;
     // Warp-level indexing
     const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t warp_id = global_tid / GPU_WARP_SIZE;
@@ -236,3 +237,9 @@ __device__ __forceinline__ int32_t ternary_bitplane_dot64_device(
 }
 
 } // namespace ggml::cuda::kv
+
+void ggml_cuda_fattn_zdd_configure_l2(
+    cudaStream_t stream,
+    const ggml_tensor * dst,
+    int device_id
+);

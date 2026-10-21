@@ -18,18 +18,163 @@ Outputs:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import platform
 import re
+import resource
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+MODE_LIVE = "live"
+MODE_SIMULATED = "simulated"
+MODE_FAILED = "failed"
+RUN_MODES = (MODE_LIVE, MODE_SIMULATED, MODE_FAILED)
+
+_GIT_SHA_CACHE = None
+
+
+def get_git_sha():
+    """Return current git HEAD SHA for provenance tracking."""
+    global _GIT_SHA_CACHE
+    if _GIT_SHA_CACHE is not None:
+        return _GIT_SHA_CACHE
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        _GIT_SHA_CACHE = out if out else "unknown"
+    except Exception:
+        _GIT_SHA_CACHE = "unknown"
+    return _GIT_SHA_CACHE
+
+
+def extract_binary_from_cmd(cmd):
+    """Extract executable binary path from command list (skipping numactl wrapper if present)."""
+    if not cmd:
+        return ""
+    if os.path.basename(str(cmd[0])) == "numactl":
+        for token in cmd[1:]:
+            if not str(token).startswith("-"):
+                return str(token)
+    return str(cmd[0])
+
+
+def get_binary_sha256(bin_path):
+    """Compute SHA-256 of the target binary if it exists on disk."""
+    if not bin_path:
+        return "missing"
+    p = Path(bin_path)
+    if not p.is_file():
+        resolved = shutil.which(str(bin_path))
+        if not resolved:
+            return "missing"
+        p = Path(resolved)
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "error"
+
+
+def get_hardware_fingerprint(plat=None):
+    """Return a concise, deterministic hardware topology fingerprint."""
+    if plat is None:
+        plat = detect_platform_info()
+    return (
+        f"{plat.get('arch', 'unknown')}|{plat.get('cpu_brand', 'unknown')}|"
+        f"{plat.get('cpu_cores', 1)}c|numa={plat.get('numa_nodes', 1)}|"
+        f"ram={plat.get('total_ram_gb', 0.0)}G|gpu={plat.get('gpu_name', 'None')}({plat.get('gpu_vram_gb', 0.0)}G)"
+    )
+
+
+def _read_proc_vmhwm_kb(pid):
+    """Read VmHWM (Peak Resident Set Size) in kB from /proc/<pid>/status."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1])
+    except Exception:
+        pass
+    return 0
+
+
+class _RusagePopen(subprocess.Popen):
+    """Popen subclass that captures per-child resource usage via os.wait4 on POSIX."""
+
+    def __init__(self, *args, **kwargs):
+        self.rusage = None
+        super().__init__(*args, **kwargs)
+
+    def _try_wait(self, wait_flags):
+        if hasattr(os, "wait4"):
+            try:
+                pid, sts, ru = os.wait4(self.pid, wait_flags)
+                if pid == self.pid:
+                    self.rusage = ru
+                return (pid, sts)
+            except ChildProcessError:
+                return (self.pid, 0)
+        return super()._try_wait(wait_flags)
+
+
+def run_with_vmhwm_monitor(cmd, env=None):
+    """Run subprocess while polling /proc/<pid>/status and os.wait4 for peak VmHWM in kB."""
+    proc = _RusagePopen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    peak_kb = [0]
+    stop_evt = threading.Event()
+
+    def _poll():
+        while not stop_evt.is_set():
+            hwm = _read_proc_vmhwm_kb(proc.pid)
+            if hwm > peak_kb[0]:
+                peak_kb[0] = hwm
+            stop_evt.wait(0.01)
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    try:
+        stdout, stderr = proc.communicate()
+    finally:
+        stop_evt.set()
+        t.join(timeout=1.0)
+
+    if getattr(proc, "rusage", None) is not None and getattr(proc.rusage, "ru_maxrss", 0) > 0:
+        ru_kb = int(proc.rusage.ru_maxrss)
+        if ru_kb > peak_kb[0]:
+            peak_kb[0] = ru_kb
+    elif peak_kb[0] == 0:
+        try:
+            ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+            if ru.ru_maxrss > 0:
+                peak_kb[0] = int(ru.ru_maxrss)
+        except Exception:
+            pass
+
+    return proc.returncode, stdout, stderr, peak_kb[0]
+
 
 # --- Platform Detection & Hardware Topology Probing ---
 
@@ -247,9 +392,9 @@ def enforce_thermal_cooldown(max_cpu_temp=75.0, max_gpu_temp=70.0, max_wait_sec=
     """Enforce thermal equilibrium gating between benchmark model runs."""
     start_wait = time.perf_counter()
     while time.perf_counter() - start_wait < max_wait_sec:
-        telemetry = read_environment_telemetry()
-        cpu_t = telemetry.get("cpu_temp_c", 0.0)
-        gpu_t = telemetry.get("gpu_temp_c", 0.0)
+        telemetry = detect_environment_telemetry()
+        cpu_t = telemetry.get("cpu_temp_c") or 0.0
+        gpu_t = telemetry.get("gpu_temp_c") or 0.0
         if cpu_t <= max_cpu_temp and gpu_t <= max_gpu_temp:
             break
         time.sleep(2.0)
@@ -605,7 +750,7 @@ def resolve_model_path(models_dir, filename):
 
 # --- Database & Storage Helpers ---
 
-# Superset 54-column SQLite schema defined in llama-bench.cpp:1544-1558
+# Superset 54-column SQLite schema defined in llama-bench.cpp:1544-1558 plus provenance columns
 SQL_SUPERSET_SCHEMA = """
 CREATE TABLE IF NOT EXISTS test (
   build_commit TEXT,
@@ -666,7 +811,12 @@ CREATE TABLE IF NOT EXISTS test (
   track TEXT DEFAULT NULL,
   local_numa_hit_rate REAL DEFAULT NULL,
   local_node_delta INTEGER DEFAULT NULL,
-  other_node_delta INTEGER DEFAULT NULL
+  other_node_delta INTEGER DEFAULT NULL,
+  mode TEXT DEFAULT 'live',
+  binary_sha256 TEXT DEFAULT NULL,
+  git_sha TEXT DEFAULT NULL,
+  hardware_fingerprint TEXT DEFAULT NULL,
+  vm_hwm_kb INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS run_metadata (
@@ -688,7 +838,12 @@ CREATE TABLE IF NOT EXISTS run_metadata (
   core_affinity TEXT,
   cpu_temp_c REAL,
   gpu_temp_c REAL,
-  repetitions INTEGER
+  repetitions INTEGER,
+  mode TEXT DEFAULT 'live',
+  binary_sha256 TEXT DEFAULT NULL,
+  git_sha TEXT DEFAULT NULL,
+  hardware_fingerprint TEXT DEFAULT NULL,
+  vm_hwm_kb INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS benchmark_statistics (
@@ -711,26 +866,42 @@ CREATE TABLE IF NOT EXISTS benchmark_statistics (
   p95_ts REAL,
   p99_ts REAL,
   p99_9_ts REAL,
-  p99_99_ts REAL
+  p99_99_ts REAL,
+  mode TEXT DEFAULT 'live',
+  binary_sha256 TEXT DEFAULT NULL,
+  git_sha TEXT DEFAULT NULL,
+  hardware_fingerprint TEXT DEFAULT NULL,
+  vm_hwm_kb INTEGER DEFAULT 0
 );
 """
 
 def init_db(db_path):
-    """Pre-initialize the SQLite database with full 54-column superset schema from llama-bench.cpp."""
+    """Pre-initialize the SQLite database with full 54-column superset schema plus provenance columns."""
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p))
     conn.executescript(SQL_SUPERSET_SCHEMA)
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(benchmark_statistics)")
-    cols = [col[1] for col in cur.fetchall()]
-    if "trimmed_mean_ts" not in cols:
-        cur.execute("ALTER TABLE benchmark_statistics ADD COLUMN trimmed_mean_ts REAL DEFAULT NULL")
-    conn.commit()
-    conn.close()
 
-    # Ensure metadata columns exist if table was created in an older run
-    cur = conn.cursor()
+    # Ensure benchmark_statistics columns exist if table was created in an older run
+    cur.execute("PRAGMA table_info(benchmark_statistics)")
+    existing_stat_cols = {col[1] for col in cur.fetchall()}
+    extra_stat_cols = [
+        ("trimmed_mean_ts", "REAL DEFAULT NULL"),
+        ("mode", "TEXT DEFAULT 'live'"),
+        ("binary_sha256", "TEXT DEFAULT NULL"),
+        ("git_sha", "TEXT DEFAULT NULL"),
+        ("hardware_fingerprint", "TEXT DEFAULT NULL"),
+        ("vm_hwm_kb", "INTEGER DEFAULT 0"),
+    ]
+    for col_name, col_def in extra_stat_cols:
+        if col_name not in existing_stat_cols:
+            try:
+                cur.execute(f"ALTER TABLE benchmark_statistics ADD COLUMN {col_name} {col_def}")
+            except Exception:
+                pass
+
+    # Ensure test metadata & provenance columns exist if table was created in an older run
     cur.execute("PRAGMA table_info(test)")
     existing_cols = {row[1] for row in cur.fetchall()}
     extra_cols = [
@@ -739,6 +910,11 @@ def init_db(db_path):
         ("local_numa_hit_rate", "REAL DEFAULT NULL"),
         ("local_node_delta", "INTEGER DEFAULT NULL"),
         ("other_node_delta", "INTEGER DEFAULT NULL"),
+        ("mode", "TEXT DEFAULT 'live'"),
+        ("binary_sha256", "TEXT DEFAULT NULL"),
+        ("git_sha", "TEXT DEFAULT NULL"),
+        ("hardware_fingerprint", "TEXT DEFAULT NULL"),
+        ("vm_hwm_kb", "INTEGER DEFAULT 0"),
     ]
     for col_name, col_def in extra_cols:
         if col_name not in existing_cols:
@@ -757,6 +933,11 @@ def init_db(db_path):
         ("cpu_temp_c", "REAL"),
         ("gpu_temp_c", "REAL"),
         ("repetitions", "INTEGER"),
+        ("mode", "TEXT DEFAULT 'live'"),
+        ("binary_sha256", "TEXT DEFAULT NULL"),
+        ("git_sha", "TEXT DEFAULT NULL"),
+        ("hardware_fingerprint", "TEXT DEFAULT NULL"),
+        ("vm_hwm_kb", "INTEGER DEFAULT 0"),
     ]
     for col_name, col_def in extra_run_cols:
         if col_name not in existing_run_cols:
@@ -765,10 +946,15 @@ def init_db(db_path):
             except Exception:
                 pass
 
+    try:
+        cur.execute("UPDATE test SET git_sha = build_commit WHERE git_sha IS NULL AND build_commit IS NOT NULL")
+    except Exception:
+        pass
+
     conn.commit()
     return conn
 
-def extract_and_apply_sql(conn, stdout, engine, track, numa_delta):
+def extract_and_apply_sql(conn, stdout, engine, track, numa_delta, provenance=None):
     """Extract SQL statements from llama-bench -o sql output and execute them with dynamic schema adaptation."""
     if not stdout:
         return 0
@@ -824,12 +1010,19 @@ def extract_and_apply_sql(conn, stdout, engine, track, numa_delta):
     hit_rate = numa_delta.get("local_hit_rate_pct")
     local_d = numa_delta.get("local_node")
     other_d = numa_delta.get("other_node")
+    prov = provenance or {}
+    run_mode = prov.get("mode", MODE_LIVE)
+    bin_sha = prov.get("binary_sha256")
+    git_sha = prov.get("git_sha")
+    hw_fp = prov.get("hardware_fingerprint")
+    vm_hwm_kb = prov.get("vm_hwm_kb", 0)
 
     cur.execute("""
         UPDATE test
-        SET engine = ?, track = ?, local_numa_hit_rate = ?, local_node_delta = ?, other_node_delta = ?
+        SET engine = ?, track = ?, local_numa_hit_rate = ?, local_node_delta = ?, other_node_delta = ?,
+            mode = ?, binary_sha256 = ?, git_sha = ?, hardware_fingerprint = ?, vm_hwm_kb = ?
         WHERE rowid > ?
-    """, (engine, track, hit_rate, local_d, other_d, max_rowid_before))
+    """, (engine, track, hit_rate, local_d, other_d, run_mode, bin_sha, git_sha, hw_fp, vm_hwm_kb, max_rowid_before))
 
     conn.commit()
     return inserted_count
@@ -861,8 +1054,9 @@ def build_iso_track_command(engine_type, binary_path, model_path, model_meta, pl
 
     return cmd
 
-def build_pareto_command(engine_type, binary_path, model_path, model_meta, plat_info, repetitions=10):
+def build_pareto_command(engine_type, binary_path, model_meta_or_path, model_meta=None, plat_info=None, repetitions=10):
     """Build independently autotuned, Pareto-optimized command line for each engine."""
+    model_path = model_meta_or_path
     p_str = ",".join(str(p) for p in model_meta["n_prompt_tokens"])
     n_str = ",".join(str(g) for g in model_meta["n_gen_tokens"])
 
@@ -915,17 +1109,80 @@ def build_pareto_command(engine_type, binary_path, model_path, model_meta, plat_
     return cmd
 
 
-# --- Execution Engine with NUMA Polling & Statistical Rigor ---
+# --- Execution Engine with NUMA Polling, VmHWM & Provenance Rigor ---
 
-def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=False):
-    """Execute command, poll numastat deltas, and pipe SQL into SQLite with statistical rigor."""
+def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=False, plat=None):
+    """Execute command, poll numastat deltas and VmHWM, and pipe SQL into SQLite with provenance rigor."""
+    bin_path = extract_binary_from_cmd(cmd)
+    binary_sha256 = get_binary_sha256(bin_path)
+    git_sha = get_git_sha()
+    hw_fp = get_hardware_fingerprint(plat)
+    reps = 10
+    if "-r" in cmd:
+        try:
+            reps = int(cmd[cmd.index("-r") + 1])
+        except Exception:
+            pass
+
     print(f"\n[EXEC ({engine.upper()}:{track.upper()})] {' '.join(cmd)}")
     if dry_run:
-        return {"returncode": 0, "stdout": "", "stderr": "", "duration": 0.0, "numa_delta": {}}
+        telemetry = detect_environment_telemetry()
+        print(
+            f"  [PROVENANCE (SIMULATED)] mode={MODE_SIMULATED} | git_sha={git_sha[:12]} | "
+            f"binary_sha256={binary_sha256[:16]} | vm_hwm_kb=0"
+        )
+        if db_conn:
+            cur = db_conn.cursor()
+            cur.execute("""
+                INSERT INTO run_metadata (
+                    timestamp, engine, track, model_id, model_name, cmd, duration_sec,
+                    numa_hit_rate, local_node_delta, other_node_delta, numa_hit_delta, numa_miss_delta,
+                    cpu_governor, cpu_boost, core_affinity, cpu_temp_c, gpu_temp_c, repetitions,
+                    mode, binary_sha256, git_sha, hardware_fingerprint, vm_hwm_kb
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(timezone.utc).isoformat(), engine, track, model_meta["id"], model_meta["name"],
+                " ".join(cmd), 0.0, None, None, None, None, None,
+                telemetry.get("cpu_governor"), telemetry.get("cpu_boost"),
+                telemetry.get("core_affinity"), telemetry.get("cpu_temp_c"),
+                telemetry.get("gpu_temp_c"), reps,
+                MODE_SIMULATED, binary_sha256, git_sha, hw_fp, 0
+            ))
+            model_fn = model_meta.get("filename") or model_meta.get("name", "simulated.gguf")
+            if "-m" in cmd:
+                try:
+                    model_fn = str(cmd[cmd.index("-m") + 1])
+                except Exception:
+                    pass
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for n_p, n_g, t_lbl in [(512, 0, "pp512"), (0, 128, "tg128")]:
+                cur.execute("""
+                    INSERT INTO test (
+                        build_commit, model_filename, model_type, n_prompt, n_gen, test_time,
+                        avg_ts, stddev_ts, test, engine, track,
+                        mode, binary_sha256, git_sha, hardware_fingerprint, vm_hwm_kb
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    git_sha[:9], model_fn, model_meta["name"], n_p, n_g,
+                    now_iso, 0.0, 0.0, t_lbl,
+                    engine, track, MODE_SIMULATED, binary_sha256, git_sha, hw_fp, 0
+                ))
+            db_conn.commit()
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration": 0.0,
+            "numa_delta": {},
+            "mode": MODE_SIMULATED,
+            "binary_sha256": binary_sha256,
+            "git_sha": git_sha,
+            "hardware_fingerprint": hw_fp,
+            "vm_hwm_kb": 0,
+        }
 
-    if not dry_run:
-        purge_page_cache()
-        enforce_thermal_cooldown()
+    purge_page_cache()
+    enforce_thermal_cooldown()
 
     child_env = os.environ.copy()
     is_cpu_baseline = (
@@ -942,44 +1199,54 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
     snap0 = read_numastat()
     t0 = time.perf_counter()
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, env=child_env)
+        returncode, stdout, stderr, vm_hwm_kb = run_with_vmhwm_monitor(cmd, env=child_env)
         t1 = time.perf_counter()
         snap1 = read_numastat()
         delta = compute_numastat_delta(snap0, snap1)
 
         duration = t1 - t0
+        run_mode = MODE_LIVE if returncode == 0 else MODE_FAILED
+        provenance = {
+            "mode": run_mode,
+            "binary_sha256": binary_sha256,
+            "git_sha": git_sha,
+            "hardware_fingerprint": hw_fp,
+            "vm_hwm_kb": vm_hwm_kb,
+        }
+
         if delta:
             print(f"  [NUMA] Local Hit Rate: {delta.get('local_hit_rate_pct', 100.0):.2f}% "
                   f"(Local: +{delta.get('local_node', 0):,} pages, Remote: +{delta.get('other_node', 0):,} pages)")
+        print(
+            f"  [PROVENANCE] mode={run_mode} | git_sha={git_sha[:12]} | "
+            f"binary_sha256={binary_sha256[:16]} | vm_hwm_kb={vm_hwm_kb:,}"
+        )
 
-        if proc.returncode != 0:
-            print(f"  [ERROR] Exited with code {proc.returncode}")
-            if proc.stderr:
-                print(f"  [STDERR] {proc.stderr[:400]}...")
+        if returncode != 0:
+            print(f"  [ERROR] Exited with code {returncode}")
+            if stderr:
+                print(f"  [STDERR] {stderr[:400]}...")
 
         # Pipe SQL output into SQLite
-        if db_conn and proc.stdout:
+        if db_conn:
             cur = db_conn.cursor()
             cur.execute("SELECT COALESCE(MAX(rowid), 0) FROM test")
             max_rowid_before = cur.fetchone()[0]
 
-            rows = extract_and_apply_sql(db_conn, proc.stdout, engine, track, delta)
+            rows = 0
+            if stdout:
+                rows = extract_and_apply_sql(db_conn, stdout, engine, track, delta, provenance=provenance)
 
-            reps = 10
-            if "-r" in cmd:
-                try:
-                    reps = int(cmd[cmd.index("-r") + 1])
-                except Exception:
-                    pass
             telemetry = detect_environment_telemetry()
 
-            # Record run metadata
+            # Record run metadata with provenance
             cur.execute("""
                 INSERT INTO run_metadata (
                     timestamp, engine, track, model_id, model_name, cmd, duration_sec,
                     numa_hit_rate, local_node_delta, other_node_delta, numa_hit_delta, numa_miss_delta,
-                    cpu_governor, cpu_boost, core_affinity, cpu_temp_c, gpu_temp_c, repetitions
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cpu_governor, cpu_boost, core_affinity, cpu_temp_c, gpu_temp_c, repetitions,
+                    mode, binary_sha256, git_sha, hardware_fingerprint, vm_hwm_kb
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 datetime.now(timezone.utc).isoformat(), engine, track, model_meta["id"], model_meta["name"],
                 " ".join(cmd), round(duration, 3), delta.get("local_hit_rate_pct"),
@@ -987,7 +1254,8 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
                 delta.get("numa_hit"), delta.get("numa_miss"),
                 telemetry.get("cpu_governor"), telemetry.get("cpu_boost"),
                 telemetry.get("core_affinity"), telemetry.get("cpu_temp_c"),
-                telemetry.get("gpu_temp_c"), reps
+                telemetry.get("gpu_temp_c"), reps,
+                run_mode, binary_sha256, git_sha, hw_fp, vm_hwm_kb
             ))
 
             # Compute HDR percentiles and bootstrap confidence intervals for new rows
@@ -1010,27 +1278,35 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
                         INSERT INTO benchmark_statistics (
                             timestamp, model_id, model_name, engine, track, task, n_samples,
                             median_ts, trimmed_mean_ts, ci95_low, ci95_high, ci99_low, ci99_high,
-                            p50_ts, p90_ts, p95_ts, p99_ts, p99_9_ts, p99_99_ts
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            p50_ts, p90_ts, p95_ts, p99_ts, p99_9_ts, p99_99_ts,
+                            mode, binary_sha256, git_sha, hardware_fingerprint, vm_hwm_kb
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         datetime.now(timezone.utc).isoformat(), model_meta["id"], model_meta["name"],
                         engine, track, task_label, len(samples),
                         boot["median"], tmean, boot["ci95_low"], boot["ci95_high"], boot["ci99_low"], boot["ci99_high"],
-                        hdr.get("p50"), hdr.get("p90"), hdr.get("p95"), hdr.get("p99"), hdr.get("p99_9"), hdr.get("p99_99")
+                        hdr.get("p50"), hdr.get("p90"), hdr.get("p95"), hdr.get("p99"), hdr.get("p99_9"), hdr.get("p99_99"),
+                        run_mode, binary_sha256, git_sha, hw_fp, vm_hwm_kb
                     ))
                     print(f"  [STATS ({task_label})] Median: {boot['median']:.2f} t/s | Trimmed Mean (20%): {tmean:.2f} t/s | CV: {cv_val:.4f} (std={std_val:.2f}) | 99% CI: [{boot['ci99_low']:.2f}, {boot['ci99_high']:.2f}] | p90: {hdr.get('p90', 0.0):.2f} | p99: {hdr.get('p99', 0.0):.2f}")
                     if cv_val > 0.05:
                         print(f"  [GATE] Warning: CV={cv_val:.4f} > 0.05 exceeds Bilokon & Gunduz variance threshold!")
 
             db_conn.commit()
-            print(f"  [SQL] Ingested {rows} test result records into SQLite.")
+            if rows:
+                print(f"  [SQL] Ingested {rows} test result records into SQLite.")
 
         return {
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
             "duration": duration,
-            "numa_delta": delta
+            "numa_delta": delta,
+            "mode": run_mode,
+            "binary_sha256": binary_sha256,
+            "git_sha": git_sha,
+            "hardware_fingerprint": hw_fp,
+            "vm_hwm_kb": vm_hwm_kb,
         }
     except Exception as e:
         print(f"  [EXCEPTION] Failed to execute: {e}")
@@ -1039,19 +1315,51 @@ def run_bench_command(cmd, engine, track, model_meta, db_conn=None, dry_run=Fals
             "stdout": "",
             "stderr": str(e),
             "duration": 0.0,
-            "numa_delta": {}
+            "numa_delta": {},
+            "mode": MODE_FAILED,
+            "binary_sha256": binary_sha256,
+            "git_sha": git_sha,
+            "hardware_fingerprint": hw_fp,
+            "vm_hwm_kb": 0,
         }
 
 
 # --- Custom Pareto Aggregator Query & Markdown Summary Table ---
 
-def generate_pareto_summary(db_path, output_md_path="results/benchmark_summary.md"):
-    """Query SQLite database, aggregate peak performance per model/engine, and format markdown table."""
+def generate_pareto_summary(db_path, output_md_path="results/benchmark_summary.md", allow_mixed_modes=False):
+    """Query SQLite database, enforce mode provenance invariants, aggregate peak performance per model/engine, and format markdown table."""
     if not os.path.exists(db_path):
         return
 
-    conn = sqlite3.connect(db_path)
+    conn = init_db(db_path)
     cur = conn.cursor()
+
+    # Check distinct execution modes across test and run_metadata tables
+    modes = set()
+    cur.execute("SELECT DISTINCT COALESCE(mode, 'live') FROM test")
+    modes.update(r[0] for r in cur.fetchall() if r[0])
+    cur.execute("SELECT DISTINCT COALESCE(mode, 'live') FROM run_metadata")
+    modes.update(r[0] for r in cur.fetchall() if r[0])
+
+    unknown_modes = sorted(m for m in modes if m not in RUN_MODES)
+    if unknown_modes and not allow_mixed_modes:
+        conn.close()
+        raise SystemExit(
+            f"[REFUSED] Unknown execution mode(s) {unknown_modes} in database. "
+            "Pass --allow-mixed-modes to override."
+        )
+    if MODE_FAILED in modes and not allow_mixed_modes:
+        conn.close()
+        raise SystemExit(
+            "[REFUSED] Cannot generate Pareto summary from database containing 'failed' mode records. "
+            "Pass --allow-mixed-modes to override."
+        )
+    if len(modes) > 1 and not allow_mixed_modes:
+        conn.close()
+        raise SystemExit(
+            f"[REFUSED] Mixed execution modes detected in database ({sorted(modes)}). "
+            "Refusing to mix 'live' and 'simulated' records without --allow-mixed-modes."
+        )
 
     # Query distinct models tested
     cur.execute("SELECT DISTINCT model_filename FROM test WHERE model_filename IS NOT NULL AND model_filename != ''")
@@ -1062,16 +1370,53 @@ def generate_pareto_summary(db_path, output_md_path="results/benchmark_summary.m
         conn.close()
         return
 
+    cur.execute("""
+        SELECT COALESCE(mode, 'live'), COALESCE(git_sha, 'unknown'),
+               COALESCE(binary_sha256, 'unknown'), COALESCE(hardware_fingerprint, 'unknown')
+        FROM run_metadata
+        WHERE git_sha IS NOT NULL AND git_sha != ''
+        ORDER BY id DESC LIMIT 1
+    """)
+    prov_row = cur.fetchone()
+    if not prov_row:
+        cur.execute("""
+            SELECT COALESCE(mode, 'live'), COALESCE(git_sha, build_commit, 'unknown'),
+                   COALESCE(binary_sha256, 'unknown'), COALESCE(hardware_fingerprint, 'unknown')
+            FROM test
+            ORDER BY rowid DESC LIMIT 1
+        """)
+        prov_row = cur.fetchone()
+
+    cur.execute("""
+        SELECT MAX(v) FROM (
+            SELECT COALESCE(MAX(vm_hwm_kb), 0) AS v FROM run_metadata
+            UNION ALL
+            SELECT COALESCE(MAX(vm_hwm_kb), 0) AS v FROM test
+        )
+    """)
+    peak_hwm_row = cur.fetchone()
+
+    mode_str = ", ".join(sorted(modes)) if modes else MODE_LIVE
+    git_sha_str = prov_row[1] if (prov_row and prov_row[1] != "unknown") else get_git_sha()
+    bin_sha_str = prov_row[2] if prov_row else "unknown"
+    hw_fp_str = prov_row[3] if (prov_row and prov_row[3] != "unknown") else get_hardware_fingerprint()
+    peak_hwm_kb = int(peak_hwm_row[0] or 0) if peak_hwm_row else 0
+
     lines = [
         "# Benchmark Results Summary: Comparative Pareto Optimization (Statistical Rigor)",
         "",
         f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}  ",
-        f"**Database**: `{db_path}`",
+        f"**Database**: `{db_path}`  ",
+        f"**Execution Mode**: `{mode_str}`  ",
+        f"**Git SHA**: `{git_sha_str}`  ",
+        f"**Binary SHA-256**: `{bin_sha_str}`  ",
+        f"**Hardware Fingerprint**: `{hw_fp_str}`  ",
+        f"**Peak VmHWM**: `{peak_hwm_kb:,} kB`",
         "",
         "### Peak Performance Comparison Table (Statistical Rigor Profile: Median [99% Bootstrap CI])",
         "",
-        "| Model Architecture | Task | Target (`feat/numa-split`) | Vanilla `ik_llama` | Mainline `llama.cpp` | Target Tail (p90 / p99) | Speedup vs Vanilla | Speedup vs Mainline | Local NUMA Hit |",
-        "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "| Model Architecture | Task | Mode | Target (`feat/numa-split`) | Vanilla `ik_llama` | Mainline `llama.cpp` | Target Tail (p90 / p99) | Speedup vs Vanilla | Speedup vs Mainline | Local NUMA Hit |",
+        "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     ]
 
     for mf in model_files:
@@ -1083,13 +1428,13 @@ def generate_pareto_summary(db_path, output_md_path="results/benchmark_summary.m
             ("Token Generation (TG)", "n_gen > 0 AND (n_prompt = 0 OR test LIKE 'tg%')")
         ]:
             cur.execute(f"""
-                SELECT engine, MAX(avg_ts), AVG(local_numa_hit_rate)
+                SELECT engine, MAX(avg_ts), AVG(local_numa_hit_rate), GROUP_CONCAT(DISTINCT COALESCE(mode, 'live'))
                 FROM test
                 WHERE model_filename = ? AND {where_clause} AND engine IS NOT NULL
                 GROUP BY engine
             """, (mf,))
             rows = cur.fetchall()
-            stats = {r[0]: (r[1], r[2]) for r in rows}
+            stats = {r[0]: (r[1] or 0.0, r[2], r[3] or mode_str) for r in rows}
 
             # Check if we have statistical rigor rows in benchmark_statistics
             cur.execute("""
@@ -1101,17 +1446,23 @@ def generate_pareto_summary(db_path, output_md_path="results/benchmark_summary.m
             stat_rows = cur.fetchall()
             stats_ext = {r[0]: {"med": r[1], "ci_l": r[2], "ci_h": r[3], "p90": r[4], "p99": r[5]} for r in stat_rows}
 
-            target_val, target_hit = stats.get("target", (0.0, 100.0))
-            vanilla_val, _ = stats.get("vanilla_ik", (0.0, None))
-            mainline_val, _ = stats.get("mainline", (0.0, None))
+            target_val, target_hit, target_mode = stats.get("target", (0.0, 100.0, mode_str))
+            vanilla_val, _, _ = stats.get("vanilla_ik", (0.0, None, mode_str))
+            mainline_val, _, _ = stats.get("mainline", (0.0, None, mode_str))
 
-            if target_val == 0.0 and vanilla_val == 0.0 and mainline_val == 0.0:
+            row_modes = sorted({m.strip() for _, _, em in stats.values() for m in str(em).split(",") if m.strip()})
+            row_mode_str = "+".join(row_modes) if row_modes else mode_str
+
+            if target_val == 0.0 and vanilla_val == 0.0 and mainline_val == 0.0 and MODE_SIMULATED not in row_modes:
                 continue
 
             def fmt_stat(engine_id, max_val):
                 if engine_id in stats_ext:
                     d = stats_ext[engine_id]
                     return f"**{d['med']:.2f}** [{d['ci_l']:.2f}, {d['ci_h']:.2f}] t/s"
+                eng_mode = stats[engine_id][2] if engine_id in stats else ""
+                if eng_mode == MODE_SIMULATED and max_val == 0.0:
+                    return "0.00 t/s (simulated)"
                 return f"{max_val:.2f} t/s" if max_val > 0 else "N/A"
 
             target_str = fmt_stat("target", target_val)
@@ -1128,30 +1479,35 @@ def generate_pareto_summary(db_path, output_md_path="results/benchmark_summary.m
             hit_str = f"{target_hit:.1f}%" if target_hit is not None else "N/A"
 
             lines.append(
-                f"| {model_name} | {task_label} | {target_str} | {vanilla_str} | {mainline_str} | {tail_str} | {spd_v_str} | {spd_m_str} | {hit_str} |"
+                f"| {model_name} | {task_label} | `{row_mode_str}` | {target_str} | {vanilla_str} | {mainline_str} | {tail_str} | {spd_v_str} | {spd_m_str} | {hit_str} |"
             )
 
-    # Append Environment Verification & Telemetry table
+    # Append Environment Verification, Provenance & Telemetry table
     cur.execute("""
-        SELECT engine, cpu_governor, cpu_boost, core_affinity, cpu_temp_c, gpu_temp_c, repetitions
+        SELECT engine, COALESCE(mode, 'live'), COALESCE(git_sha, 'unknown'),
+               COALESCE(binary_sha256, 'unknown'), COALESCE(MAX(vm_hwm_kb), 0),
+               cpu_governor, cpu_boost, core_affinity, cpu_temp_c, gpu_temp_c, repetitions
         FROM run_metadata
-        WHERE cpu_governor IS NOT NULL
-        GROUP BY engine
+        WHERE engine IS NOT NULL
+        GROUP BY engine, COALESCE(mode, 'live')
         ORDER BY id DESC
     """)
     tele_rows = cur.fetchall()
     if tele_rows:
         lines.extend([
             "",
-            "### Environment Verification & Telemetry Telemetry",
+            "### Environment Verification, Provenance & Telemetry",
             "",
-            "| Engine | CPU Governor | CPU Boost / Turbo | Core Affinity | Thermal Range (CPU / GPU) | Repetitions |",
-            "| :--- | :---: | :---: | :---: | :---: | :---: |"
+            "| Engine | Mode | Git SHA | Binary SHA-256 | Peak VmHWM (kB) | CPU Governor | CPU Boost / Turbo | Core Affinity | Thermal Range (CPU / GPU) | Repetitions |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
         ])
         for tr in tele_rows:
-            eng, gov, boost, aff, c_temp, g_temp, reps = tr
+            eng, r_mode, g_sha, b_sha, r_hwm, gov, boost, aff, c_temp, g_temp, reps = tr
             thermals = f"{c_temp or 'N/A'}°C / {g_temp or 'N/A'}°C"
-            lines.append(f"| {eng} | `{gov or 'N/A'}` | `{boost or 'N/A'}` | `{aff or 'all'}` | {thermals} | {reps or 10} |")
+            lines.append(
+                f"| {eng} | `{r_mode}` | `{str(g_sha)[:12]}` | `{str(b_sha)[:16]}` | `{int(r_hwm or 0):,}` | "
+                f"`{gov or 'N/A'}` | `{boost or 'N/A'}` | `{aff or 'all'}` | {thermals} | {reps or 10} |"
+            )
 
     conn.close()
 
@@ -1180,7 +1536,8 @@ def main():
     parser.add_argument("--mainline-bin", default="", help="Path to mainline llama.cpp llama-bench")
     parser.add_argument("--db-path", default="results/benchmarks.sqlite", help="SQLite results output path")
     parser.add_argument("--summary-md", default="results/benchmark_summary.md", help="Markdown summary table path")
-    parser.add_argument("--dry-run", action="store_true", help="Print command plan without executing")
+    parser.add_argument("--dry-run", action="store_true", help="Record simulated command plan (mode='simulated') without executing GPU binaries")
+    parser.add_argument("--allow-mixed-modes", action="store_true", help="Allow mixing 'live' and 'simulated' runs in summary reports")
     parser.add_argument("--concurrency-test", action="store_true", help="Run high-concurrency cohort PPS server benchmark")
     parser.add_argument("--server-bin", default="./build/bin/llama-server", help="Path to llama-server")
     parser.add_argument("--threads", type=int, default=None, help="Override thread count for benchmark runs")
@@ -1209,6 +1566,9 @@ def main():
     print("  IK_LLAMA.CPP HIGH-PERFORMANCE BENCHMARKING & TESTING MATRIX")
     print(f"  Platform Detected: {plat['os']} {plat['arch']} ({plat.get('cpu_brand', 'Unknown CPU')})")
     print(f"  Topology: {plat['numa_nodes']} NUMA Nodes | {plat['cpu_cores']} Cores | GPU: {plat['gpu_name']} ({plat['gpu_vram_gb']} GB)")
+    print(f"  Hardware Fingerprint: {get_hardware_fingerprint(plat)}")
+    print(f"  Git SHA: {get_git_sha()} | Target Binary SHA-256: {get_binary_sha256(args.target_bin)}")
+    print(f"  Execution Mode: {MODE_SIMULATED if args.dry_run else MODE_LIVE}")
     print(f"  Models Directory: {args.models_dir}")
     print(f"  Repetitions per Run: {args.benchmark_repetitions} (Bilokon & Gunduz Statistical Rigor)")
     if plat["is_apple_silicon"]:
@@ -1216,7 +1576,7 @@ def main():
     print("================================================================================")
 
     if args.summarize_only:
-        generate_pareto_summary(args.db_path, args.summary_md)
+        generate_pareto_summary(args.db_path, args.summary_md, allow_mixed_modes=args.allow_mixed_modes)
         return
 
     # Filter models
@@ -1226,12 +1586,10 @@ def main():
 
     print(f"\n[PLAN] Selected {len(models_to_run)} model architectures for evaluation.")
 
-    db_conn = None
-    if not args.dry_run:
-        db_conn = init_db(args.db_path)
+    db_conn = init_db(args.db_path)
 
     # Thread selection invariant: on Apple Silicon, strictly pin to P-cores (-t 8) to avoid E-core tail jitter
-    iso_threads = plat.get("p_cores", 8) if plat["is_apple_silicon"] else (28 if plat["numa_nodes"] > 1 else 8)
+    iso_threads = args.threads or (plat.get("p_cores", 8) if plat["is_apple_silicon"] else (28 if plat["numa_nodes"] > 1 else 8))
 
     # 1. Iso-Parameter Track
     if args.track in ["iso", "all"]:
@@ -1246,17 +1604,17 @@ def main():
             
             # Target Engine (feat/numa-split)
             cmd_target = build_iso_track_command("target", args.target_bin, m_path, m, plat, threads=iso_threads, repetitions=args.benchmark_repetitions)
-            run_bench_command(cmd_target, "target", "iso", m, db_conn=db_conn, dry_run=args.dry_run)
+            run_bench_command(cmd_target, "target", "iso", m, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
             
             # Vanilla ik_llama.cpp
             if args.vanilla_ik_bin:
                 cmd_v = build_iso_track_command("vanilla_ik", args.vanilla_ik_bin, m_path, m, plat, threads=iso_threads, repetitions=args.benchmark_repetitions)
-                run_bench_command(cmd_v, "vanilla_ik", "iso", m, db_conn=db_conn, dry_run=args.dry_run)
+                run_bench_command(cmd_v, "vanilla_ik", "iso", m, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
 
             # Mainline llama.cpp
             if args.mainline_bin:
                 cmd_m = build_iso_track_command("mainline", args.mainline_bin, m_path, m, plat, threads=iso_threads, repetitions=args.benchmark_repetitions)
-                run_bench_command(cmd_m, "mainline", "iso", m, db_conn=db_conn, dry_run=args.dry_run)
+                run_bench_command(cmd_m, "mainline", "iso", m, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
 
     # 2. Pareto-Optimized Track
     if args.track in ["pareto", "all"]:
@@ -1271,17 +1629,17 @@ def main():
 
             # Target Engine (feat/numa-split)
             cmd_target = build_pareto_command("target", args.target_bin, m_path, m, plat, repetitions=args.benchmark_repetitions)
-            run_bench_command(cmd_target, "target", "pareto", m, db_conn=db_conn, dry_run=args.dry_run)
+            run_bench_command(cmd_target, "target", "pareto", m, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
 
             # Vanilla ik_llama.cpp
             if args.vanilla_ik_bin:
                 cmd_v = build_pareto_command("vanilla_ik", args.vanilla_ik_bin, m_path, m, plat, repetitions=args.benchmark_repetitions)
-                run_bench_command(cmd_v, "vanilla_ik", "pareto", m, db_conn=db_conn, dry_run=args.dry_run)
+                run_bench_command(cmd_v, "vanilla_ik", "pareto", m, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
 
             # Mainline llama.cpp
             if args.mainline_bin:
                 cmd_m = build_pareto_command("mainline", args.mainline_bin, m_path, m, plat, repetitions=args.benchmark_repetitions)
-                run_bench_command(cmd_m, "mainline", "pareto", m, db_conn=db_conn, dry_run=args.dry_run)
+                run_bench_command(cmd_m, "mainline", "pareto", m, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
 
     # 3. High-Concurrency Server Benchmark
     if args.concurrency_test:
@@ -1291,11 +1649,13 @@ def main():
             bench_script = Path(__file__).parent.parent / "scratch" / "bench_concurrent_server.py"
         if bench_script.exists():
             cmd_bench = [sys.executable, str(bench_script)]
-            run_bench_command(cmd_bench, "target", "cohort_concurrent", {"id": "server", "name": "Server Cohort"}, db_conn=db_conn, dry_run=args.dry_run)
+            run_bench_command(cmd_bench, "target", "cohort_concurrent", {"id": "server", "name": "Server Cohort", "filename": "server_cohort"}, db_conn=db_conn, dry_run=args.dry_run, plat=plat)
+
+    if db_conn:
+        db_conn.close()
 
     # 4. Generate Pareto Summary Table
-    if not args.dry_run and db_conn:
-        generate_pareto_summary(args.db_path, args.summary_md)
+    generate_pareto_summary(args.db_path, args.summary_md, allow_mixed_modes=args.allow_mixed_modes)
 
     print("\n================================================================================")
     print("  BENCHMARK MATRIX EXECUTION COMPLETE")

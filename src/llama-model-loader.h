@@ -6,7 +6,7 @@
 #include "llama-mmap.h"
 #include "llama-arch.h"
 #include "llama-hparams.h"
-#include "llama-npmc-superblock.h"
+#include "npmc-superblock.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -126,6 +126,10 @@ struct llama_model_loader {
     llama::npmc::Superblock2MiBView get_npmc_superblock_view(const std::string & name) const;
 
     static llama::npmc::Superblock2MiBView get_npmc_superblock_view(const struct ggml_tensor * tensor);
+
+    void export_npmc_superblocks(std::unordered_map<std::string, uint32_t> & out_map) const {
+        out_map = npmc_superblock_tensors;
+    }
 
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,

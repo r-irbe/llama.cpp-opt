@@ -1,6 +1,9 @@
 #include "llama-build-context.h"
 #include "llama-context.h"
 #include "llama-cparams.h"
+#include "llama-model.h"
+#include "llama-model-loader.h"
+#include "npmc-superblock.h"
 #include "llama-kv-zdd.h"
 #include "paged-kv-cache.h"
 #include "ggml-cuda.h"
@@ -8,6 +11,44 @@
 #include <cstdlib>
 #include <algorithm>
 #include <vector>
+
+void llama_graph_apply_zdd_fattn_op_params(
+        struct ggml_tensor * dst,
+        bool zdd_sparse_kv) {
+    if (!dst) {
+        return;
+    }
+    const char * env_skip = std::getenv("LLAMA_KV_ZDD_SKIP");
+    const bool zdd_enabled = zdd_sparse_kv || (env_skip != nullptr && env_skip[0] != '\0' && env_skip[0] != '0');
+    if (zdd_enabled) {
+        dst->op_params[5] = 1;
+    }
+}
+
+bool llama_graph_dispatch_npmc_superblock(
+        const struct ggml_tensor * expert_tensor,
+        uint32_t expert_id,
+        const void * activations_bitplanes,
+        size_t num_words,
+        int32_t * out_dot,
+        uint64_t * out_expert_offset) {
+    llama::npmc::Superblock2MiBView view = llama_model_loader::get_npmc_superblock_view(expert_tensor);
+    if (!view.valid()) {
+        return false;
+    }
+    const uint64_t offset = view.lookup_expert_offset(expert_id);
+    if (offset == 0ULL) {
+        return false;
+    }
+    if (out_expert_offset != nullptr) {
+        *out_expert_offset = offset;
+    }
+    if (activations_bitplanes != nullptr && out_dot != nullptr) {
+        const auto * act = static_cast<const llama::npmc::TernaryBitplane64 *>(activations_bitplanes);
+        *out_dot = view.gemv_popcnt(expert_id, act, num_words);
+    }
+    return true;
+}
 
 bool llm_build_context::llama_graph_build_zdd_skip_mask(
         llama_context & lctx,
@@ -19,6 +60,10 @@ bool llm_build_context::llama_graph_build_zdd_skip_mask(
     if (!zdd_enabled || n_kv <= 0) {
         out_skip_mask.clear();
         return false;
+    }
+
+    if (lctx.inp_KQ_mask != nullptr) {
+        llama_graph_apply_zdd_fattn_op_params(lctx.inp_KQ_mask, true);
     }
 
     const uint32_t total_blocks = (uint32_t)((n_kv + llama::kv::zdd::KV_BLOCK_TOKENS - 1) / llama::kv::zdd::KV_BLOCK_TOKENS);

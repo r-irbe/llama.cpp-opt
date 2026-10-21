@@ -26,10 +26,11 @@
 
 namespace llama::npmc {
 
-constexpr uint64_t LEANGRPH_V3_MAGIC     = 0x485052474E41454CULL; // "LEANGRPH" in little-endian
-constexpr uint32_t LEANGRPH_V3_VERSION   = 3u;
-constexpr size_t   SUPERBLOCK_2MIB_BYTES = 2ULL * 1024ULL * 1024ULL;
-constexpr uint32_t MAX_SUPERBLOCK_EXPERTS = 4096u;
+constexpr uint64_t LEANGRPH_V3_MAGIC       = 0x485052474E41454CULL; // "LEANGRPH" in little-endian
+constexpr uint32_t NPMC_SUPERBLOCK_MAGIC   = 0x4E504D43u;           // "NPMC" magic header (0x4E504D43)
+constexpr uint32_t LEANGRPH_V3_VERSION     = 3u;
+constexpr size_t   SUPERBLOCK_2MIB_BYTES   = 2ULL * 1024ULL * 1024ULL;
+constexpr uint32_t MAX_SUPERBLOCK_EXPERTS  = 4096u;
 
 struct alignas(64) Superblock2MiBHeader {
     uint64_t magic;
@@ -302,7 +303,9 @@ public:
         if (!base_ || size_ < SUPERBLOCK_2MIB_BYTES) return false;
         if ((reinterpret_cast<uintptr_t>(base_) & 127u) != 0u) return false;
         const auto * hdr = header();
-        if (hdr->magic != LEANGRPH_V3_MAGIC || hdr->version != LEANGRPH_V3_VERSION) return false;
+        const bool valid_magic = (hdr->magic == LEANGRPH_V3_MAGIC) ||
+                                 (hdr->magic == static_cast<uint64_t>(NPMC_SUPERBLOCK_MAGIC));
+        if (!valid_magic || hdr->version != LEANGRPH_V3_VERSION) return false;
         if (hdr->num_experts == 0u || hdr->num_experts > MAX_SUPERBLOCK_EXPERTS || hdr->active_experts > hdr->num_experts) return false;
         if (hdr->words_per_expert == 0u) return false;
         if (hdr->stream_a_offset < sizeof(Superblock2MiBHeader)) return false;
@@ -377,6 +380,54 @@ public:
         const int32_t r = active_expert_rank(expert_id);
         if (r < 0) return nullptr;
         return expert_bitplanes_by_rank(static_cast<size_t>(r));
+    }
+
+    /// Resolves the byte offset of expert_id's TernaryBitplane64 weights within the 2 MiB superblock
+    /// via BitwiseVeb4096 rank + EliasFanoView::get(rank) in O(1) time (returns 0 if inactive).
+    inline uint64_t lookup_expert_offset(uint32_t expert_id) const noexcept {
+        const int32_t r = active_expert_rank(expert_id);
+        if (r < 0) return 0ULL;
+        const auto * hdr = header();
+        const uint64_t byte_offset = elias_fano().get(static_cast<size_t>(r));
+        const size_t expert_bytes = static_cast<size_t>(hdr->words_per_expert) * sizeof(TernaryBitplane64);
+        if (byte_offset + expert_bytes > hdr->stream_b_bytes) return 0ULL;
+        return static_cast<uint64_t>(hdr->stream_b_offset) + byte_offset;
+    }
+
+    /// Executes 2-bitplane ternary POPCNT GEMV for a single active expert against TernaryBitplane64 activations.
+    inline int32_t gemv_popcnt(
+        uint32_t expert_id,
+        const TernaryBitplane64 * activations,
+        size_t num_words = 0u
+    ) const noexcept {
+        if (!activations) return 0;
+        const uint64_t off = lookup_expert_offset(expert_id);
+        if (off == 0ULL) return 0;
+        const auto * w = reinterpret_cast<const TernaryBitplane64 *>(base_ + off);
+        const size_t words = (num_words == 0u || num_words > header()->words_per_expert)
+            ? static_cast<size_t>(header()->words_per_expert)
+            : num_words;
+        return TernaryBitplane64::dot_popcount(w, activations, words);
+    }
+
+    /// Executes multi-row 2-bitplane ternary POPCNT GEMV for an active expert into out_rows[0..num_rows).
+    inline bool gemv_popcnt(
+        uint32_t expert_id,
+        const TernaryBitplane64 * activations,
+        size_t words_per_row,
+        size_t num_rows,
+        int32_t * out_rows
+    ) const noexcept {
+        if (!activations || !out_rows || words_per_row == 0u || num_rows == 0u) return false;
+        const uint64_t off = lookup_expert_offset(expert_id);
+        if (off == 0ULL) return false;
+        const size_t total_words = static_cast<size_t>(header()->words_per_expert);
+        if (words_per_row * num_rows > total_words) return false;
+        const auto * w = reinterpret_cast<const TernaryBitplane64 *>(base_ + off);
+        for (size_t r = 0; r < num_rows; ++r) {
+            out_rows[r] = TernaryBitplane64::dot_popcount(w + r * words_per_row, activations, words_per_row);
+        }
+        return true;
     }
 
 private:

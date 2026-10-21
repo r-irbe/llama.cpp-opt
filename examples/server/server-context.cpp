@@ -1233,12 +1233,65 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     if (params_base.cohort_prefix_sharing) {
         if (!slot.cohort_id.empty() && slot.cohort_id != task.cohort_id) {
             cohort_trie.remove_slot(slot.id);
+            llama_kv_cache_seq_rm(ctx, slot.id, (int)system_tokens.size(), -1);
             slot.cache_tokens.clear();
             slot.n_past = 0;
             slot.n_past_prompt = 0;
             slot.cohort_reuse_count = 0;
         }
         slot.cohort_id = task.cohort_id;
+
+        if (!task.infill && !task.tokens.empty() && !task.tokens.has_mtmd_data() &&
+            llama_model_supports_partial_kv_reuse(model)) {
+            std::vector<llama_token> task_toks = task.tokens.get_text_tokens();
+            common_prefix local_prefix = slot.cache_tokens.empty()
+                ? common_prefix{0, 0}
+                : slot.cache_tokens.get_common_prefix(ctx, task.tokens);
+
+            auto donor = cohort_trie.find_best_donor_match(
+                task_toks,
+                task.cohort_id,
+                params_base.cohort_min_prefix,
+                [this](int id) -> const server_slot* { return get_slot_by_id(id); },
+                slot.id
+            );
+
+            if (donor.slot_id >= 0 && donor.slot_id != slot.id &&
+                donor.matched_tokens >= params_base.cohort_min_prefix &&
+                donor.matched_tokens > (int)local_prefix.first) {
+                server_slot* donor_slot = get_slot_by_id(donor.slot_id);
+                if (donor_slot && donor_slot->n_past >= donor.matched_tokens &&
+                    (int)donor_slot->cache_tokens.size() >= donor.matched_tokens) {
+                    bool prefix_verified = true;
+                    for (int i = 0; i < donor.matched_tokens; ++i) {
+                        if (donor_slot->cache_tokens[i] != task_toks[i]) {
+                            prefix_verified = false;
+                            break;
+                        }
+                    }
+                    if (prefix_verified) {
+                        const int p_end = (int)system_tokens.size() + donor.matched_tokens;
+                        llama_kv_cache_seq_rm(ctx, slot.id, 0, -1);
+                        llama_kv_cache_seq_cp(ctx, donor_slot->id, slot.id, 0, p_end);
+                        slot.cache_tokens.clear();
+                        for (int i = 0; i < donor.matched_tokens; ++i) {
+                            slot.cache_tokens.push_back(task_toks[i]);
+                        }
+                        slot.n_past = donor.matched_tokens;
+                        slot.n_past_prompt = donor.matched_tokens;
+                        slot.cohort_reuse_count++;
+                        donor_slot->cohort_reuse_count++;
+                        LOG_INFO("cloned cohort prefix across slots via llama_kv_cache_seq_cp", {
+                            {"id_slot", slot.id},
+                            {"donor_slot", donor_slot->id},
+                            {"matched_tokens", donor.matched_tokens},
+                            {"cohort_id", task.cohort_id},
+                            {"reuse_count", donor_slot->cohort_reuse_count}
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)

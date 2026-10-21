@@ -23738,10 +23738,26 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, Dk);
 
+        const bool zdd_skip = mp != NULL && (dst->op_params[5] != 0);
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
         for (int64_t ic = 0; ic < nek1; ++ic) {
+            if (zdd_skip && ((ic & 63) == 0) && (ic + 64 <= nek1)) {
+                const char * mp_blk = (const char *)(mp + ic);
+                uint64_t diff = 0ULL;
+                for (int w = 0; w < 16; ++w) {
+                    uint64_t word = 0ULL;
+                    memcpy(&word, mp_blk + (size_t)w * sizeof(uint64_t), sizeof(uint64_t));
+                    diff |= (word ^ 0xFC00FC00FC00FC00ULL);
+                }
+                if (diff == 0ULL) {
+                    ic += 63;
+                    continue;
+                }
+            }
+
             const float mv = mp ? slope*GGML_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;

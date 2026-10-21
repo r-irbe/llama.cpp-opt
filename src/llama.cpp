@@ -1723,6 +1723,11 @@ static bool llama_kv_cache_init(
         }
         if (ntensor > 0) {
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (!buf && !ggml_backend_buft_is_host(buft) && !split_cache && !replicate_mla) {
+                LLAMA_LOG_WARN("%s: %s KV buffer allocation failed; falling back to host CPU buffer for tiered KV streaming\n",
+                        __func__, ggml_backend_buft_name(buft));
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, llama_default_buffer_type_cpu(true));
+            }
             if (!buf) {
                 LLAMA_LOG_ERROR("%s: failed to allocate buffer for kv cache\n", __func__);
                 return false;
@@ -4475,12 +4480,20 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             //}
         }
     }
+    const uint32_t eff_attn_ctx = (model.hparams.n_swa > 0 || model.hparams.indexer_top_k > 0)
+        ? std::min<uint32_t>(max_ctx_size, std::max<uint32_t>((uint32_t) n_ubatch, model.hparams.n_swa + model.hparams.indexer_top_k))
+        : max_ctx_size;
     for (int il = 0; il < n_layer; ++il) {
         auto ffn = std::max(std::max(ffn_exps[il], ffn_shexp[il]), ffn_dense[il]);
         auto inp = model.hparams.n_embd * n_ubatch * sizeof(float);
         if (has_layer_norm[il]) inp *= 2;
         ffn += inp;
-        compute[il] = std::max<double>(compute[il], ffn);
+        if (llm_arch_is_dsv4(model.arch)) {
+            const double dsv4_attn = (double) std::max<uint32_t>(1, model.hparams.n_head(il)) * eff_attn_ctx * n_ubatch * sizeof(uint16_t) + attn[il];
+            compute[il] = std::max<double>(compute[il], std::max<double>(ffn, dsv4_attn));
+        } else {
+            compute[il] = std::max<double>(compute[il], ffn);
+        }
     }
     if (has_mla) {
         for (int il = 0; il < n_layer; ++il) {
@@ -4495,7 +4508,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
                 if (!mla.wv_b) result[il] += ggml_nbytes(mla.wkv_b)/2;
             }
             if (mla_attn == 3 && mla.wv_b) {
-                auto kv_f32_size = (2 * mla.wv_b->ne[1] * mla.wv_b->ne[2] * max_ctx_size * sizeof(float))/(1024.*1024.);
+                auto kv_f32_size = (2 * mla.wv_b->ne[1] * mla.wv_b->ne[2] * eff_attn_ctx * sizeof(float))/(1024.*1024.);
                 //printf("wv_b: %ld x %ld x %ld -> %g\n", mla.wv_b->ne[0], mla.wv_b->ne[1], mla.wv_b->ne[2], kv_f32_size);
                 int n_head = mla.wv_b->ne[2];
                 int n_max_head = n_head;
@@ -4508,7 +4521,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
                         }
                     }
                 }
-                kv_f32_size = 2. * mla.wv_b->ne[1] * n_max_head * max_ctx_size * sizeof(float);
+                kv_f32_size = 2. * mla.wv_b->ne[1] * n_max_head * eff_attn_ctx * sizeof(float);
                 compute[il] = std::max(compute[il], kv_f32_size);
             }
         }
@@ -4940,6 +4953,19 @@ static bool llm_load_tensors(
                         }
                     }
                     if (cur_mem > device_mem[id]) {
+                        for (int il = 0; il < n_layer && cur_mem > device_mem[id]; ++il) {
+                            if (model.default_layer_device[il] != id) continue;
+                            size_t layer_rem = (size_t) layer_sizes[il];
+                            if (experts[il].down && layer_rem >= ggml_nbytes(experts[il].down)) layer_rem -= ggml_nbytes(experts[il].down);
+                            if (experts[il].up   && layer_rem >= ggml_nbytes(experts[il].up))   layer_rem -= ggml_nbytes(experts[il].up);
+                            if (experts[il].gate && layer_rem >= ggml_nbytes(experts[il].gate)) layer_rem -= ggml_nbytes(experts[il].gate);
+                            cur_mem = cur_mem > layer_rem ? cur_mem - layer_rem : 0;
+                            model.default_layer_device[il] = -1;
+                            model.buft_layer[il] = llama_default_buffer_type_cpu(true);
+                            LLAMA_LOG_INFO("Offloading layer %d (non-expert + KV cache) to host CPU to fit device %d budget\n", il, id);
+                        }
+                    }
+                    if (cur_mem > device_mem[id]) {
                         if (n_override > 0) {
                             LLAMA_LOG_ERROR("Required memory %zu MiB in device %d is still greater than available memory %zu MiB after overriding all MoE tensors to CPU\n",
                                     cur_mem/(1024*1024), id, device_mem[id]/(1024*1024));
@@ -4994,10 +5020,14 @@ static bool llm_load_tensors(
     // assign the repeating layers to the devices according to the splits
     if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
         for (int i = i_gpu_start; i < n_layer; ++i) {
-            model.buft_layer[i] = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[i]]);
+            if (model.default_layer_device[i] >= 0) {
+                model.buft_layer[i] = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[i]]);
+            } else {
+                model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+            }
         }
         // assign the output layer
-        if (n_gpu_layers > n_layer) {
+        if (n_gpu_layers > n_layer && model.default_layer_device[n_layer] >= 0) {
             model.buft_output = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[n_layer]]);
         } else {
             model.buft_output = llama_default_buffer_type_cpu(true);
@@ -9112,6 +9142,15 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
     }
 
     ggml_numa_init(numa);
+    {
+        const auto & topo = ggml::cpu::numa::topology();
+        const char * strat_name = (numa == GGML_NUMA_STRATEGY_DISTRIBUTE) ? "distribute"
+                                : (numa == GGML_NUMA_STRATEGY_ISOLATE)    ? "isolate"
+                                : (numa == GGML_NUMA_STRATEGY_NUMACTL)    ? "numactl"
+                                : (numa == GGML_NUMA_STRATEGY_MIRROR)     ? "mirror"
+                                : "custom";
+        LLAMA_LOG_INFO("%s: --numa %s enabled across %zu NUMA nodes\n", __func__, strat_name, topo.size());
+    }
     return LLAMA_NUMA_INIT_STATUS_SUCCESS;
 }
 
@@ -9969,12 +10008,38 @@ struct llama_context * llama_init_from_model(
             LLAMA_LOG_INFO("%s: initialized ZDD sparse KV block manager (max_blocks=%u)\n", __func__, max_zdd_blocks);
         }
 
-        if (!cparams.offload_kqv) {
+        bool has_host_kv_buffer = !cparams.offload_kqv;
+        if (!has_host_kv_buffer) {
+            for (const auto & buf : ctx->kv_self.bufs) {
+                if (buf && ggml_backend_buffer_is_host(buf)) {
+                    has_host_kv_buffer = true;
+                    break;
+                }
+            }
+            if (!has_host_kv_buffer) {
+                for (const auto * k : ctx->kv_self.k_l) {
+                    if (k && k->buffer && ggml_backend_buffer_is_host(k->buffer)) {
+                        has_host_kv_buffer = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_host_kv_buffer) {
+                for (const auto & bl : model->buft_layer) {
+                    if (bl.buft && ggml_backend_buft_is_host(bl.buft)) {
+                        has_host_kv_buffer = true;
+                        break;
+                    }
+                }
+            }
+        }
+        const bool force_paged_kv_auto = std::getenv("LLAMA_PAGED_KV_AUTO") != nullptr;
+        if (has_host_kv_buffer || force_paged_kv_auto || (kv_size >= 262144 && has_host_kv_buffer)) {
             paged_kv_config paged_cfg;
             paged_cfg.block_size_tokens = 64;
             paged_cfg.n_embd_k = (uint32_t) std::max<size_t>(128, (hparams.n_embd_k_gqa(0) * ggml_type_size(type_k)) / ggml_blck_size(type_k));
             paged_cfg.n_embd_v = (uint32_t) std::max<size_t>(128, (hparams.n_embd_v_gqa(0) * ggml_type_size(type_v)) / ggml_blck_size(type_v));
-            paged_cfg.max_blocks = std::max<uint32_t>(64, (kv_size + paged_cfg.block_size_tokens - 1) / paged_cfg.block_size_tokens);
+            paged_cfg.max_blocks = std::clamp<uint32_t>((kv_size + paged_cfg.block_size_tokens - 1) / paged_cfg.block_size_tokens, 64u, 2048u);
             paged_cfg.use_hugetlb = true;
             paged_cfg.pin_host_memory = true;
             try {
@@ -9984,8 +10049,8 @@ struct llama_context * llama_init_from_model(
                 tiered_cfg.max_tier2_blocks = 8192;
                 tiered_cfg.enable_background_pretoucher = true;
                 ctx->tiered_kv = std::make_unique<common_tiered_kv_cache>(tiered_cfg);
-                LLAMA_LOG_INFO("%s: initialized host paged/tiered KV cache (block_size=%u, max_blocks=%u, zero-copy DMA active)\n",
-                        __func__, paged_cfg.block_size_tokens, paged_cfg.max_blocks);
+                LLAMA_LOG_INFO("%s: initialized host paged/tiered KV cache (block_size=%u, max_blocks=%u, host_kv=%d, zero-copy DMA active)\n",
+                        __func__, paged_cfg.block_size_tokens, paged_cfg.max_blocks, (int) has_host_kv_buffer);
             } catch (const std::exception & e) {
                 LLAMA_LOG_WARN("%s: host paged KV cache init failed: %s (falling back to standard host KV)\n", __func__, e.what());
             }

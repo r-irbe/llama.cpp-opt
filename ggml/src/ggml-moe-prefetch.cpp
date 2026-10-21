@@ -69,6 +69,7 @@ struct prefetch_pool {
     std::atomic<uint64_t> n_jobs{0};
     std::atomic<uint64_t> n_skipped{0};
     std::atomic<uint64_t> bytes_populated{0};
+    std::atomic<uint64_t> bytes_uring_prefetched{0};
     std::atomic<uint64_t> n_colded{0};
 
     ~prefetch_pool() { stop(); }
@@ -91,10 +92,11 @@ struct prefetch_pool {
             if (w.joinable()) w.join();
         }
         workers.clear();
-        if (getenv("GGML_MOE_PREFETCH_DEBUG") && n_jobs.load() > 0) {
-            fprintf(stderr, "%s: jobs=%llu skipped_resident=%llu bytes_populated=%.2f GiB colded=%llu\n", __func__,
+        if ((getenv("GGML_MOE_PREFETCH_DEBUG") || getenv("GGML_MOE_URING_PREFETCH")) && n_jobs.load() > 0) {
+            fprintf(stderr, "%s: jobs=%llu skipped_resident=%llu bytes_populated=%.2f GiB uring_prefetched=%.2f GiB colded=%llu\n", __func__,
                     (unsigned long long) n_jobs.load(), (unsigned long long) n_skipped.load(),
                     (double) bytes_populated.load()/(1024.0*1024.0*1024.0),
+                    (double) bytes_uring_prefetched.load()/(1024.0*1024.0*1024.0),
                     (unsigned long long) n_colded.load());
         }
     }
@@ -147,10 +149,35 @@ struct prefetch_pool {
             } else {
                 const uintptr_t astart = j.addr & ~(uintptr_t)(page - 1);
                 const size_t    alen   = ((j.addr + j.len + page - 1) & ~(uintptr_t)(page - 1)) - astart;
-                if (madvise((void *)astart, alen, MADV_POPULATE_READ) == 0) {
+                const bool      uring_mode = (std::getenv("GGML_MOE_URING_PREFETCH") != nullptr);
+                if (uring_mode) {
+                    // Issue async kernel read-ahead (WILLNEED) then populate PTEs
+                    (void) madvise((void *)astart, alen, MADV_WILLNEED);
+                    if (madvise((void *)astart, alen, MADV_POPULATE_READ) != 0) {
+                        volatile uint8_t sink = 0;
+                        const auto * p = reinterpret_cast<const volatile uint8_t *>(astart);
+                        for (size_t off = 0; off < alen; off += (size_t)page) {
+                            sink ^= p[off];
+                        }
+                        (void) sink;
+                    }
+                    bytes_populated.fetch_add(alen, std::memory_order_relaxed);
+                    bytes_uring_prefetched.fetch_add(alen, std::memory_order_relaxed);
+                    done_read = true;
+                } else if (madvise((void *)astart, alen, MADV_POPULATE_READ) == 0) {
                     bytes_populated.fetch_add(alen, std::memory_order_relaxed);
                     done_read = true;
-                } // on failure the fault path takes over
+                } else if (madvise((void *)astart, alen, MADV_WILLNEED) == 0) {
+                    volatile uint8_t sink = 0;
+                    const auto * p = reinterpret_cast<const volatile uint8_t *>(astart);
+                    for (size_t off = 0; off < alen; off += (size_t)page) {
+                        sink ^= p[off];
+                    }
+                    (void) sink;
+                    bytes_populated.fetch_add(alen, std::memory_order_relaxed);
+                    bytes_uring_prefetched.fetch_add(alen, std::memory_order_relaxed);
+                    done_read = true;
+                }
             }
             if (j.tk) {
                 const int left = j.tk->pending.fetch_sub(1, std::memory_order_acq_rel);
@@ -341,10 +368,8 @@ void ggml_moe_prefetch_set_n_threads(int n_threads) {
         s.pool.reset();
         return;
     }
-    if (!populate_read_supported()) {
-        fprintf(stderr, "%s: MADV_POPULATE_READ not supported; MoE prefetch disabled\n", __func__);
-        s.pool.reset();
-        return;
+    if (!populate_read_supported() && std::getenv("GGML_MOE_URING_PREFETCH") == nullptr) {
+        fprintf(stderr, "%s: MADV_POPULATE_READ not supported; using MADV_WILLNEED read-ahead fallback\n", __func__);
     }
     if (s.pool && s.pool->workers.size() == (size_t)n_threads) {
         return;

@@ -304,6 +304,11 @@ struct llama_mmap::impl {
             size_t huge = get_default_huge_page_size();
             auto size = huge*((file->size() + huge - 1)/huge);
             addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+            if (addr == MAP_FAILED) {
+                huge = 2 * 1024 * 1024;
+                size = huge * ((file->size() + huge - 1) / huge);
+                addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << 26), -1, 0);
+            }
             if (addr != MAP_FAILED) {
                 printf("%s: using THP with page size %zu MiB ", __func__, huge/(1024*1024));
                 fflush(stdout);

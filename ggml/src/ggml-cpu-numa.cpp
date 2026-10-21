@@ -60,6 +60,10 @@ bool is_numa_expert() {
 
 void set_numa_expert(bool enable) {
     g_numa_expert.store(enable, std::memory_order_relaxed);
+    if (enable) {
+        const auto & topo = topology();
+        fprintf(stderr, "ggml_numa: strategy=expert (--numa expert) initialized across %zu NUMA nodes\n", topo.size());
+    }
 }
 
 static bool read_file(const std::string & path, std::string & out) {
@@ -894,6 +898,12 @@ bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nod
     const uintptr_t page_mask = ~(4096ULL - 1);
     const size_t bits_per_word = 8 * sizeof(unsigned long);
 
+    static std::atomic<bool> s_logged_expert_bind{false};
+    if (!s_logged_expert_bind.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "ggml_numa: --numa expert round-robin MPOL_BIND active (%d experts across %d NUMA nodes, first tensor=%s)\n",
+                n_experts, n_numa_nodes, tensor->name);
+    }
+
     for (int e = 0; e < n_experts; ++e) {
         int target_node = e % n_numa_nodes;
         uintptr_t start_addr = (uintptr_t)tensor->data + e * expert_stride;
@@ -965,6 +975,11 @@ bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_node
 
     long ret = syscall(__NR_mbind, (void *)page_start, len, MPOL_INTERLEAVE, nodemask.data(), nodemask.size() * bits_per_word, MPOL_MF_MOVE);
     madvise((void *)page_start, len, MADV_HUGEPAGE);
+    static std::atomic<bool> s_logged_shared_interleave{false};
+    if (ret == 0 && !s_logged_shared_interleave.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "ggml_numa: --numa distribute/expert MPOL_INTERLEAVE active across %d NUMA nodes (first tensor=%s)\n",
+                n_numa_nodes, tensor->name);
+    }
     return ret == 0;
 #else
     (void)tensor;

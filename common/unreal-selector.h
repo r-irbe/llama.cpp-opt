@@ -52,6 +52,56 @@ struct chunk_span {
 };
 
 // =========================================================================================
+// UNREAL Pre-Pruning Global Aggregation Summary Header (Task 3.4b)
+// Computes exact corpus-wide occurrence statistics across ALL chunks prior to top-k pruning
+// so global counting and frequency queries remain 100% exact even when >80% of chunks are
+// pruned by Late-Interaction MaxSim filtering.
+// =========================================================================================
+struct global_aggregation_summary {
+    int total_chunks_scanned = 0;
+    int total_tokens_scanned = 0;
+    int retained_chunks      = 0;
+    int pruned_chunks        = 0;
+    std::unordered_map<llama_token, int> token_corpus_counts;     // exact total occurrences across all chunks
+    std::unordered_map<llama_token, int> token_chunk_frequencies; // number of chunks containing token (>= 1 time)
+
+    int get_corpus_count(llama_token tok) const {
+        auto it = token_corpus_counts.find(tok);
+        return it != token_corpus_counts.end() ? it->second : 0;
+    }
+
+    int get_chunk_frequency(llama_token tok) const {
+        auto it = token_chunk_frequencies.find(tok);
+        return it != token_chunk_frequencies.end() ? it->second : 0;
+    }
+
+    std::string format_header() const {
+        std::string out = "[UNREAL Global Corpus Summary: chunks=" + std::to_string(total_chunks_scanned) +
+                          " (retained=" + std::to_string(retained_chunks) +
+                          ", pruned=" + std::to_string(pruned_chunks) + ")" +
+                          ", total_tokens=" + std::to_string(total_tokens_scanned);
+        if (!token_corpus_counts.empty()) {
+            std::vector<std::pair<llama_token, int>> sorted_counts(token_corpus_counts.begin(), token_corpus_counts.end());
+            std::sort(sorted_counts.begin(), sorted_counts.end(), [](const auto & a, const auto & b) {
+                if (a.second != b.second) return a.second > b.second;
+                return a.first < b.first;
+            });
+            out += ", query_token_counts={";
+            for (size_t i = 0; i < sorted_counts.size(); ++i) {
+                if (i > 0) out += ", ";
+                llama_token tok = sorted_counts[i].first;
+                int count = sorted_counts[i].second;
+                int doc_freq = get_chunk_frequency(tok);
+                out += std::to_string(tok) + ":" + std::to_string(count) + "(chunks:" + std::to_string(doc_freq) + ")";
+            }
+            out += "}";
+        }
+        out += "]";
+        return out;
+    }
+};
+
+// =========================================================================================
 // SIMD-Accelerated Vector Dot Product Primitives
 // =========================================================================================
 
@@ -284,6 +334,53 @@ public:
         return selected;
     }
 
+    // =====================================================================================
+    // Pre-Pruning Global Aggregation Summary (Task 3.4b)
+    // Computes exact corpus-wide occurrence statistics across all chunks before top-k
+    // pruning so global counting / aggregation queries remain 100% exact even when >80%
+    // of chunks are pruned.
+    // =====================================================================================
+    static global_aggregation_summary compute_global_summary(
+        const std::vector<llama_token> & prompt_tokens,
+        int context_start,
+        const std::vector<chunk_span> & all_spans,
+        const std::unordered_set<llama_token> & query_tokens_set,
+        int retained_chunks = 0)
+    {
+        global_aggregation_summary summary;
+        summary.total_chunks_scanned = (int)all_spans.size();
+        summary.retained_chunks = std::min(retained_chunks, (int)all_spans.size());
+        summary.pruned_chunks = std::max(0, summary.total_chunks_scanned - summary.retained_chunks);
+
+        for (llama_token qtok : query_tokens_set) {
+            summary.token_corpus_counts[qtok] = 0;
+            summary.token_chunk_frequencies[qtok] = 0;
+        }
+
+        const int n_total = (int)prompt_tokens.size();
+        for (const auto & span : all_spans) {
+            int c_start = std::max(0, context_start + span.token_start);
+            int c_end = std::min(n_total, c_start + span.token_count);
+            if (c_end <= c_start) continue;
+
+            summary.total_tokens_scanned += (c_end - c_start);
+            std::unordered_set<llama_token> seen_in_chunk;
+
+            for (int t = c_start; t < c_end; ++t) {
+                llama_token tok = prompt_tokens[t];
+                if (query_tokens_set.count(tok)) {
+                    summary.token_corpus_counts[tok]++;
+                    seen_in_chunk.insert(tok);
+                }
+            }
+            for (llama_token tok : seen_in_chunk) {
+                summary.token_chunk_frequencies[tok]++;
+            }
+        }
+
+        return summary;
+    }
+
 private:
     config cfg_;
     std::vector<chunk_record> chunks_;
@@ -358,7 +455,8 @@ private:
 inline std::vector<llama_token> filter_prompt(
     const struct llama_model * model,
     const std::vector<llama_token> & prompt_tokens,
-    const gpt_params & params)
+    const gpt_params & params,
+    global_aggregation_summary * out_summary = nullptr)
 {
     if (!params.unreal_filter) {
         return prompt_tokens;
@@ -543,6 +641,15 @@ inline std::vector<llama_token> filter_prompt(
 
     // 5. Chronological Reassembly to preserve document context flow without distractors
     auto reassembled_spans = selector::reassemble_selected_spans(spans, selected_chunk_indices);
+
+    if (out_summary != nullptr) {
+        *out_summary = selector::compute_global_summary(
+            prompt_tokens,
+            context_start,
+            spans,
+            query_tokens_set,
+            (int)reassembled_spans.size());
+    }
 
     // 6. Assemble Distractor-Free Filtered Prompt
     std::vector<llama_token> filtered;

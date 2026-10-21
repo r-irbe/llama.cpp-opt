@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-model.h"
 #include "llama-model-loader.h"
 #include "ggml.h"
 
@@ -202,9 +203,46 @@ static void test_npmc_superblock_loader_view() {
             assert(bp != nullptr);
             assert(bp[0].pos_mask == 0x5555555555555555ULL);
             assert(bp[0].neg_mask == 0xAAAAAAAAAAAAAAAAULL);
+            assert(view.lookup_expert_offset(active_ids[r]) > 0ULL);
         }
         assert(!view.is_expert_active(0u));
-        printf("  [PASS] Zero-copy Superblock2MiBView mapped and verified via llama_model_loader\n");
+        assert(view.lookup_expert_offset(0u) == 0ULL);
+
+        // Verify export_npmc_superblocks and live llama_graph_dispatch_npmc_superblock tensor dispatch
+        std::unordered_map<std::string, uint32_t> exported_sb;
+        ml.export_npmc_superblocks(exported_sb);
+        assert(exported_sb.count("blk.0.ffn_exps.superblock") == 1u);
+        assert(exported_sb["blk.0.ffn_exps.superblock"] == llama::npmc::LEANGRPH_V3_VERSION);
+
+        const auto * w_sb = ml.get_weight("blk.0.ffn_exps.superblock");
+        assert(w_sb != nullptr && w_sb->tensor != nullptr);
+        w_sb->tensor->data = const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(view.header()));
+
+        std::vector<llama::npmc::TernaryBitplane64> act_planes(
+            words_per_expert,
+            {0x5555555555555555ULL, 0x0ULL}
+        );
+        int32_t dispatched_dot = 0;
+        uint64_t dispatched_off = 0ULL;
+        assert(llama_graph_dispatch_npmc_superblock(
+            w_sb->tensor,
+            active_ids[1],
+            act_planes.data(),
+            words_per_expert,
+            &dispatched_dot,
+            &dispatched_off
+        ));
+        assert(dispatched_off == view.lookup_expert_offset(active_ids[1]));
+        assert(dispatched_dot == view.gemv_popcnt(active_ids[1], act_planes.data(), words_per_expert));
+        assert(!llama_graph_dispatch_npmc_superblock(
+            w_sb->tensor,
+            0u,
+            act_planes.data(),
+            words_per_expert,
+            &dispatched_dot,
+            &dispatched_off
+        ));
+        printf("  [PASS] Zero-copy Superblock2MiBView mapped and live-dispatched via llama_graph_dispatch_npmc_superblock\n");
     }
     llama_backend_free();
     unlink(fname);

@@ -3301,6 +3301,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     if (!model.layers[il].wqkv && !model.layers[il].wqk && cparams.flash_attn &&
          model.layers[il].wq->extra && model.layers[il].wk->extra && model.layers[il].wv->extra && model.layers[il].wo->extra) {
         if (kv_self.k_l[il]->extra && kv_self.v_l[il]->extra) {
+            if (lctx.paged_kv) {
+                llm_build_context::llama_graph_stream_paged_kv(lctx, kv_self, n_kv, il);
+            }
 
             const bool compacted = kv_self.is_compacted(il);
             const bool use_swa_window = compacted && lctx.swa_window_view.active;

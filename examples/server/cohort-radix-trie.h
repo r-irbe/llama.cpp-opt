@@ -129,6 +129,72 @@ public:
         return best_match;
     }
 
+    // Searches the trie for ANY slot (including busy processing slots) holding the longest
+    // matching prefix in its KV cache (slot->n_past >= matched) that is authorized for
+    // task_cohort, enabling cross-slot KV cloning via llama_kv_cache_seq_cp.
+    template <typename SlotAccessor>
+    cohort_trie_match find_best_donor_match(
+        const std::vector<llama_token>& query_tokens,
+        const std::string& task_cohort,
+        int min_prefix_tokens,
+        SlotAccessor get_slot,
+        int exclude_slot_id = -1
+    ) const {
+        cohort_trie_match best_match;
+        if (query_tokens.empty()) return best_match;
+
+        const trie_node* cur = root.get();
+        int matched = 0;
+
+        for (llama_token tok : query_tokens) {
+            auto it = cur->children.find(tok);
+            if (it == cur->children.end()) {
+                break;
+            }
+            cur = it->second.get();
+            matched++;
+
+            if (matched >= min_prefix_tokens) {
+                for (int slot_id : cur->slot_ids) {
+                    if (slot_id == exclude_slot_id) continue;
+                    const auto* slot = get_slot(slot_id);
+                    if (!slot) continue;
+
+                    // Donor slot must have at least `matched` tokens materialized in its KV cache
+                    if (slot->n_past < matched) {
+                        continue;
+                    }
+
+                    // Strict multi-tenant cohort isolation
+                    if (slot->cohort_id != task_cohort) {
+                        continue;
+                    }
+
+                    bool is_better = false;
+                    if (matched > best_match.matched_tokens) {
+                        is_better = true;
+                    } else if (matched == best_match.matched_tokens) {
+                        if (slot->cohort_reuse_count > best_match.cohort_reuse_count) {
+                            is_better = true;
+                        } else if (slot->cohort_reuse_count == best_match.cohort_reuse_count &&
+                                   slot->t_last_used > best_match.t_last_used) {
+                            is_better = true;
+                        }
+                    }
+
+                    if (is_better) {
+                        best_match.slot_id = slot_id;
+                        best_match.matched_tokens = matched;
+                        best_match.cohort_reuse_count = slot->cohort_reuse_count;
+                        best_match.t_last_used = slot->t_last_used;
+                    }
+                }
+            }
+        }
+
+        return best_match;
+    }
+
 private:
     void remove_slot_recursive(trie_node* node, int slot_id) {
         if (!node) return;

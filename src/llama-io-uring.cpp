@@ -211,6 +211,27 @@ bool llama_io_uring_read_fd(
         is_direct = false;
     }
 
+    int direct_fd = -1;
+    int active_fd = fd;
+    if (!is_direct && config.try_direct_io && (addr_val % 4096 == 0)) {
+        char proc_fd_path[64];
+        std::snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/self/fd/%d", fd);
+        direct_fd = open(proc_fd_path, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (direct_fd >= 0) {
+            active_fd = direct_fd;
+            is_direct = true;
+        }
+    }
+    struct direct_fd_guard {
+        int & fd_ref;
+        ~direct_fd_guard() {
+            if (fd_ref >= 0) {
+                close(fd_ref);
+                fd_ref = -1;
+            }
+        }
+    } fd_cleanup{direct_fd};
+
     // Proactive memory pre-touching to eliminate page table soft faults
     if (config.populate_pages) {
         madvise(dest_addr, dest_capacity, MADV_POPULATE_WRITE);
@@ -233,6 +254,7 @@ bool llama_io_uring_read_fd(
     size_t completed_bytes = 0;
     size_t inflight = 0;
     bool had_error = false;
+    bool fallback_retry = false;
 
     while (completed_bytes < file_size && !had_error) {
         // Enqueue SQEs up to ring capacity
@@ -243,12 +265,15 @@ bool llama_io_uring_read_fd(
             size_t len = std::min(chunk_size, remaining);
 
             size_t read_len = len;
+            int sqe_fd = active_fd;
             if (is_direct) {
                 // If trailing block is not 4KB aligned, pad to 4KB if buffer allows
                 if (read_len % 4096 != 0) {
                     size_t padded_len = ((read_len + 4095) / 4096) * 4096;
                     if (off + padded_len <= dest_capacity) {
                         read_len = padded_len;
+                    } else if (direct_fd >= 0) {
+                        sqe_fd = fd;
                     }
                 }
             }
@@ -266,7 +291,7 @@ bool llama_io_uring_read_fd(
                 sqe->opcode = IORING_OP_READ;
                 sqe->addr = (uintptr_t)((char *)dest_addr + off);
             }
-            sqe->fd = fd;
+            sqe->fd = sqe_fd;
             sqe->off = off;
             sqe->len = (uint32_t)read_len;
             sqe->user_data = (uint64_t)off;
@@ -304,8 +329,14 @@ bool llama_io_uring_read_fd(
         while (head != tail) {
             struct io_uring_cqe * cqe = &session.cqes[head & *session.cq_mask];
             if (cqe->res < 0) {
-                had_error = true;
-                break;
+                if (cqe->res == -EINVAL && direct_fd >= 0 && !fallback_retry) {
+                    fallback_retry = true;
+                } else {
+                    had_error = true;
+                }
+                inflight--;
+                head++;
+                continue;
             }
 
             completed_bytes += cqe->res;
@@ -313,6 +344,31 @@ bool llama_io_uring_read_fd(
             head++;
         }
         __atomic_store_n(session.cq_head, head, __ATOMIC_RELEASE);
+
+        if (fallback_retry) {
+            // Drain any remaining inflight CQEs before retrying on buffered fd
+            while (inflight > 0) {
+                unsigned ch = *session.cq_head;
+                unsigned ct = __atomic_load_n(session.cq_tail, __ATOMIC_ACQUIRE);
+                if (ch == ct) {
+                    syscall(__NR_io_uring_enter, session.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+                    ct = __atomic_load_n(session.cq_tail, __ATOMIC_ACQUIRE);
+                }
+                while (ch != ct) {
+                    inflight--;
+                    ch++;
+                }
+                __atomic_store_n(session.cq_head, ch, __ATOMIC_RELEASE);
+            }
+            close(direct_fd);
+            direct_fd = -1;
+            active_fd = fd;
+            is_direct = false;
+            fallback_retry = false;
+            had_error = false;
+            submitted_offset = 0;
+            completed_bytes = 0;
+        }
     }
 
     if (had_error || completed_bytes < file_size) {
