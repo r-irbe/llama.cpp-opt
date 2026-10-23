@@ -1561,8 +1561,7 @@ common_speculative * common_speculative_init(
     } else if (params.autotune && !result->impls.empty()) {
         auto actual_type = result->impls[0]->type;
         if (actual_type != COMMON_SPECULATIVE_TYPE_NONE &&
-            actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3 &&
-            actual_type != COMMON_SPECULATIVE_TYPE_DSPARK) {
+            actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
             result->tuner = std::make_unique<spec_tuner>();
             result->tuner->init(actual_type, result->configs[0].params, llama_get_model(ctx_tgt));
             LOG_DBG("Autotune initialized for %s, tuning %zu parameters\n",
