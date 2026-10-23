@@ -19,6 +19,10 @@
 
 #include "llama-bitwise-veb.h"
 
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+#include "rust_mmap_engine.h"
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -385,6 +389,13 @@ public:
     /// Resolves the byte offset of expert_id's TernaryBitplane64 weights within the 2 MiB superblock
     /// via BitwiseVeb4096 rank + EliasFanoView::get(rank) in O(1) time (returns 0 if inactive).
     inline uint64_t lookup_expert_offset(uint32_t expert_id) const noexcept {
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+        uint64_t out_offset = 0ULL;
+        if (rust_mmap_superblock_lookup_expert(base_, size_, expert_id, &out_offset) != 0) {
+            return out_offset;
+        }
+        return 0ULL;
+#else
         const int32_t r = active_expert_rank(expert_id);
         if (r < 0) return 0ULL;
         const auto * hdr = header();
@@ -392,6 +403,7 @@ public:
         const size_t expert_bytes = static_cast<size_t>(hdr->words_per_expert) * sizeof(TernaryBitplane64);
         if (byte_offset + expert_bytes > hdr->stream_b_bytes) return 0ULL;
         return static_cast<uint64_t>(hdr->stream_b_offset) + byte_offset;
+#endif
     }
 
     /// Executes 2-bitplane ternary POPCNT GEMV for a single active expert against TernaryBitplane64 activations.
@@ -407,6 +419,23 @@ public:
         const size_t words = (num_words == 0u || num_words > header()->words_per_expert)
             ? static_cast<size_t>(header()->words_per_expert)
             : num_words;
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+        if (words <= 256u) {
+            uint64_t w_pos[256];
+            uint64_t w_neg[256];
+            uint64_t x_pos[256];
+            uint64_t x_neg[256];
+            for (size_t i = 0; i < words; ++i) {
+                w_pos[i] = w[i].pos_mask;
+                w_neg[i] = w[i].neg_mask;
+                x_pos[i] = activations[i].pos_mask;
+                x_neg[i] = activations[i].neg_mask;
+            }
+            return static_cast<int32_t>(
+                rust_mmap_superblock_ternary_gemv_popcnt(w_pos, w_neg, x_pos, x_neg, words)
+            );
+        }
+#endif
         return TernaryBitplane64::dot_popcount(w, activations, words);
     }
 

@@ -218,13 +218,13 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    if (dim == 0 && src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
+    if (src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
             src0->nb[1] % sizeof(float) == 0 && src1->nb[1] % sizeof(float) == 0) {
         auto bs = ggml_blck_size(dst->type);
         auto ts = ggml_type_size(dst->type);
         auto ne00_eff = (src0->ne[0]/bs)*ts/sizeof(float);
         auto ne0_eff  = (dst->ne[0]/bs)*ts/sizeof(float);
-        if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && dim <= 2) {
             //if (dst->ne[1] >= 65536 || dst->ne[2] >= 65536) {
             //    fprintf(stderr, "%s: ne1 = %ld, ne2 = %ld exceed max. blocks when computing %s\n", __func__, dst->ne[1], dst->ne[2], dst->name);
             //    GGML_ABORT("fatal error");

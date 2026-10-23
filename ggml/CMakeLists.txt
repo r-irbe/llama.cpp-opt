@@ -200,7 +200,7 @@ if (GGML_RUST_MMAP_ENGINE)
     target_compile_definitions(ggml PUBLIC GGML_USE_RUST_MMAP_ENGINE)
     target_include_directories(ggml PUBLIC "${GGML_RUST_MMAP_ENGINE_DIR}/include")
     find_library(GGML_RUST_MMAP_ENGINE_LIB
-        NAMES rust_mmap_engine librust_mmap_engine.a librust_mmap_engine.so
+        NAMES librust_mmap_engine.a rust_mmap_engine librust_mmap_engine.so
         PATHS "${GGML_RUST_MMAP_ENGINE_DIR}/target/release"
         NO_DEFAULT_PATH)
     if (GGML_RUST_MMAP_ENGINE_LIB)
@@ -209,6 +209,7 @@ if (GGML_RUST_MMAP_ENGINE)
         target_link_directories(ggml PUBLIC "${GGML_RUST_MMAP_ENGINE_DIR}/target/release")
         target_link_libraries(ggml PUBLIC rust_mmap_engine)
     endif()
+    target_link_options(ggml PUBLIC "-Wl,-rpath,${GGML_RUST_MMAP_ENGINE_DIR}/target/release")
 endif()
 
 #

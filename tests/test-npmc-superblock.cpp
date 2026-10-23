@@ -377,6 +377,39 @@ static void test_npmc_format_benchmarks() {
            popcnt_gelem_s, i8_gelem_s, popcnt_gelem_s / (i8_gelem_s > 0.0 ? i8_gelem_s : 1.0));
     printf("    * DRAM Bank-Conflict Strided Gather (512 rows x 64KB): Aliased(65536B) = %.2f ms vs Padded(65664B) = %.2f ms (%.2fx speedup)\n",
            aliased_ms, padded_ms, aliased_ms / (padded_ms > 0.0 ? padded_ms : 1.0));
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+    // 4.4: Rust-Mmap-Engine & Lean 4 FFI Verification and Latency vs C++20 Inline Mirror
+    const int32_t storage_node = rust_mmap_detect_storage_numa_node(".");
+    assert(storage_node >= -1);
+    assert(rust_mmap_lean_verify_transaction(100ULL, 200ULL, 50000ULL, 1ULL, 0u) == 0u);
+    assert(rust_mmap_lean_verify_transaction(100ULL, 200ULL, 950000ULL, 1ULL, 0u) == 1u);
+    assert(rust_mmap_lean_verify_transaction(100ULL, 200ULL, 50000ULL, 1ULL, 1u) == 2u);
+
+    volatile uint64_t ffi_off_sink = 0;
+    auto t12 = clock_t::now();
+    for (size_t it = 0; it < lookup_iters; ++it) {
+        const uint32_t q = active_ids[it & 31u];
+        uint64_t out_off = 0ULL;
+        const int32_t active = rust_mmap_superblock_lookup_expert(sb->data, sizeof(sb->data), q, &out_off);
+        assert(active == 1);
+        ffi_off_sink ^= out_off;
+    }
+    auto t13 = clock_t::now();
+    const double rust_ffi_lookup_ns = std::chrono::duration<double, std::nano>(t13 - t12).count() / static_cast<double>(lookup_iters);
+
+    const size_t lean_iters = 50000u;
+    volatile int32_t lean_gemv_sink = 0;
+    auto t14 = clock_t::now();
+    for (size_t it = 0; it < lean_iters; ++it) {
+        lean_gemv_sink += view.gemv_popcnt(active_ids[it & 31u], act_planes.data(), words_per_expert);
+    }
+    auto t15 = clock_t::now();
+    const double lean_gemv_ns = std::chrono::duration<double, std::nano>(t15 - t14).count() / static_cast<double>(lean_iters);
+
+    printf("    * [E4 Rust/Lean FFI] Storage NUMA node = %d | FFI Expert Lookup = %.2f ns/op (vs %.2f ns C++20 inline) | Lean 4 FFI 64-word GEMV = %.2f ns/op\n",
+           storage_node, rust_ffi_lookup_ns, veb_ef_ns, lean_gemv_ns);
+    (void)ffi_off_sink; (void)lean_gemv_sink;
+#endif
     (void)sink_ptr; (void)sink_idx; (void)dot_sink; (void)mem_sink;
 }
 

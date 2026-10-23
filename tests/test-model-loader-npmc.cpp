@@ -242,6 +242,27 @@ static void test_npmc_superblock_loader_view() {
             &dispatched_dot,
             &dispatched_off
         ));
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+        const int32_t detected_node = rust_mmap_detect_storage_numa_node(fname);
+        assert(detected_node >= -1);
+        uint64_t ffi_off = 0ULL;
+        assert(rust_mmap_superblock_lookup_expert(
+            reinterpret_cast<const uint8_t *>(view.header()),
+            llama::npmc::SUPERBLOCK_2MIB_BYTES,
+            active_ids[1],
+            &ffi_off
+        ) == 1);
+        assert(ffi_off == dispatched_off);
+        assert(rust_mmap_superblock_lookup_expert(
+            reinterpret_cast<const uint8_t *>(view.header()),
+            llama::npmc::SUPERBLOCK_2MIB_BYTES,
+            0u,
+            &ffi_off
+        ) == 0);
+        assert(rust_mmap_lean_verify_transaction(1ULL, 2ULL, 1000ULL, 1ULL, 0u) == 0u);
+        printf("  [PASS] GGML_USE_RUST_MMAP_ENGINE C-ABI FFI verified (storage_numa_node=%d, lookup_expert_offset=%llu)\n",
+               detected_node, (unsigned long long)ffi_off);
+#endif
         printf("  [PASS] Zero-copy Superblock2MiBView mapped and live-dispatched via llama_graph_dispatch_npmc_superblock\n");
     }
     llama_backend_free();

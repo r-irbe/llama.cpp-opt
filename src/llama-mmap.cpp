@@ -1,6 +1,10 @@
 #include "llama-mmap.h"
 #include "llama-io-uring.h"
 
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+#include "rust_mmap_engine.h"
+#endif
+
 #include "llama-impl.h"
 
 #include "ggml.h"
@@ -295,6 +299,13 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
+#ifdef GGML_USE_RUST_MMAP_ENGINE
+        if (!file->get_path().empty()) {
+            const int32_t storage_node = rust_mmap_detect_storage_numa_node(file->get_path().c_str());
+            LLAMA_LOG_INFO("llama_mmap: rust-mmap-engine detected storage NUMA node %d for %s\n",
+                    storage_node, file->get_path().c_str());
+        }
+#endif
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
