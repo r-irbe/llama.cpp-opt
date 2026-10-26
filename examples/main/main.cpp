@@ -1005,7 +1005,7 @@ int main(int argc, char ** argv) {
                 }
 
                 const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
-                if ((int) draft.size() >= min_usable_draft && (!draft.empty() || n_predict_budget > 1)) {
+                if (((int) draft.size() >= min_usable_draft && (!draft.empty() || n_predict_budget > 1)) || draft_result.target_only) {
                     if (common_speculative_needs_checkpoint(model)) {
                         if (!common_speculative_before_draft(
                             spec,

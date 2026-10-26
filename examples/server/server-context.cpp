@@ -3848,7 +3848,7 @@ void server_context::add_sampled_tokens() {
                 slot.i_batch_dft.clear();
             } else {
                 if (slot.spec_target_only) {
-                    SLT_DBG(slot, "%s\n", "selected DFlash target-only arm: root-only target batch");
+                    SLT_DBG(slot, "%s\n", "selected target-only arm: root-only target batch");
                 }
                 // keep track of total number of drafted tokens tested
                 slot.n_draft_total += draft.size();
@@ -5288,6 +5288,23 @@ void server_context::update_slots() {
     // check if all slots are idle
     if (slots_idle()) {
         return;
+    }
+
+    // ConcurrencyKnee sampling (investigation-garden spec 5.3): feed every
+    // speculative slot with the current active-stream count. When saturated
+    // (S >= C_knee), the next propose() throttles draft length to target-only
+    // so speculation cannot steal host memory bandwidth from the target's
+    // prefill and decode. The observe helper early-outs when the tuner is off.
+    {
+        int n_active_streams = 0;
+        for (const server_slot & slot : slots) {
+            if (slot.state != SLOT_STATE_IDLE) {
+                n_active_streams++;
+            }
+        }
+        for (auto & slot : slots) {
+            common_speculative_observe_concurrency(slot.spec, (double) n_active_streams);
+        }
     }
 
     {

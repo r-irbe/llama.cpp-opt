@@ -14,6 +14,20 @@ struct ggml_graph_node_properties {
     int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
 };
 
+// PolyGraph Plan-Buffer (28-byte fixed metadata struct)
+// Allows dynamic speculative draft verification (n in {0, 1, 2, 4, 8}) with fixed launch grids
+// and skips inactive draft tiles with zero CUDA graph invalidation or re-instantiation.
+struct alignas(4) ggml_cuda_polygraph_plan {
+    uint32_t active_draft_len;  // n in [0, n_max]
+    uint32_t active_tiles;      // Number of active execution tiles
+    uint32_t tile_offset;       // Base tile index in verification batch
+    uint32_t flags;             // Bitflags (e.g. 0x1: target-only baseline)
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;         // 7 x 4 bytes = 28 bytes
+};
+static_assert(sizeof(ggml_cuda_polygraph_plan) == 28, "PolyGraph plan buffer must be exactly 28 bytes");
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -42,6 +56,11 @@ struct ggml_cuda_graph {
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;
+
+    // PolyGraph plan-buffer support
+    bool has_polygraph_plan = false;
+    ggml_cuda_polygraph_plan polygraph_plan = {};
+    void * polygraph_plan_d = nullptr;
 #endif
 };
 

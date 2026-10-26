@@ -1824,6 +1824,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.speculative.autotune = true;
         return true;
     }
+    if (arg == "--spec-c-knee") {
+        CHECK_ARG
+        params.speculative.c_knee = std::stof(argv[i]);
+        if (params.speculative.c_knee < 0.0f) {
+            params.speculative.c_knee = 0.0f;
+        }
+        return true;
+    }
     if (arg == "--chunks") {
         CHECK_ARG
         params.n_chunks = std::stoi(argv[i]);
@@ -3758,6 +3766,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                               "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
                                                               "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });
     options.push_back({ "*", "--spec-autotune",          "automatically tune speculative params to maximize tokens/sec" });
+    options.push_back({ "*", "--spec-c-knee F",          "active-stream threshold that throttles speculation to target-only (Concurrent Knee; 0 disables, default 8)" });
 
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });

@@ -114,6 +114,14 @@ bool common_speculative_prepare_mtp_runtime(
 
 void common_speculative_free(common_speculative * spec);
 
+/**
+ * Feed the speculative systems tuner's ConcurrencyKnee with the current
+ * active-stream / queue-depth sample (e.g. the server's processing-slot count).
+ * When saturated, the next propose() throttles draft length to target-only.
+ * See investigation-garden spec section 5.3 (Concurrency Knee Throttler).
+ */
+void common_speculative_observe_concurrency(common_speculative * spec, double active_streams_or_queue_depth);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 

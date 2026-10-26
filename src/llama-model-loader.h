@@ -149,6 +149,12 @@ struct llama_model_loader {
     template<typename T>
     bool get_arr(const std::string & key, std::vector<T> & result, const bool required = true);
 
+    // read a raw integral array out of an in-file tensor by name (results in
+    // `result`); used when packagings carry config tables as tensors instead
+    // of KV arrays (e.g. RCO/DASLab DeepSeek-V4.1 engram tables)
+    template<typename T>
+    bool get_arr_tensor(const std::string & name, std::vector<T> & result);
+
     template<typename T, size_t N_MAX>
     bool get_arr(const std::string & key, std::array<T, N_MAX> & result, const bool required = true);
 

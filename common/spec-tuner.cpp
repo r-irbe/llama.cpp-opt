@@ -173,6 +173,17 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
     enabled    = true;
     spec_type  = type;
     configured_n_max = std::max(1, (int) user_params.n_max);
+    counterfactual = spec_counterfactual_engine(configured_n_max, 0.1, 0.15, 1.0);
+    systems_tuner.init_defaults(user_params.n_threads > 0 ? user_params.n_threads : 16, 8);
+    // ConcurrencyKnee threshold is operator-tunable (--spec-c-knee); a value
+    // of 0 disables the systems tuner entirely (no knee, no Thompson coords).
+    if (user_params.c_knee > 0.0f) {
+        systems_tuner.c_knee = (double) user_params.c_knee;
+        systems_tuner.enabled = true;
+    } else {
+        systems_tuner.c_knee = 1e30; // never saturates
+        systems_tuner.enabled = false;
+    }
     dflash_quarantined.clear();
     dflash_probe_cursor = 0;
     dflash_last_exploratory = false;
@@ -182,6 +193,7 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
     n_exploratory_selections = 0;
     n_quarantines = 0;
     n_recovery_probes = 0;
+    n_counterfactual_selections = 0;
     coords.clear();
     n_calls    = 0;
     n_requests = 0;
@@ -292,11 +304,25 @@ int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
         dflash_quarantined.assign(coord.arms.size(), false);
     }
 
+    // Exploration sweep: visit every undersampled arm, but start with the
+    // positive draft arms and leave target-only (value 0) for last. A cold
+    // start that proposes n_max 0 would disable drafting before any feedback
+    // cycle exists, and without drafting no feedback can ever arrive -- the
+    // tuner would pin itself to the zero arm forever. Sweeping non-zero arms
+    // first guarantees the first proposal drafts (and therefore learns).
+    int zero_arm = -1;
     for (int i = 0; i < (int) coord.arms.size(); ++i) {
         if (coord.arms[i].N < dflash_min_samples_per_arm) {
-            dflash_last_exploratory = true;
-            return i;
+            if (coord.arms[i].value != 0) {
+                dflash_last_exploratory = true;
+                return i;
+            }
+            zero_arm = i;
         }
+    }
+    if (zero_arm >= 0) {
+        dflash_last_exploratory = true;
+        return zero_arm;
     }
 
     if (dflash_recovery_probe_interval > 0 && n_calls > 0 &&
@@ -314,6 +340,23 @@ int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
     }
 
     static thread_local std::mt19937 rng(std::random_device{}());
+
+    // Not-a-Bandit Theorem 3: once the full-information engine is warm, its Hedge
+    // distribution over candidate draft lengths drives selection with zero
+    // exploration waste; the quarantine mask remains as a safety overlay.
+    if ((int) counterfactual.total_pulls() >= counterfactual_warmup_steps) {
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        const int k = counterfactual.select_draft_length(false, uni(rng));
+        const int idx = coord.find_nearest_arm((float) k);
+        if (idx >= 0 && idx < (int) coord.arms.size() && !dflash_quarantined[idx]) {
+            n_counterfactual_selections++;
+            coord.current_idx = idx;
+            coord.best_idx = idx;
+            return idx;
+        }
+        // Hedge draw landed on a quarantined arm: fall through to the deterministic
+        // best-mean exploit below (quarantine wins over the distribution).
+    }
 
     int best_mean_idx = -1;
     int ts_best_idx   = -1;
@@ -441,6 +484,12 @@ void spec_tuner::propose(common_params_speculative & params) {
         params.n_max = has_dflash_target_only_arm() ? 0 : std::min((int32_t)params.n_max, (int32_t)2);
     }
 
+    // ConcurrencyKnee throttling: when host memory bus or queue depth is saturated,
+    // throttle speculative draft length (n_max -> 0) to protect core target processing.
+    if (systems_tuner.enabled && systems_tuner.knee_saturated) {
+        params.n_max = has_dflash_target_only_arm() ? 0 : std::min((int32_t)params.n_max, (int32_t)1);
+    }
+
     enforce_constraints(params);
     t_tuner_us += (ggml_time_us() - t_start);
 }
@@ -490,6 +539,14 @@ void spec_tuner::accept_feedback(int n_accepted, int n_drafted, double step_tps)
 
     for (auto & coord : coords) {
         coord.update(reward);
+    }
+
+    // Update full-information counterfactual prefix attribution engine (Theorem 3)
+    counterfactual.update_full_information(n_drafted, n_accepted);
+
+    // Update multi-coordinate discounted Thompson systems tuner
+    if (systems_tuner.enabled) {
+        systems_tuner.update_feedback(reward);
     }
 
     update_dflash_quarantine();
@@ -544,6 +601,17 @@ void spec_tuner::accept_feedback(int n_accepted, int n_drafted, double step_tps)
         LOG_DBG("%s\n", oss.str().c_str());
     }
 
+    t_tuner_us += (ggml_time_us() - t_start);
+}
+
+void spec_tuner::observe_concurrency(double active_streams_or_queue_depth) {
+    if (!enabled) {
+        return;
+    }
+    // ConcurrencyKnee (investigation-garden spec 5.3): record the saturation
+    // sample; propose() consults knee_saturated to throttle n_max.
+    int64_t t_start = ggml_time_us();
+    systems_tuner.check_concurrency_knee(active_streams_or_queue_depth);
     t_tuner_us += (ggml_time_us() - t_start);
 }
 

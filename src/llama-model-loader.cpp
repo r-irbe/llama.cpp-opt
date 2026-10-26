@@ -446,6 +446,50 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
     }
 
+    // RCO/DASLab DeepSeek-V4.1 packagings ship the Engram lookup tables
+    // (arch "deepseek41-engram") in a companion GGUF next to the backbone,
+    // cross-referenced through the deepseek41.engram.file pointer and the
+    // deepseek41.engram.source hash. Attach it as an extra source file so the
+    // deferred engram_embd tensors resolve like any other weight.
+    {
+        std::string engram_file;
+        if (get_key("deepseek41.engram.file", engram_file, false)) {
+            bool have_embd = false;
+            for (const auto & w : weights) {
+                if (strstr(w.tensor->name, "engram_embd") != nullptr) {
+                    have_embd = true;
+                    break;
+                }
+            }
+            if (!have_embd) {
+                const size_t slash = fname.find_last_of("/\\");
+                const std::string sidecar_path =
+                    (slash == std::string::npos ? std::string(".") : fname.substr(0, slash)) + "/" + engram_file;
+                struct gguf_init_params side_params = {
+                    /*.no_alloc = */ true,
+                    /*.ctx      = */ &ctx,
+                };
+                struct gguf_context * side_gguf = gguf_init_from_file(sidecar_path.c_str(), side_params);
+                if (side_gguf) {
+                    files.emplace_back(new llama_file(sidecar_path.c_str(), "rb"));
+                    contexts.emplace_back(ctx);
+                    const uint16_t side_idx = (uint16_t) (files.size() - 1);
+                    int n_engram_tables = 0;
+                    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                        if (strstr(cur->name, "engram_embd") != nullptr) {
+                            weights.emplace_back(files.back().get(), side_idx, cur->name, side_gguf, cur);
+                            n_engram_tables++;
+                        }
+                    }
+                    gguf_free(side_gguf);
+                    LLAMA_LOG_INFO("%s: attached engram sidecar from %s (%d engram_embd tables)\n", __func__, sidecar_path.c_str(), n_engram_tables);
+                } else {
+                    LLAMA_LOG_WARN("%s: deepseek41.engram.file points at '%s' which failed to load; continuing without the engram tables\n", __func__, sidecar_path.c_str());
+                }
+            }
+        }
+    }
+
     n_kv      = gguf_get_n_kv(meta);
     n_tensors = weights.size();
 
@@ -996,8 +1040,33 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
     return true;
 }
 
+template<typename T>
+bool llama_model_loader::get_arr_tensor(const std::string & name, std::vector<T> & result) {
+    for (auto & w : weights) {
+        if (name != w.tensor->name) {
+            continue;
+        }
+        const enum ggml_type gt = w.tensor->type;
+        if (gt != GGML_TYPE_I32 && gt != GGML_TYPE_I64) {
+            LLAMA_LOG_WARN("%s: tensor '%s' is not an I32/I64 table (type %s)\n", __func__, name.c_str(), ggml_type_name(gt));
+            return false;
+        }
+        const size_t nbytes = (size_t) ggml_nbytes(w.tensor);
+        if (nbytes % sizeof(T) != 0) {
+            LLAMA_LOG_WARN("%s: tensor '%s' byte size %zu is not a multiple of %zu\n", __func__, name.c_str(), nbytes, sizeof(T));
+            return false;
+        }
+        result.resize(nbytes / sizeof(T));
+        files[w.idx]->seek(w.offs, SEEK_SET);
+        files[w.idx]->read_raw(result.data(), nbytes);
+        return true;
+    }
+    return false;
+}
+
 template<typename T, size_t N_MAX>
 bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> & result, const bool required) {
+
     const int kid = gguf_find_key(meta, key.c_str());
 
     if (kid < 0 || gguf_get_kv_type(meta, kid) != GGUF_TYPE_ARRAY) {
@@ -2100,6 +2169,8 @@ template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
 template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
 template bool llama_model_loader::get_arr<uint64_t>(const std::string &, std::vector<uint64_t> &, bool);
+template bool llama_model_loader::get_arr_tensor<uint32_t>(const std::string &, std::vector<uint32_t> &);
+template bool llama_model_loader::get_arr_tensor<uint64_t>(const std::string &, std::vector<uint64_t> &);
 template bool llama_model_loader::get_arr<int32_t, 8>(const std::string &, std::array<int32_t, 8> &, bool);
 template bool llama_model_loader::get_arr<uint32_t, 8>(const std::string &, std::array<uint32_t, 8> &, bool);
 

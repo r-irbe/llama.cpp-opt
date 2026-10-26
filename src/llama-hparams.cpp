@@ -2268,9 +2268,20 @@ void llm_load_hparams(
                                 throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
                             }
                         }
-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
-                        if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS), model.engram_offsets, false)) {
+                        // RCO/DASLab GSQ packagings store the engram hash
+                        // tables as raw I64/I32 tensors (engram_multipliers.weight
+                        // etc.) with the KV arrays absent; source them from the
+                        // tensors when the KV keys are missing.
+                        if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers, false) &&
+                                !ml.get_arr_tensor("engram_multipliers.weight", model.engram_multipliers)) {
+                            throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str()));
+                        }
+                        if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES), model.engram_primes, false) &&
+                                !ml.get_arr_tensor("engram_primes.weight", model.engram_primes)) {
+                            throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_PRIMES).c_str()));
+                        }
+                        if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS), model.engram_offsets, false) &&
+                                !ml.get_arr_tensor("engram_offsets.weight", model.engram_offsets)) {
                             const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                             model.engram_offsets.resize(model.engram_primes.size());
                             for (uint32_t l = 0; l < hparams.engram_n_layer; ++l) {
@@ -2284,7 +2295,10 @@ void llm_load_hparams(
                                 }
                             }
                         }
-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP),   model.engram_token_map);
+                        if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP), model.engram_token_map, false) &&
+                                !ml.get_arr_tensor("engram_token_map.weight", model.engram_token_map)) {
+                            throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str()));
+                        }
                         const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                         if (model.engram_multipliers.size() != (size_t) hparams.engram_n_layer * hparams.engram_max_ngram_size) {
                             throw std::runtime_error("engram multiplier count does not match layers * ngram size");

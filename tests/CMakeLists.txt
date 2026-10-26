@@ -305,3 +305,19 @@ target_include_directories(test-npmc-superblock PRIVATE ${PROJECT_SOURCE_DIR}/co
 target_link_libraries(test-npmc-superblock PRIVATE common)
 add_test(NAME test-npmc-superblock COMMAND $<TARGET_FILE:test-npmc-superblock>)
 
+add_executable(test-spec-counterfactual test-spec-counterfactual.cpp)
+target_include_directories(test-spec-counterfactual PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-spec-counterfactual PRIVATE common)
+add_test(NAME test-spec-counterfactual COMMAND $<TARGET_FILE:test-spec-counterfactual>)
+
+add_executable(test-spec-arbiter test-spec-arbiter.cpp)
+target_include_directories(test-spec-arbiter PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-spec-arbiter PRIVATE common)
+add_test(NAME test-spec-arbiter COMMAND $<TARGET_FILE:test-spec-arbiter>)
+
+add_executable(test-spec-integration test-spec-integration.cpp)
+target_include_directories(test-spec-integration PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-spec-integration PRIVATE common)
+add_test(NAME test-spec-integration COMMAND $<TARGET_FILE:test-spec-integration>)
+
+

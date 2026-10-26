@@ -1585,6 +1585,13 @@ void common_speculative_free(common_speculative * spec) {
     delete spec;
 }
 
+void common_speculative_observe_concurrency(common_speculative * spec, double active_streams_or_queue_depth) {
+    if (spec == nullptr || spec->tuner == nullptr || !spec->tuner->enabled) {
+        return;
+    }
+    spec->tuner->observe_concurrency(active_streams_or_queue_depth);
+}
+
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {
     if (spec == nullptr) {
         return;
@@ -1636,10 +1643,13 @@ llama_tokens common_speculative_draft(
         result.clear();
 
         if (spec->tuner && spec->tuner->has_dflash_target_only_arm() &&
-                impl->type == COMMON_SPECULATIVE_TYPE_DFLASH && impl_params.n_max == 0) {
+                (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                 impl->type == COMMON_SPECULATIVE_TYPE_DSPARK ||
+                 impl->type == COMMON_SPECULATIVE_TYPE_MTP) && impl_params.n_max == 0) {
             spec->curr_impl = impl.get();
             spec->last_step_target_only = true;
-            LOG_DBG("%s: selected DFlash target-only arm\n", __func__);
+            LOG_DBG("%s: selected %s target-only arm\n", __func__,
+                    common_speculative_type_to_str(impl->type).c_str());
             break;
         }
 

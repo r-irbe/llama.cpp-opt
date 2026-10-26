@@ -282,6 +282,11 @@ struct common_params_speculative {
 
     bool autotune = false; // automatically optimize speculative params for max tokens/sec
 
+    // ConcurrencyKnee (systems tuner): active-stream / queue-depth threshold at
+    // which speculative drafting is throttled to target-only so it cannot steal
+    // host memory bandwidth from the target's prefill and decode. 0 disables.
+    float c_knee = 8.0f;
+
     bool has_dft() const {
         // external draft model present only when -md is set
         return !model.empty();

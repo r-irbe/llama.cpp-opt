@@ -40,7 +40,7 @@ fi
 # 2. Parameters & Model Paths
 PORT="${PORT:-8080}"
 HOST="${HOST:-0.0.0.0}"
-MODEL_PATH="${MODEL_PATH:-/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf}"
+MODEL_PATH="${MODEL_PATH:-/home/radu/code/vm/llm/models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf}"
 BINARY="${SCRIPT_DIR}/build/bin/llama-server"
 
 # Context & Concurrency Settings

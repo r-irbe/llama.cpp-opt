@@ -110,6 +110,14 @@ add_library(${TARGET} STATIC
     paged-kv-cache.h
     tiered-kv-cache.h
     superchip-unified-pipeline.h
+    spec-counterfactual.h
+    spec-counterfactual.cpp
+    spec-arbiter.h
+    spec-arbiter.cpp
+    spec-systems-tuner.h
+    spec-systems-tuner.cpp
+    spec-split-executor.h
+    spec-split-executor.cpp
     )
 
 if (BUILD_SHARED_LIBS)

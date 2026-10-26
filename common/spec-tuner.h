@@ -1,6 +1,8 @@
 #pragma once
 
 #include "common.h"
+#include "spec-counterfactual.h"
+#include "spec-systems-tuner.h"
 
 struct llama_model;
 
@@ -79,6 +81,17 @@ struct spec_tuner {
     common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
     std::vector<spec_tuner_coord> coords;
 
+    // Full-information counterfactual prefix attribution engine (Not-a-Bandit Theorem 3)
+    spec_counterfactual_engine counterfactual;
+
+    // Multi-coordinate Discounted Thompson Sampling for hardware systems parameters
+    spec_systems_tuner systems_tuner;
+
+    // Not-a-Bandit warmup: minimum full-information observations before the Hedge
+    // distribution over candidate draft lengths replaces exploration-based selection.
+    int counterfactual_warmup_steps = 8;
+    uint64_t n_counterfactual_selections = 0;
+
     void init(common_speculative_type type, const common_params_speculative & user_params, const llama_model * model_tgt);
     void propose(common_params_speculative & params);
     void accept_feedback(int n_accepted, int n_drafted, double step_tps);
@@ -89,6 +102,13 @@ struct spec_tuner {
     void reset_exploration();
 
     void write_best(common_params_speculative & params) const;
+
+    /**
+     * Feed the systems tuner's ConcurrencyKnee with the current active-stream /
+     * queue-depth sample. When saturated (S >= C_knee), the next propose() throttles
+     * speculative draft length to protect target prefill and decoding.
+     */
+    void observe_concurrency(double active_streams_or_queue_depth);
 
     bool has_dflash_target_only_arm() const {
         return enabled && (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_DSPARK || spec_type == COMMON_SPECULATIVE_TYPE_MTP) && configured_n_max > 0;

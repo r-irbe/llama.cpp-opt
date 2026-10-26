@@ -600,16 +600,16 @@ def build_dynamic_parameter_space(hw: HostHardwareProfile) -> dict:
         "spec_type": {
             "group": "speculative",
             "cli_flag": "--spec-type",
-            "values": ["none", "ngram-mod", "mtp", "dflash", "suffix"],
+            "values": ["none", "ngram-mod", "mtp", "dflash", "dspark", "suffix"],
             "default": "none",
             "description": "Speculative drafting engine architecture"
         },
         "n_draft": {
             "group": "speculative",
             "cli_flag": "--draft",
-            "values": [1, 2, 4, 8, 16],
+            "values": [0, 1, 2, 4, 8, 16],
             "default": 4,
-            "description": "Maximum draft tokens proposed per step"
+            "description": "Maximum draft tokens proposed per step (0 = target-only baseline)"
         },
         "p_min": {
             "group": "speculative",
@@ -624,6 +624,27 @@ def build_dynamic_parameter_space(hw: HostHardwareProfile) -> dict:
             "values": [0, 1],
             "default": 1,
             "description": "Dynamic acceptance-rate guided draft length autotuning"
+        },
+        "n_threads_draft": {
+            "group": "speculative",
+            "cli_flag": "-td",
+            "values": [1, 2, 4, 8, 16],
+            "default": 4,
+            "description": "Worker threads allocated to drafter CCX / execution pool"
+        },
+        "companion_numa_domain": {
+            "group": "speculative",
+            "cli_flag": None,
+            "values": list(range(hw.numa_nodes)) if hw.numa_nodes > 1 else [0],
+            "default": 0,
+            "description": "NUMA domain affinity for asynchronous companion drafter"
+        },
+        "kv_dma_prefetch_depth": {
+            "group": "speculative",
+            "cli_flag": None,
+            "values": [0, 1, 2, 4, 8],
+            "default": 2,
+            "description": "Host paged KV DMA prefetch queue depth"
         },
         "spec_ckpt_mode": {
             "group": "speculative",
@@ -914,11 +935,15 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
     spec_type = config.get("spec_type", "none")
     if spec_type != "none":
         n_draft = config.get("n_draft", 4)
-        p_min = config.get("p_min", 0.7)
-        alpha = 0.82 if spec_type == "mtp" else (0.70 if p_min <= 0.7 else 0.55)
-        effective_drafts = min(n_draft, 8)
-        spec_multiplier = (1.0 - (alpha ** (effective_drafts + 1))) / (1.0 - alpha) / (1.0 + (effective_drafts * 0.10))
-        tg_tps *= max(1.0, spec_multiplier)
+        if n_draft == 0:
+            # Target-only baseline arm: no speculative draft, pure target decode
+            pass
+        else:
+            p_min = config.get("p_min", 0.7)
+            alpha = 0.82 if (spec_type == "mtp" or spec_type == "dspark") else (0.70 if p_min <= 0.7 else 0.55)
+            effective_drafts = min(n_draft, 8)
+            spec_multiplier = (1.0 - (alpha ** (effective_drafts + 1))) / (1.0 - alpha) / (1.0 + (effective_drafts * 0.10))
+            tg_tps *= max(1.0, spec_multiplier)
 
     # 4. Context Length Scaling on TTFT
     ctx_size = config.get("ctx_size", 16384)

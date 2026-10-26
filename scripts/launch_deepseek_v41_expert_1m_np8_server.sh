@@ -21,7 +21,7 @@ elif [[ -f "${WORKSPACE_ROOT}/env.sh" ]]; then
     source "${WORKSPACE_ROOT}/env.sh"
 fi
 
-MODEL_PATH="${MODEL_PATH:-/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf}"
+MODEL_PATH="${MODEL_PATH:-/home/radu/vm/llm/models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf}"
 BINARY="${WORKSPACE_ROOT}/build/bin/llama-server"
 PORT="${PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
@@ -55,6 +55,7 @@ echo "==========================================================================
 
 exec "${BINARY}" \
     -m "${MODEL_PATH}" \
+    --jinja \
     -ngl 99 \
     -ot "exps=CPU,engram_embd=CPU,nextn=CPU" \
     -t 56 \
@@ -68,12 +69,12 @@ exec "${BINARY}" \
     -fa on \
     --zdd-sparse-kv \
     --defer-ple \
-    --numa expert \
+    --numa expert --numa-replicate-shared \
     --transparent-huge-pages \
     -np 8 \
     --cohort-prefix-sharing \
     --cohort-min-prefix 64 \
-    --cache-ram 0 \
+    --cache-ram -1 \
     --port "${PORT}" \
     --host "${HOST}" \
     "$@"
