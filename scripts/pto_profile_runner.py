@@ -96,13 +96,18 @@ def resolve_llvm_profdata_binary() -> str:
 
 
 def build_production_env(profile_dir: Path) -> Dict[str, str]:
-    """Constructs the production runtime environment with continuous IRPGO counter sync (%c)."""
+    """Constructs the production runtime environment with IRPGO module+PID counter separation."""
     env = os.environ.copy()
     for k, v in PRODUCTION_ENV_DEFAULTS.items():
         env.setdefault(k, v)
     # Override any inherited GGML_CUDA_NO_PINNED=1 so pinned host memory & CUDA graphs stay active
     env["GGML_CUDA_NO_PINNED"] = os.environ.get("PTO_FORCE_NO_PINNED", "0")
-    env["LLVM_PROFILE_FILE"] = str(profile_dir / "pto-%p%c.profraw")
+    suffix = "%c" if os.environ.get("PTO_CONTINUOUS_MMAP") == "1" else ""
+    env["LLVM_PROFILE_FILE"] = str(profile_dir / f"pto-%p-%m{suffix}.profraw")
+    # Ensure native /lib64 (GLIBC_2.43) precedes any older conda sysroot in LD_LIBRARY_PATH
+    raw_ld = env.get("LD_LIBRARY_PATH", "")
+    filtered_ld = [p for p in raw_ld.split(":") if p and "sysroot" not in p]
+    env["LD_LIBRARY_PATH"] = ":".join(["/lib64", "/usr/lib64", "/usr/local/cuda/targets/x86_64-linux/lib"] + filtered_ld)
     return env
 
 
@@ -191,7 +196,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--live-daemon-merge",
         action="store_true",
-        help="Mode B: Merge live mmap-synced .profraw files (%p%c.profraw) from a running daemon without running synthetic stages"
+        help="Mode B: Merge live mmap-synced .profraw files (%%p%%c.profraw) from a running daemon without running synthetic stages"
     )
     parser.add_argument(
         "--merge-only",
@@ -371,7 +376,9 @@ def run_stage5_live_server_multi_slot(
         "-c", "8192",
         "-np", "4",
         "-cb",
-        "-fa",
+        "-fa", "on",
+        "--cohort-prefix-sharing",
+        "--zdd-sparse-kv",
         "-t", str(threads),
         "-ngl", str(n_gpu_layers),
     ]
@@ -391,6 +398,14 @@ def run_stage5_live_server_multi_slot(
 
     if not llama_server.exists():
         print(f"     [WARN] llama-server binary not found at {llama_server}, skipping Stage 5.")
+        return False
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+            probe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe_sock.bind(("127.0.0.1", port))
+    except OSError as sock_err:
+        print(f"     [SKIP] Loopback TCP bind on 127.0.0.1:{port} restricted ({sock_err}); skipping Stage 5 HTTP probe.")
         return False
 
     proc: Optional[subprocess.Popen[str]] = None
@@ -482,7 +497,10 @@ def merge_profraw_traces(
     """
     merged_out = profile_dir / "merged.profdata"
     llvm_profdata = resolve_llvm_profdata_binary()
-    profraw_files = sorted(profile_dir.glob("*.profraw"))
+    profraw_files = [
+        p for p in sorted(profile_dir.glob("*.profraw"))
+        if p.is_file() and p.stat().st_size > 128
+    ]
 
     inputs: List[str] = [str(p) for p in profraw_files]
     if base_profdata and base_profdata.exists():
@@ -692,7 +710,7 @@ def main() -> None:
         if prose_path and prose_path.exists():
             try:
                 with open(prose_path, "r", encoding="utf-8", errors="replace") as f:
-                    prompt_arg = f.read(min(ctx * 4, 3000)).strip()
+                    prompt_arg = f.read(min(ctx * 2, 1400)).strip()
             except Exception:
                 pass
 
@@ -704,7 +722,7 @@ def main() -> None:
             "-c", str(ctx),
             "-t", str(args.threads),
             "-ngl", str(args.n_gpu_layers),
-            "-fa",
+            "-fa", "on",
             "--temp", "0",
         ]
         if args.numa and args.numa.lower() != "none":
@@ -743,7 +761,7 @@ def main() -> None:
             "-c", "2048",
             "-t", str(args.threads),
             "-ngl", str(args.n_gpu_layers),
-            "-fa",
+            "-fa", "on",
             "--temp", "0.2",
         ]
         if args.numa and args.numa.lower() != "none":
@@ -765,7 +783,7 @@ def main() -> None:
                 "-c", "2048",
                 "-t", str(args.threads),
                 "-ngl", str(args.n_gpu_layers),
-                "-fa",
+                "-fa", "on",
             ]
             run_stage(cmd, "Speculative decoding draft verification loop", profile_dir, dry_run=args.dry_run, timeout=120)
         else:
@@ -779,7 +797,7 @@ def main() -> None:
             "-c", "2048",
             "-t", str(args.threads),
             "-ngl", str(args.n_gpu_layers),
-            "-fa",
+            "-fa", "on",
             "--temp", "0",
         ]
         if args.numa and args.numa.lower() != "none":
@@ -817,7 +835,7 @@ def main() -> None:
     elif args.perf_stat and shutil.which("perf"):
         bench_cmd = [
             "perf", "stat",
-            "-e", "cycles,instructions,icache-load-misses,L1-icache-load-misses,iTLB-load-misses,branch-misses",
+            "-e", "cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses",
         ] + bench_cmd
 
     if llama_bench.exists() or args.dry_run:

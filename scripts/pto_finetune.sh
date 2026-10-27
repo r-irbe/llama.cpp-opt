@@ -102,6 +102,8 @@ case "$COMPILER_FLAVOR" in
         CC_BIN="${CC_BIN:-/usr/bin/clang-21}"
         CXX_BIN="${CXX_BIN:-/usr/bin/clang++-21}"
         LLD_BIN="${LLD_BIN:-/usr/bin/ld.lld-21}"
+        AR_BIN="${AR_BIN:-/usr/bin/llvm-ar-21}"
+        RANLIB_BIN="${RANLIB_BIN:-/usr/bin/llvm-ranlib-21}"
         PROFDATA_BIN="${PROFDATA_BIN:-/usr/bin/llvm-profdata-21}"
         ALLOW_UNSUPPORTED_CUDA=OFF
         ;;
@@ -109,6 +111,8 @@ case "$COMPILER_FLAVOR" in
         CC_BIN="${CC_BIN:-$(command -v clang-22 || echo /usr/bin/clang-21)}"
         CXX_BIN="${CXX_BIN:-$(command -v clang++-22 || echo /usr/bin/clang++-21)}"
         LLD_BIN="${LLD_BIN:-$(command -v ld.lld-22 || echo /usr/bin/ld.lld-21)}"
+        AR_BIN="${AR_BIN:-$(command -v llvm-ar-22 || echo /usr/bin/llvm-ar-21)}"
+        RANLIB_BIN="${RANLIB_BIN:-$(command -v llvm-ranlib-22 || echo /usr/bin/llvm-ranlib-21)}"
         PROFDATA_BIN="${PROFDATA_BIN:-$(command -v llvm-profdata-22 || echo /usr/bin/llvm-profdata-21)}"
         ALLOW_UNSUPPORTED_CUDA=ON
         ;;
@@ -192,11 +196,48 @@ if [[ "$ENABLE_RUST_FFI" -eq 1 ]]; then
     fi
 fi
 
+mkdir -p "${REPO_ROOT}/aocc_sandbox"
+GCC_TOOLCHAIN_FLAG=""
+if [[ -d "/usr/lib64/gcc/x86_64-suse-linux/14" ]]; then
+    GCC_TOOLCHAIN_FLAG="--gcc-install-dir=/usr/lib64/gcc/x86_64-suse-linux/14"
+elif [[ -d "/usr/lib64/gcc/x86_64-suse-linux/13" ]]; then
+    GCC_TOOLCHAIN_FLAG="--gcc-install-dir=/usr/lib64/gcc/x86_64-suse-linux/13"
+fi
+
+cat << EOF > "${REPO_ROOT}/aocc_sandbox/clang-pto"
+#!/bin/bash
+exec "${CC_BIN}" ${GCC_TOOLCHAIN_FLAG} -Wno-unknown-warning-option "\$@"
+EOF
+
+cat << EOF > "${REPO_ROOT}/aocc_sandbox/clang++-pto"
+#!/bin/bash
+exec "${CXX_BIN}" ${GCC_TOOLCHAIN_FLAG} -Wno-unknown-warning-option "\$@"
+EOF
+chmod +x "${REPO_ROOT}/aocc_sandbox/clang-pto" "${REPO_ROOT}/aocc_sandbox/clang++-pto"
+CC_WRAPPER="${REPO_ROOT}/aocc_sandbox/clang-pto"
+CXX_WRAPPER="${REPO_ROOT}/aocc_sandbox/clang++-pto"
+
+NVCC_BIN="/usr/local/cuda/bin/nvcc"
+if [[ ! -x "$NVCC_BIN" ]]; then
+    NVCC_BIN="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
+fi
+
+# Strip conda sysroot flags from inherited LDFLAGS/CFLAGS/CXXFLAGS so /lib64/libm.so.6 is used
+unset LDFLAGS
+unset CPPFLAGS
+
 COMMON_CMAKE_ARGS=(
+    -G Ninja
     -DCMAKE_BUILD_TYPE=Release
-    "-DCMAKE_C_COMPILER=${CC_BIN}"
-    "-DCMAKE_CXX_COMPILER=${CXX_BIN}"
-    "-DCMAKE_CUDA_HOST_COMPILER=${CXX_BIN}"
+    -DCMAKE_SKIP_BUILD_RPATH=ON
+    "-DCMAKE_C_COMPILER=${CC_WRAPPER}"
+    "-DCMAKE_CXX_COMPILER=${CXX_WRAPPER}"
+    "-DCMAKE_AR=${AR_BIN}"
+    "-DCMAKE_RANLIB=${RANLIB_BIN}"
+    "-DCMAKE_CUDA_COMPILER=${NVCC_BIN}"
+    "-DCMAKE_CUDA_HOST_COMPILER=${CXX_WRAPPER}"
+    -DCUDAToolkit_ROOT=/usr/local/cuda
+    -DCMAKE_CUDA_ARCHITECTURES=89
     -DGGML_CUDA=ON
     -DGGML_CUDA_F16=ON
     -DGGML_AVX2=ON
