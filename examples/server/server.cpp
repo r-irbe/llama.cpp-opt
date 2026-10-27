@@ -1162,19 +1162,31 @@ int main(int argc, char ** argv) {
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
 
-                const bool enable_unreal = json_value(data, "unreal_filter", json_value(data, "unreal", ctx_server.params_base.unreal_filter));
-                if (enable_unreal) {
+                const bool enable_evidence = json_value(data, "evidence_filter", ctx_server.params_base.unreal_filter);
+                if (enable_evidence) {
                     gpt_params unreal_params = ctx_server.params_base;
                     unreal_params.unreal_filter = true;
                     unreal_params.n_ctx = ctx_server.n_ctx;
-                    if (data.contains("unreal_chunk_size")) {
-                        unreal_params.unreal_chunk_size = data["unreal_chunk_size"].get<int32_t>();
+                    if (data.contains("evidence_chunk_tokens")) {
+                        unreal_params.unreal_chunk_size = data["evidence_chunk_tokens"].get<int32_t>();
                     }
-                    if (data.contains("unreal_top_n")) {
-                        unreal_params.unreal_top_n = data["unreal_top_n"].get<int32_t>();
+                    if (data.contains("evidence_top_k")) {
+                        unreal_params.unreal_top_n = data["evidence_top_k"].get<int32_t>();
                     }
-                    if (data.contains("unreal_min_tokens")) {
-                        unreal_params.unreal_min_tokens = data["unreal_min_tokens"].get<int32_t>();
+                    if (data.contains("evidence_min_tokens")) {
+                        unreal_params.unreal_min_tokens = data["evidence_min_tokens"].get<int32_t>();
+                    }
+                    if (data.contains("evidence_strategy")) {
+                        unreal_params.unreal_evidence_strategy = data["evidence_strategy"].get<std::string>();
+                    }
+                    if (data.contains("symbol_boost")) {
+                        unreal_params.unreal_symbol_boost = data["symbol_boost"].get<float>();
+                    }
+                    if (data.contains("chunk_expansion")) {
+                        unreal_params.unreal_chunk_expansion = data["chunk_expansion"].get<int32_t>();
+                    }
+                    if (data.contains("maxsim_threshold")) {
+                        unreal_params.unreal_maxsim_threshold = data["maxsim_threshold"].get<float>();
                     }
                     for (size_t k = 0; k < inputs.size(); ++k) {
                         if (!inputs[k].has_mtmd_data()) {

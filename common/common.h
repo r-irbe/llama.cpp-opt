@@ -591,11 +591,18 @@ struct gpt_params {
 
     // UNREAL: Model-Internal Evidence Selection (arXiv:2610.08463)
     bool    unreal_filter           = false; // enable UNREAL model-internal evidence selection
-    int32_t unreal_chunk_size       = 140;   // chunk size in tokens (T)
+    int32_t unreal_chunk_size       = 140;   // chunk size in tokens (T) (aliased as evidence_chunk_tokens)
     int32_t unreal_top_n            = 10;    // number of top-scoring chunks to select (n)
     int32_t unreal_min_tokens       = 4096;  // minimum prompt tokens to activate UNREAL filtering (0 = auto N*)
     int32_t unreal_query_groups     = 4;     // pooled query groups (G)
-    int32_t unreal_chunk_vectors    = 7;     // pooled vectors per chunk (Lp)
+    int32_t unreal_chunk_vectors    = 7;     // pooled vectors / centroids per chunk (Lp)
+
+    // Agent-Tuned Evidence Selection Strategy Controls
+    std::string unreal_evidence_strategy = "adaptive_default"; // code_pinpoint, narrative_recall, analytic_aggregate, temporal_window, custom_weights
+    float   unreal_symbol_boost     = 1.5f;  // identifier / symbol lexical boost weight
+    int32_t unreal_chunk_expansion  = 0;     // radius of contiguous neighbour chunks to expand around top hits
+    float   unreal_maxsim_threshold = -1.0f; // minimum MaxSim threshold (-1.0f = disabled)
+    std::string unreal_symbol_regex = "";    // custom regex pattern for symbol boost matching
 
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot

@@ -31,189 +31,36 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Import unified provenance, metrics, and monitoring engine
+try:
+    from benchmarks.common import (
+        get_git_sha,
+        get_binary_sha256,
+        get_hardware_fingerprint,
+        detect_platform_info as detect_hardware_info,
+        read_proc_vmhwm_kb as _read_proc_vmhwm_kb,
+        RusagePopen as _RusagePopen,
+        run_with_vmhwm_monitor,
+        VmHwmMonitor,
+    )
+except ImportError:
+    # Allow running directly from scripts/ directory
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from benchmarks.common import (
+        get_git_sha,
+        get_binary_sha256,
+        get_hardware_fingerprint,
+        detect_platform_info as detect_hardware_info,
+        read_proc_vmhwm_kb as _read_proc_vmhwm_kb,
+        RusagePopen as _RusagePopen,
+        run_with_vmhwm_monitor,
+        VmHwmMonitor,
+    )
+
 MODE_LIVE = "live"
 MODE_SIMULATED = "simulated"
 MODE_FAILED = "failed"
 RUN_MODES = (MODE_LIVE, MODE_SIMULATED, MODE_FAILED)
-
-_GIT_SHA_CACHE = None
-
-
-def get_git_sha() -> str:
-    """Return current git HEAD SHA for provenance tracking."""
-    global _GIT_SHA_CACHE
-    if _GIT_SHA_CACHE is not None:
-        return _GIT_SHA_CACHE
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent.parent),
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        _GIT_SHA_CACHE = out if out else "unknown"
-    except Exception:
-        _GIT_SHA_CACHE = "unknown"
-    return _GIT_SHA_CACHE
-
-
-def get_binary_sha256(bin_path: str) -> str:
-    """Compute SHA-256 of the target binary if it exists on disk."""
-    if not bin_path:
-        return "missing"
-    p = Path(bin_path)
-    if not p.is_file():
-        resolved = shutil.which(str(bin_path))
-        if not resolved:
-            return "missing"
-        p = Path(resolved)
-    try:
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return "error"
-
-
-def detect_hardware_info() -> dict:
-    """Probe CPU, NUMA, RAM, and GPU topology for hardware provenance."""
-    info = {
-        "os": platform.system(),
-        "arch": platform.machine(),
-        "cpu_brand": "unknown",
-        "cpu_cores": os.cpu_count() or 1,
-        "numa_nodes": 1,
-        "total_ram_gb": 0.0,
-        "gpu_name": "None",
-        "gpu_vram_gb": 0.0,
-    }
-    if info["os"] == "Linux":
-        try:
-            node_dirs = list(Path("/sys/devices/system/node").glob("node[0-9]*"))
-            if node_dirs:
-                info["numa_nodes"] = len(node_dirs)
-        except Exception:
-            pass
-        try:
-            with open("/proc/cpuinfo", "r") as f:
-                m = re.search(r"model name\s*:\s*(.+)", f.read())
-                if m:
-                    info["cpu_brand"] = m.group(1).strip()
-        except Exception:
-            pass
-        try:
-            with open("/proc/meminfo", "r") as f:
-                m = re.search(r"MemTotal:\s*(\d+)\s*kB", f.read())
-                if m:
-                    info["total_ram_gb"] = round(int(m.group(1)) / (1024 ** 2), 1)
-        except Exception:
-            pass
-        if shutil.which("nvidia-smi"):
-            try:
-                out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-                    stderr=subprocess.DEVNULL,
-                ).decode().strip()
-                lines = [l for l in out.splitlines() if l.strip()]
-                if lines:
-                    parts = lines[0].split(",")
-                    info["gpu_name"] = parts[0].strip()
-                    info["gpu_vram_gb"] = round(float(parts[1].strip()) / 1024.0, 1)
-            except Exception:
-                pass
-    return info
-
-
-def get_hardware_fingerprint(hw: dict = None) -> str:
-    """Return a concise, deterministic hardware topology fingerprint."""
-    if hw is None:
-        hw = detect_hardware_info()
-    return (
-        f"{hw.get('arch', 'unknown')}|{hw.get('cpu_brand', 'unknown')}|"
-        f"{hw.get('cpu_cores', 1)}c|numa={hw.get('numa_nodes', 1)}|"
-        f"ram={hw.get('total_ram_gb', 0.0)}G|gpu={hw.get('gpu_name', 'None')}({hw.get('gpu_vram_gb', 0.0)}G)"
-    )
-
-
-def _read_proc_vmhwm_kb(pid: int) -> int:
-    """Read VmHWM (Peak Resident Set Size) in kB from /proc/<pid>/status."""
-    try:
-        with open(f"/proc/{pid}/status", "r") as f:
-            for line in f:
-                if line.startswith("VmHWM:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1])
-    except Exception:
-        pass
-    return 0
-
-
-class _RusagePopen(subprocess.Popen):
-    """Popen subclass that captures per-child resource usage via os.wait4 on POSIX."""
-
-    def __init__(self, *args, **kwargs):
-        self.rusage = None
-        super().__init__(*args, **kwargs)
-
-    def _try_wait(self, wait_flags):
-        if hasattr(os, "wait4"):
-            try:
-                pid, sts, ru = os.wait4(self.pid, wait_flags)
-                if pid == self.pid:
-                    self.rusage = ru
-                return (pid, sts)
-            except ChildProcessError:
-                return (self.pid, 0)
-        return super()._try_wait(wait_flags)
-
-
-def run_with_vmhwm_monitor(cmd, env=None, timeout=None):
-    """Run subprocess while polling /proc/<pid>/status and os.wait4 for peak VmHWM in kB."""
-    proc = _RusagePopen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-    )
-    peak_kb = [0]
-    stop_evt = threading.Event()
-
-    def _poll():
-        while not stop_evt.is_set():
-            hwm = _read_proc_vmhwm_kb(proc.pid)
-            if hwm > peak_kb[0]:
-                peak_kb[0] = hwm
-            stop_evt.wait(0.01)
-
-    t = threading.Thread(target=_poll, daemon=True)
-    t.start()
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        raise
-    finally:
-        stop_evt.set()
-        t.join(timeout=1.0)
-
-    if getattr(proc, "rusage", None) is not None and getattr(proc.rusage, "ru_maxrss", 0) > 0:
-        ru_kb = int(proc.rusage.ru_maxrss)
-        if ru_kb > peak_kb[0]:
-            peak_kb[0] = ru_kb
-    elif peak_kb[0] == 0:
-        try:
-            ru = resource.getrusage(resource.RUSAGE_CHILDREN)
-            if ru.ru_maxrss > 0:
-                peak_kb[0] = int(ru.ru_maxrss)
-        except Exception:
-            pass
-
-    return proc.returncode, stdout, stderr, peak_kb[0]
 
 
 def validate_stage_modes(stages: list, allow_mixed_modes: bool = False):

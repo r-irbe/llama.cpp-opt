@@ -13220,9 +13220,37 @@ static void ggml_compute_forward_dup_q(
     int nth = params->nth;
 
     if (dst->src[0]->type == dst->type &&
+        dst->src[0]->ne[0] == dst->ne[0] &&
         dst->src[0]->nb[0] == ggml_type_size(dst->type) &&
         dst->nb[0] == ggml_type_size(dst->type)) {
-        ggml_compute_forward_dup_bytes(params, dst);
+        // Direct row copy for matching quantized types (e.g. Q4_0 -> Q4_0, Q8_0 -> Q8_0 views)
+        const struct ggml_tensor * src0 = dst->src[0];
+        const int64_t ne00 = src0->ne[0];
+        const int64_t ne01 = src0->ne[1];
+        const int64_t ne02 = src0->ne[2];
+        const int64_t ne03 = src0->ne[3];
+        const size_t  nb01 = src0->nb[1];
+        const size_t  nb02 = src0->nb[2];
+        const size_t  nb03 = src0->nb[3];
+        const size_t  nb1  = dst->nb[1];
+        const size_t  nb2  = dst->nb[2];
+        const size_t  nb3  = dst->nb[3];
+
+        const int dr = (ne01 + nth - 1) / nth;
+        const int ir0 = dr * ith;
+        const int ir1 = MIN(ir0 + dr, (int) ne01);
+        const size_t rs = ggml_row_size(dst->type, ne00);
+
+        for (int64_t i03 = 0; i03 < ne03; i03++) {
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                    memcpy(
+                        ((char *) dst->data  + i01*nb1  + i02*nb2  + i03*nb3),
+                        ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03),
+                        rs);
+                }
+            }
+        }
         return;
     }
 

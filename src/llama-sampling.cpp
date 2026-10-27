@@ -8,6 +8,7 @@
 #include <cstring>
 #include <ctime>
 #include <cfloat>
+#include <cmath>
 #include <numeric>
 #include <unordered_map>
 #include <fstream>
@@ -707,6 +708,18 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
         return candidates->data[0].id;
     }
 
+    // Sanitize logits against NaN/Inf to prevent corrupted probabilities.txt crashes
+    bool has_nan = false;
+    for (size_t j = 0; j < candidates->size; ++j) {
+        if (!std::isfinite(candidates->data[j].logit)) {
+            candidates->data[j].logit = -1e9f;
+            has_nan = true;
+        }
+    }
+    if (has_nan) {
+        LLAMA_LOG_WARN("llama_sample_token_with_rng_impl: detected and clamped non-finite logits (NaN/Inf)\n");
+    }
+
     std::vector<float> probs(candidates->size);
     probs[0] = candidates->data[0].logit;
     float max = probs[0];
@@ -723,10 +736,23 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
     }
     probs.back() += sump;
 
+    if (!std::isfinite(sump) || sump <= 0.0f) {
+        LLAMA_LOG_WARN("llama_sample_token_with_rng_impl: non-positive or non-finite sum of probabilities (sump=%f), falling back to greedy token\n", sump);
+        smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
+        smpl->n_sample++;
+        return candidates->data[0].id;
+    }
+
     auto r = rng();
     auto p = sump * r / rng.max();
     auto iter = std::upper_bound(probs.begin(), probs.end(), p);
     if (iter == probs.end()) {
+        // Fallback: If edge rounding or precision puts p slightly above probs.back(), fallback to last or first valid token rather than hard crashing
+        if (!probs.empty() && std::isfinite(probs.back()) && candidates->size > 0) {
+            smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
+            smpl->n_sample++;
+            return candidates->data[candidates->size - 1].id;
+        }
         LLAMA_LOG_ERROR("=============================== Failed to sample token\n");
         std::ofstream out("probabilities.txt");
         out << "candidates->size: " << candidates->size << std::endl;

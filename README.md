@@ -189,7 +189,26 @@ https://github.com/ikawrakow/ik_llama.cpp/blob/main/docs/build.md
 
 Download `.gguf` model files (e.g. [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf)) to your favorite directory (e.g. `/my_local_files/gguf`).
 
-Start the server with one of the commands (CPU or GPU):
+#### Unified Declarative Launcher (`scripts/launch.sh` / `scripts/launch.py`)
+All server runs can now be launched via the unified declarative launcher reading from `scripts/configs/models.toml`:
+
+```bash
+# List available declarative model profiles:
+./scripts/launch.sh --list
+
+# Launch DeepSeek-V4.1-Flash (default hardware-optimized profile):
+./scripts/launch.sh deepseek_v41_flash
+
+# Launch GLM-5.3-Flash with custom port and host:
+./scripts/launch.sh glm_53 --port 8000 --host 0.0.0.0
+
+# Launch Qwen3.8-27B or inspect generated command in dry-run mode:
+./scripts/launch.sh qwen38_27b --dry-run
+```
+
+Each profile in `scripts/configs/models.toml` declaratively specifies context lengths, batch dimensions, NUMA pinning, offload rules, MLA settings, and feature flags (`--zdd-sparse-kv`, `--transparent-huge-pages`, `--cohort-prefix-sharing`). Note that `--cache-ram 0` is set by default to protect models with private latent state from invalid cross-slot compaction cycles.
+
+Alternatively, start the server directly:
 
 ```
 ./build/bin/llama-server --model /my_local_files/gguf/Qwen_Qwen3-0.6B-IQ4_NL.gguf --ctx-size 4096
@@ -199,7 +218,7 @@ Start the server with one of the commands (CPU or GPU):
 ./build/bin/llama-server --model /my_local_files/gguf/Qwen_Qwen3-0.6B-IQ4_NL.gguf --ctx-size 4096 -ngl 999
 ```
 
-That's all! Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in Browser and start chatting, or use the available API endpoins in your program/harness.
+That's all! Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in Browser and start chatting, or use the available API endpoints in your program/harness.
 
 ### Run in Docker or Podman
 

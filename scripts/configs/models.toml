@@ -1,0 +1,119 @@
+# Common server defaults
+[defaults]
+host = "127.0.0.1"
+port = 8080
+threads = 56
+jinja = true
+transparent_huge_pages = true
+numa = "expert"
+spill_dir = "/home/radu/llama-checkpoints"
+cache_ram = 0
+
+# -----------------------------------------------------------------------------
+# DeepSeek-V4.1-Flash (671B MoE / 748B-equivalent)
+# -----------------------------------------------------------------------------
+[models.deepseek_v41_flash]
+name = "DeepSeek-V4.1-Flash"
+model_path = "/home/radu/vm/llm/models/DeepSeek-V4.1-Flash-UNCENSORED-DwarfStar-Q2/DeepSeek-V4.1-Flash-UNCENSORED-Q2-bootstrap.gguf"
+fallback_paths = [
+    "/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf",
+    "/home/radu/vm/llm/models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+]
+draft_path = "/home/radu/vm/llm/models/Smalinin-Deepseek-v41-flash/DeepSeek-V4.1-Flash-DSpark-AUTO.gguf"
+ngl = 999
+offload_tensors = "exps=CPU,engram_embd=CPU,nextn=CPU"
+batch_size = 2048
+ubatch_size = 1024
+ctx_size = 1048576
+n_parallel = 4
+cache_type_k = "q4_0"
+cache_type_v = "q4_0"
+mla = 2
+flash_attn = true
+zdd_sparse_kv = true
+defer_ple = true
+cohort_prefix_sharing = true
+cohort_min_prefix = 64
+cache_ram = 0
+chat_template_kwargs = '{"reasoning_effort":100}'
+spec_type = "ngram-map-k4v:n_max=7,n_min=2,ngram_size_n=4"
+spec_autotune = true
+extra_flags = ["-fidx", "-mqkv", "-muge", "-cb", "-prexp", "-dple", "--numa-replicate-shared"]
+
+# -----------------------------------------------------------------------------
+# DeepSeek-V4.1-Flash High-Throughput Production Profile (-np 8)
+# -----------------------------------------------------------------------------
+[models.deepseek_v41_fastest_np8]
+name = "DeepSeek-V4.1-Flash-Fastest-NP8"
+model_path = "/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+fallback_paths = [
+    "/home/radu/vm/llm/models/DeepSeek-V4.1-Flash-UNCENSORED-DwarfStar-Q2/DeepSeek-V4.1-Flash-UNCENSORED-Q2-bootstrap.gguf"
+]
+ngl = 999
+offload_tensors = "exps=CPU"
+numa = "distribute"
+batch_size = 2048
+ubatch_size = 512
+ctx_size = 65536
+n_parallel = 8
+cache_type_k = "q4_0"
+cache_type_v = "q4_0"
+mla = 2
+flash_attn = true
+zdd_sparse_kv = true
+defer_ple = true
+cohort_prefix_sharing = true
+cohort_min_prefix = 64
+cache_ram = 0
+
+# -----------------------------------------------------------------------------
+# GLM-5.3 / GLM-5.3-Flash (146B MoE with Lightning DSA Attention)
+# -----------------------------------------------------------------------------
+[models.glm_53]
+name = "GLM-5.3-UD-IQ4_XS"
+model_path = "/home/radu/vm/llm/models/GLM-5.3-GGUF/UD-IQ4_XS/GLM-5.3-UD-IQ4_XS-00001-of-00009.gguf"
+fallback_paths = [
+    "/home/radu/code/llama.cpp/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+]
+draft_path = "/home/radu/vm/llm/models/GLM-5.3-GGUF/GLM-5.3-DFlash2-Q3_K_M.gguf"
+ngl = 50
+offload_tensors = "exps=CPU,engram_embd=CPU,nextn=CPU"
+batch_size = 1024
+ubatch_size = 1024
+ctx_size = 1048576
+n_parallel = 1
+cache_type_k = "q4_0"
+cache_type_v = "q4_0"
+mla = 2
+flash_attn = true
+zdd_sparse_kv = true
+defer_ple = true
+cohort_prefix_sharing = true
+cohort_min_prefix = 64
+cache_ram = 0
+chat_template_kwargs = '{"reasoning_effort":100}'
+spec_type = "ngram-map-k4v:n_max=7,n_min=2,ngram_size_n=4"
+spec_autotune = true
+extra_flags = ["-fidx", "-mqkv", "-muge", "-rtr", "-prexp", "-dsa", "-nkvo", "-dple"]
+
+# -----------------------------------------------------------------------------
+# Qwen3.8-27B (Dense Flagship)
+# -----------------------------------------------------------------------------
+[models.qwen38_27b]
+name = "Qwen3.8-27B-UD-Q4_K_XL"
+model_path = "/home/radu/code/llama.cpp/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+fallback_paths = [
+    "/home/radu/vm/llm/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+]
+ngl = 999
+batch_size = 2048
+ubatch_size = 512
+ctx_size = 262144
+n_parallel = 4
+cache_type_k = "q4_0"
+cache_type_v = "q4_0"
+flash_attn = true
+zdd_sparse_kv = true
+cohort_prefix_sharing = true
+cohort_min_prefix = 64
+cache_ram = 0

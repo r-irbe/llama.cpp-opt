@@ -34,29 +34,36 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Import unified provenance, metrics, and monitoring engine
+try:
+    from benchmarks.common import (
+        get_git_sha,
+        get_binary_sha256,
+        get_hardware_fingerprint,
+        detect_platform_info,
+        read_proc_vmhwm_kb as _read_proc_vmhwm_kb,
+        RusagePopen as _RusagePopen,
+        run_with_vmhwm_monitor,
+        VmHwmMonitor,
+    )
+except ImportError:
+    # Allow running directly from scripts/ directory
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from benchmarks.common import (
+        get_git_sha,
+        get_binary_sha256,
+        get_hardware_fingerprint,
+        detect_platform_info,
+        read_proc_vmhwm_kb as _read_proc_vmhwm_kb,
+        RusagePopen as _RusagePopen,
+        run_with_vmhwm_monitor,
+        VmHwmMonitor,
+    )
+
 MODE_LIVE = "live"
 MODE_SIMULATED = "simulated"
 MODE_FAILED = "failed"
 RUN_MODES = (MODE_LIVE, MODE_SIMULATED, MODE_FAILED)
-
-_GIT_SHA_CACHE = None
-
-
-def get_git_sha():
-    """Return current git HEAD SHA for provenance tracking."""
-    global _GIT_SHA_CACHE
-    if _GIT_SHA_CACHE is not None:
-        return _GIT_SHA_CACHE
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent.parent),
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        _GIT_SHA_CACHE = out if out else "unknown"
-    except Exception:
-        _GIT_SHA_CACHE = "unknown"
-    return _GIT_SHA_CACHE
 
 
 def extract_binary_from_cmd(cmd):
@@ -70,191 +77,6 @@ def extract_binary_from_cmd(cmd):
     return str(cmd[0])
 
 
-def get_binary_sha256(bin_path):
-    """Compute SHA-256 of the target binary if it exists on disk."""
-    if not bin_path:
-        return "missing"
-    p = Path(bin_path)
-    if not p.is_file():
-        resolved = shutil.which(str(bin_path))
-        if not resolved:
-            return "missing"
-        p = Path(resolved)
-    try:
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return "error"
-
-
-def get_hardware_fingerprint(plat=None):
-    """Return a concise, deterministic hardware topology fingerprint."""
-    if plat is None:
-        plat = detect_platform_info()
-    return (
-        f"{plat.get('arch', 'unknown')}|{plat.get('cpu_brand', 'unknown')}|"
-        f"{plat.get('cpu_cores', 1)}c|numa={plat.get('numa_nodes', 1)}|"
-        f"ram={plat.get('total_ram_gb', 0.0)}G|gpu={plat.get('gpu_name', 'None')}({plat.get('gpu_vram_gb', 0.0)}G)"
-    )
-
-
-def _read_proc_vmhwm_kb(pid):
-    """Read VmHWM (Peak Resident Set Size) in kB from /proc/<pid>/status."""
-    try:
-        with open(f"/proc/{pid}/status", "r") as f:
-            for line in f:
-                if line.startswith("VmHWM:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1])
-    except Exception:
-        pass
-    return 0
-
-
-class _RusagePopen(subprocess.Popen):
-    """Popen subclass that captures per-child resource usage via os.wait4 on POSIX."""
-
-    def __init__(self, *args, **kwargs):
-        self.rusage = None
-        super().__init__(*args, **kwargs)
-
-    def _try_wait(self, wait_flags):
-        if hasattr(os, "wait4"):
-            try:
-                pid, sts, ru = os.wait4(self.pid, wait_flags)
-                if pid == self.pid:
-                    self.rusage = ru
-                return (pid, sts)
-            except ChildProcessError:
-                return (self.pid, 0)
-        return super()._try_wait(wait_flags)
-
-
-def run_with_vmhwm_monitor(cmd, env=None):
-    """Run subprocess while polling /proc/<pid>/status and os.wait4 for peak VmHWM in kB."""
-    proc = _RusagePopen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
-    peak_kb = [0]
-    stop_evt = threading.Event()
-
-    def _poll():
-        while not stop_evt.is_set():
-            hwm = _read_proc_vmhwm_kb(proc.pid)
-            if hwm > peak_kb[0]:
-                peak_kb[0] = hwm
-            stop_evt.wait(0.01)
-
-    t = threading.Thread(target=_poll, daemon=True)
-    t.start()
-    try:
-        stdout, stderr = proc.communicate()
-    finally:
-        stop_evt.set()
-        t.join(timeout=1.0)
-
-    if getattr(proc, "rusage", None) is not None and getattr(proc.rusage, "ru_maxrss", 0) > 0:
-        ru_kb = int(proc.rusage.ru_maxrss)
-        if ru_kb > peak_kb[0]:
-            peak_kb[0] = ru_kb
-    elif peak_kb[0] == 0:
-        try:
-            ru = resource.getrusage(resource.RUSAGE_CHILDREN)
-            if ru.ru_maxrss > 0:
-                peak_kb[0] = int(ru.ru_maxrss)
-        except Exception:
-            pass
-
-    return proc.returncode, stdout, stderr, peak_kb[0]
-
-
-# --- Platform Detection & Hardware Topology Probing ---
-
-def detect_platform_info():
-    """Probe hardware platform, CPU, NUMA, GPU, and memory characteristics."""
-    info = {
-        "os": platform.system(),
-        "arch": platform.machine(),
-        "hostname": platform.node(),
-        "numa_nodes": 1,
-        "cpu_cores": os.cpu_count() or 1,
-        "is_apple_silicon": False,
-        "is_dual_epyc": False,
-        "gpu_name": "None",
-        "gpu_vram_gb": 0.0,
-    }
-
-    if info["os"] == "Darwin" and info["arch"] == "arm64":
-        info["is_apple_silicon"] = True
-        try:
-            brand = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"]).decode().strip()
-            info["cpu_brand"] = brand
-            mem = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode().strip()
-            info["total_ram_gb"] = round(int(mem) / (1024 ** 3), 1)
-            info["p_cores"] = int(subprocess.check_output(["sysctl", "-n", "hw.perflevel0.logicalcpu"]).decode().strip())
-            info["e_cores"] = int(subprocess.check_output(["sysctl", "-n", "hw.perflevel1.logicalcpu"]).decode().strip())
-            info["gpu_name"] = f"{brand} Metal 3.1"
-            info["gpu_vram_gb"] = info["total_ram_gb"]
-        except Exception:
-            info["p_cores"] = 8
-            info["e_cores"] = 4
-        return info
-
-    if info["os"] == "Linux":
-        # Check NUMA nodes
-        try:
-            node_dirs = list(Path("/sys/devices/system/node").glob("node[0-9]*"))
-            if node_dirs:
-                info["numa_nodes"] = len(node_dirs)
-        except Exception:
-            pass
-
-        # Check CPU model
-        try:
-            with open("/proc/cpuinfo", "r") as f:
-                content = f.read()
-                m = re.search(r"model name\s*:\s*(.+)", content)
-                if m:
-                    info["cpu_brand"] = m.group(1).strip()
-                    if "EPYC" in info["cpu_brand"]:
-                        info["is_dual_epyc"] = True
-        except Exception:
-            pass
-
-        # Check Total RAM
-        try:
-            with open("/proc/meminfo", "r") as f:
-                content = f.read()
-                m = re.search(r"MemTotal:\s*(\d+)\s*kB", content)
-                if m:
-                    info["total_ram_gb"] = round(int(m.group(1)) / (1024 ** 2), 1)
-        except Exception:
-            pass
-
-        # Check NVIDIA GPU via nvidia-smi if available
-        if shutil.which("nvidia-smi"):
-            try:
-                out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
-                ).decode().strip()
-                lines = [l for l in out.splitlines() if l.strip()]
-                if lines:
-                    info["gpu_count"] = len(lines)
-                    parts = lines[0].split(",")
-                    info["gpu_name"] = parts[0].strip()
-                    info["gpu_vram_gb"] = round(float(parts[1].strip()) / 1024.0, 1)
-            except Exception:
-                info["gpu_count"] = 0
-
-    return info
 
 
 # --- NUMA Telemetry Polling (Unprivileged Sysfs) ---

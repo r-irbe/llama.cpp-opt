@@ -3112,35 +3112,60 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.zdd_sparse_kv = false;
         return true;
     }
-    if (arg == "--unreal-filter" || arg == "-unreal") {
+    if (arg == "--evidence-filter" || arg == "-ef") {
         params.unreal_filter = true;
         return true;
     }
-    if (arg == "--no-unreal-filter" || arg == "-no-unreal") {
+    if (arg == "--no-evidence-filter" || arg == "-no-ef") {
         params.unreal_filter = false;
         return true;
     }
-    if (arg == "--unreal-chunk-size") {
+    if (arg == "--evidence-chunk-tokens" || arg == "-ect") {
         CHECK_ARG
         params.unreal_chunk_size = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--unreal-top-n") {
+    if (arg == "--evidence-strategy") {
+        CHECK_ARG
+        params.unreal_evidence_strategy = argv[i];
+        return true;
+    }
+    if (arg == "--evidence-symbol-boost") {
+        CHECK_ARG
+        params.unreal_symbol_boost = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--evidence-chunk-expansion") {
+        CHECK_ARG
+        params.unreal_chunk_expansion = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--evidence-maxsim-threshold") {
+        CHECK_ARG
+        params.unreal_maxsim_threshold = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--evidence-symbol-regex") {
+        CHECK_ARG
+        params.unreal_symbol_regex = argv[i];
+        return true;
+    }
+    if (arg == "--evidence-top-k" || arg == "-etk") {
         CHECK_ARG
         params.unreal_top_n = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--unreal-min-tokens") {
+    if (arg == "--evidence-min-tokens") {
         CHECK_ARG
         params.unreal_min_tokens = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--unreal-query-groups") {
+    if (arg == "--evidence-query-groups") {
         CHECK_ARG
         params.unreal_query_groups = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--unreal-chunk-vectors") {
+    if (arg == "--evidence-chunk-vectors") {
         CHECK_ARG
         params.unreal_chunk_vectors = std::stoi(argv[i]);
         return true;

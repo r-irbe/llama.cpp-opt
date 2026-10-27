@@ -393,18 +393,19 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             if (kv_self.k_l[il] == nullptr) {
                 continue;
             }
-            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            // For MLA and standard GQA models alike, kv_self.k_l[il]->ne[0] defines the true row width in elements.
+            const int64_t n_embd_k_row = kv_self.k_l[il]->ne[0];
             const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
             ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
-                    n_embd_k_gqa, nm,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*i));
+                    n_embd_k_row, nm,
+                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_row),
+                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_row*i));
 
             ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self.k_l[il],
-                    n_embd_k_gqa, nm,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*id));
+                    n_embd_k_row, nm,
+                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_row),
+                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_row*id));
 
             ggml_tensor * view_v_src = nullptr;
             ggml_tensor * view_v_dst = nullptr;
