@@ -24,6 +24,7 @@ import resource
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -255,6 +256,44 @@ def parse_arguments():
         help="Original context size for YaRN calculation (e.g. 262144, 65536)"
     )
     parser.add_argument(
+        "--zdd-sparse-kv",
+        action="store_true",
+        help="Enable Zero-Suppressed Decision Diagram (ZDD) sparse KV cache compression"
+    )
+    parser.add_argument(
+        "--evidence-filter",
+        action="store_true",
+        help="Enable UNREAL Late-Interaction MaxSim evidence token filtering"
+    )
+    parser.add_argument(
+        "--evidence-strategy",
+        default=None,
+        help="Evidence selection strategy (e.g. code_pinpoint, narrative_recall)"
+    )
+    parser.add_argument(
+        "--evidence-chunk-tokens",
+        type=int,
+        default=None,
+        help="Exact-Cover chunk size in tokens for evidence filtering"
+    )
+    parser.add_argument(
+        "--evidence-top-k",
+        type=int,
+        default=None,
+        help="Top-k spans to retain during evidence filtering"
+    )
+    parser.add_argument(
+        "--mla",
+        type=int,
+        default=None,
+        help="Multi-Head Latent Attention mode (e.g. 2 or 3 for DeepSeek)"
+    )
+    parser.add_argument(
+        "--fmoe",
+        action="store_true",
+        help="Enable fused MoE kernel"
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulate execution (mode='simulated') without running binary"
@@ -473,7 +512,18 @@ def main():
             if not model_path.exists() and not args.dry_run:
                 print(f"Error: Model file '{model_path}' not found.", file=sys.stderr)
                 sys.exit(1)
-            file_size_gb = (model_path.stat().st_size / (1024 ** 3)) if model_path.exists() else 0.0
+            if model_path.exists():
+                shard_match = re.match(r"^(.*)-\d{5}-of-\d{5}\.gguf$", model_path.name)
+                if shard_match:
+                    prefix = shard_match.group(1)
+                    total_bytes = sum(
+                        p.stat().st_size for p in model_path.parent.glob(f"{prefix}-*-of-*.gguf") if p.is_file()
+                    )
+                else:
+                    total_bytes = model_path.stat().st_size
+                file_size_gb = total_bytes / (1024 ** 3)
+            else:
+                file_size_gb = 0.0
             is_huge_model = file_size_gb > 50.0
             model_basename = model_path.stem
         try:
@@ -556,10 +606,13 @@ def main():
                     "ttft_ms": round(15.0 + ctx_len * 0.05, 2)
                 }
             else:
+                tmp_prompt_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8", delete=False)
+                tmp_prompt_file.write(stage_prompt)
+                tmp_prompt_file.close()
                 cmd = [
                     args.cli_bin,
                     "-m", str(model_path),
-                    "-p", stage_prompt,
+                    "-f", tmp_prompt_file.name,
                     "-n", str(args.n_predict),
                     "--temp", "0",
                     "-c", str(ctx_len),
@@ -569,7 +622,7 @@ def main():
                     "-tb", str(args.threads_batch)
                 ]
                 if args.flash_attn:
-                    cmd.extend(["-fa", "1"])
+                    cmd.extend(["-fa", "on"])
                 if args.n_gpu_layers > 0:
                     cmd.extend(["-ngl", str(args.n_gpu_layers)])
                 if args.split_mode:
@@ -603,10 +656,23 @@ def main():
                     cmd.extend(["--rope-scaling", args.rope_scaling])
                 if args.yarn_orig_ctx is not None:
                     cmd.extend(["--yarn-orig-ctx", str(args.yarn_orig_ctx)])
+                if args.zdd_sparse_kv:
+                    cmd.append("--zdd-sparse-kv")
+                if args.evidence_filter:
+                    cmd.append("--evidence-filter")
+                if args.evidence_strategy:
+                    cmd.extend(["--evidence-strategy", args.evidence_strategy])
+                if args.evidence_chunk_tokens is not None:
+                    cmd.extend(["--evidence-chunk-tokens", str(args.evidence_chunk_tokens)])
+                if args.evidence_top_k is not None:
+                    cmd.extend(["--evidence-top-k", str(args.evidence_top_k)])
+                if args.mla is not None:
+                    cmd.extend(["-mla", str(args.mla)])
 
                 env = os.environ.copy()
-                env["GGML_CUDA_NO_PINNED"] = "1"
-                timeout = max(300, int(eta_sec * 3.0))
+                if "GGML_CUDA_NO_PINNED" not in env:
+                    env["GGML_CUDA_NO_PINNED"] = "0"
+                timeout = max(900 if is_huge_model else 300, int(eta_sec * 3.0))
 
                 try:
                     returncode, stdout, stderr, vm_hwm_kb = run_with_vmhwm_monitor(
@@ -628,6 +694,11 @@ def main():
                     stage_mode = MODE_FAILED
                     print(f"[Stage {idx}/{total_stages}: Context = {ctx_len:>7,d} Tokens] ERROR: {e}", file=sys.stderr)
                     metrics = {"error": str(e), "pp_ms": 0.0, "pp_tokens": 0, "pp_tps": 0.0, "tg_ms": 0.0, "tg_tokens": 0, "tg_tps": 0.0, "ttft_ms": 0.0}
+                finally:
+                    try:
+                        os.unlink(tmp_prompt_file.name)
+                    except OSError:
+                        pass
 
             if "error" in metrics:
                 print(
@@ -690,7 +761,7 @@ def main():
         f"**Binary SHA-256**: `{binary_sha256}`  ",
         f"**Hardware Fingerprint**: `{hardware_fingerprint}`  ",
         f"**Peak VmHWM**: `{peak_vm_hwm_kb:,} kB`  ",
-        f"**Model Path**: `{model_path}` ({file_size_gb:.1f} GiB)  ",
+        f"**Model Artifact**: `{model_path.name}` ({file_size_gb:.1f} GiB)  ",
         f"**Execution Flags**: `-ngl {args.n_gpu_layers} -sm {args.split_mode} --numa {args.numa} -t {args.threads} -tb {args.threads_batch}`  ",
         "",
         "---",
@@ -715,7 +786,7 @@ def main():
         Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.output_json, "w", encoding="utf-8") as jf:
             json.dump({
-                "model": str(model_path),
+                "model": model_path.name,
                 "file_size_gb": file_size_gb,
                 "mode": mode_str,
                 "git_sha": git_sha,
