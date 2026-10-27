@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-TESTS=(test-spec-counterfactual test-spec-arbiter test-spec-integration)
+TESTS=(test-spec-counterfactual test-spec-arbiter test-spec-integration test-polygraph-plan)
 
 status=0
 for t in "${TESTS[@]}"; do

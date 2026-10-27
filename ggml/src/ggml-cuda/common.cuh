@@ -926,6 +926,16 @@ struct ggml_backend_cuda_context {
 
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    // CUDA graph-cache telemetry (PolyGraph slice A); zero-initialized POD, single-threaded per context
+    struct ggml_cuda_graph_stats {
+        uint64_t graph_instances        = 0;
+        uint64_t graph_captures         = 0;
+        uint64_t graph_updates_ok       = 0;
+        uint64_t graph_updates_failed   = 0;
+        uint64_t graph_reinstantiations = 0;
+        uint64_t graph_disable_events   = 0;
+    } graph_stats;
+
 #endif
 
     const void * model;

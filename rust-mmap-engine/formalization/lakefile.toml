@@ -1,0 +1,6 @@
+name = "formalization"
+version = "0.1.0"
+defaultTargets = ["PolyGraph"]
+
+[[lean_lib]]
+name = "PolyGraph"

@@ -320,4 +320,9 @@ target_include_directories(test-spec-integration PRIVATE ${PROJECT_SOURCE_DIR}/c
 target_link_libraries(test-spec-integration PRIVATE common)
 add_test(NAME test-spec-integration COMMAND $<TARGET_FILE:test-spec-integration>)
 
+add_executable(test-polygraph-plan test-polygraph-plan.cpp)
+target_include_directories(test-polygraph-plan PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-polygraph-plan PRIVATE common)
+add_test(NAME test-polygraph-plan COMMAND $<TARGET_FILE:test-polygraph-plan>)
+
 
