@@ -1,0 +1,24 @@
+# =============================================================================
+# Layer 2: models/kimi_k3.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.kimi_k3]
+display_name = "Kimi-K3-Instruct-IQ4_XS (Long-Horizon Agentic MoE)"
+architecture = "kimi_k3 (MLA + 128-Expert MoE)"
+parameter_scale = "1024B Total / 32B Active"
+quantization = "IQ4_XS"
+disk_size_gib = 412.00
+vram_footprint_gib = 15.40
+ram_footprint_gib = 210.00
+path = "models/Kimi-K3-Instruct-IQ4_XS-00001-of-00009.gguf"
+fallback_paths = []
+default_template = "low_vram_1m"
+notes = "Designed for 1M..10M token repository trajectories with Fuse8 KV capsules."
+
+[models.kimi_k3.recommended]
+ctx_size = "1048576"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+mla_mode = "2"
+override_tensor = "exps=CPU"
+defer_experts = "on"

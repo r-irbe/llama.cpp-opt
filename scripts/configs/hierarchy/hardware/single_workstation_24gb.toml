@@ -1,0 +1,20 @@
+# =============================================================================
+# Layer 1: hardware/single_workstation_24gb.toml -- Hardware Topology Profile
+# =============================================================================
+
+[hardware]
+id = "single_workstation_24gb"
+display_name = "Single-Socket Workstation + 24 GiB Ada GPU (Compact Profile)"
+cpu_topology = "16C/32T Desktop/Workstation CPU (1 NUMA node, 64-128 GiB RAM)"
+gpu_topology = "1x 24 GiB GPU (sm_89)"
+storage_topology = "NVMe SSD with buffered io_uring fallback"
+
+[hardware.defaults]
+threads = "16"
+numa_strategy = "disabled"
+gpu_layers = "99"
+flash_attn = "on"
+fused_moe = "on"
+thp_hugepages = "madvise"
+io_uring_direct = "auto"
+l2_persisting_mb = "36"

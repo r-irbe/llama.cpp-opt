@@ -1,0 +1,23 @@
+# =============================================================================
+# Layer 2: models/diffusion_gemma.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.diffusion_gemma]
+display_name = "DiffusionGemma-27B-IT-Q8_0 (Block-Diffusion Parallel Decoder)"
+architecture = "diffusion_gemma (Bidirectional Block Denoising)"
+parameter_scale = "27B"
+quantization = "Q8_0"
+disk_size_gib = 27.20
+vram_footprint_gib = 22.10
+ram_footprint_gib = 12.00
+path = "models/DiffusionGemma-27B-IT-Q8_0.gguf"
+fallback_paths = []
+default_template = "coding_pinpoint"
+notes = "Pairs with DFlash block-diffusion drafter for parallel token verification."
+
+[models.diffusion_gemma.recommended]
+ctx_size = "65536"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+draft_max = "16"
+spec_bandit = "thompson_counterfactual"

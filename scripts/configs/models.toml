@@ -1,119 +1,126 @@
-# Common server defaults
+# =============================================================================
+# Compiled Declarative Models & Profiles Configuration (scripts/configs/models.toml)
+# Auto-synthesized from scripts/configs/hierarchy/{00-defaults,hardware,models,templates,instances}
+# =============================================================================
+
 [defaults]
+binary = "build/bin/llama-server"
 host = "127.0.0.1"
 port = 8080
+active_model = "deepseek_v41_flash"
+active_template = "coding_pinpoint"
+hardware_profile = "epyc_milan_rtx4090"
 threads = 56
-jinja = true
-transparent_huge_pages = true
-numa = "expert"
-spill_dir = "/home/radu/llama-checkpoints"
-cache_ram = 0
-
-# -----------------------------------------------------------------------------
-# DeepSeek-V4.1-Flash (671B MoE / 748B-equivalent)
-# -----------------------------------------------------------------------------
-[models.deepseek_v41_flash]
-name = "DeepSeek-V4.1-Flash"
-model_path = "/home/radu/vm/llm/models/DeepSeek-V4.1-Flash-UNCENSORED-DwarfStar-Q2/DeepSeek-V4.1-Flash-UNCENSORED-Q2-bootstrap.gguf"
-fallback_paths = [
-    "/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf",
-    "/home/radu/vm/llm/models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
-]
-draft_path = "/home/radu/vm/llm/models/Smalinin-Deepseek-v41-flash/DeepSeek-V4.1-Flash-DSpark-AUTO.gguf"
-ngl = 999
-offload_tensors = "exps=CPU,engram_embd=CPU,nextn=CPU"
-batch_size = 2048
-ubatch_size = 1024
-ctx_size = 1048576
-n_parallel = 4
-cache_type_k = "q4_0"
-cache_type_v = "q4_0"
-mla = 2
-flash_attn = true
-zdd_sparse_kv = true
-defer_ple = true
-cohort_prefix_sharing = true
-cohort_min_prefix = 64
-cache_ram = 0
-chat_template_kwargs = '{"reasoning_effort":100}'
-spec_type = "ngram-map-k4v:n_max=7,n_min=2,ngram_size_n=4"
-spec_autotune = true
-extra_flags = ["-fidx", "-mqkv", "-muge", "-cb", "-prexp", "-dple", "--numa-replicate-shared"]
-
-# -----------------------------------------------------------------------------
-# DeepSeek-V4.1-Flash High-Throughput Production Profile (-np 8)
-# -----------------------------------------------------------------------------
-[models.deepseek_v41_fastest_np8]
-name = "DeepSeek-V4.1-Flash-Fastest-NP8"
-model_path = "/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
-fallback_paths = [
-    "/home/radu/vm/llm/models/DeepSeek-V4.1-Flash-UNCENSORED-DwarfStar-Q2/DeepSeek-V4.1-Flash-UNCENSORED-Q2-bootstrap.gguf"
-]
-ngl = 999
-offload_tensors = "exps=CPU"
+gpu_layers = 99
+flash_attn = "on"
 numa = "distribute"
-batch_size = 2048
-ubatch_size = 512
+ctk = "q8_0"
+ctv = "q8_0"
+evidence_strategy = "maxsim_exact_cover"
+evidence_chunk_tokens = 64
+evidence_keep_ratio = "20%"
+capsule_filter = "fuse8_simhash64"
+zdd_sparse_kv = true
+cohort_prefix_sharing = true
+spec_bandit = "thompson_counterfactual"
+
+[models.deepseek_v41_flash]
+description = "DeepSeek-V4.1-Flash (EngramQ8 Q2_K_Protected, 1T MoE)"
+path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+fallback_paths = ["unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+ctx_size = 524288
+ctk = "q4_0"
+ctv = "q4_0"
+parallel = 2
+mla = 2
+override_tensor = "exps=CPU,engram_embd=CPU,nextn=CPU"
+defer_ple = true
+default_template = "coding_pinpoint"
+
+[models.deepseek_v41_fastest_np8]
+description = "DeepSeek-V4.1-Fastest-NP8 (High-Concurrency Multi-Slot Server)"
+path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+fallback_paths = []
 ctx_size = 65536
-n_parallel = 8
-cache_type_k = "q4_0"
-cache_type_v = "q4_0"
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 8
 mla = 2
-flash_attn = true
-zdd_sparse_kv = true
+override_tensor = "exps=CPU,engram_embd=CPU,nextn=CPU"
 defer_ple = true
-cohort_prefix_sharing = true
-cohort_min_prefix = 64
-cache_ram = 0
+default_template = "max_throughput_np8"
 
-# -----------------------------------------------------------------------------
-# GLM-5.3 / GLM-5.3-Flash (146B MoE with Lightning DSA Attention)
-# -----------------------------------------------------------------------------
-[models.glm_53]
-name = "GLM-5.3-UD-IQ4_XS"
-model_path = "/home/radu/vm/llm/models/GLM-5.3-GGUF/UD-IQ4_XS/GLM-5.3-UD-IQ4_XS-00001-of-00009.gguf"
-fallback_paths = [
-    "/home/radu/code/llama.cpp/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
-]
-draft_path = "/home/radu/vm/llm/models/GLM-5.3-GGUF/GLM-5.3-DFlash2-Q3_K_M.gguf"
-ngl = 50
-offload_tensors = "exps=CPU,engram_embd=CPU,nextn=CPU"
-batch_size = 1024
-ubatch_size = 1024
-ctx_size = 1048576
-n_parallel = 1
-cache_type_k = "q4_0"
-cache_type_v = "q4_0"
-mla = 2
-flash_attn = true
-zdd_sparse_kv = true
-defer_ple = true
-cohort_prefix_sharing = true
-cohort_min_prefix = 64
-cache_ram = 0
-chat_template_kwargs = '{"reasoning_effort":100}'
-spec_type = "ngram-map-k4v:n_max=7,n_min=2,ngram_size_n=4"
-spec_autotune = true
-extra_flags = ["-fidx", "-mqkv", "-muge", "-rtr", "-prexp", "-dsa", "-nkvo", "-dple"]
-
-# -----------------------------------------------------------------------------
-# Qwen3.8-27B (Dense Flagship)
-# -----------------------------------------------------------------------------
 [models.qwen38_27b]
-name = "Qwen3.8-27B-UD-Q4_K_XL"
-model_path = "/home/radu/code/llama.cpp/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
-fallback_paths = [
-    "/home/radu/vm/llm/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
-]
-ngl = 999
-batch_size = 2048
-ubatch_size = 512
+description = "Qwen3.8-27B-UD-Q4_K_XL (100% GPU VRAM Dense Flagship)"
+path = "models/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+fallback_paths = ["unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"]
 ctx_size = 262144
-n_parallel = 4
-cache_type_k = "q4_0"
-cache_type_v = "q4_0"
-flash_attn = true
-zdd_sparse_kv = true
-cohort_prefix_sharing = true
-cohort_min_prefix = 64
-cache_ram = 0
+ctk = "q4_0"
+ctv = "q4_0"
+parallel = 8
+default_template = "coding_pinpoint"
+
+[models.qwen38_2_4t]
+description = "Qwen3.8-2.4T-A95B-UD-Q1_0 (2.4T Ultra-Scale MoE, GGUF-X NPMC)"
+path = "models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"
+fallback_paths = ["unsloth/Qwen3.8-2.4T-A95B-GGUF/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"]
+ctx_size = 65536
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 1
+override_tensor = "exps=CPU"
+default_template = "deep_formal_audit"
+
+[models.glm_53_flash]
+description = "GLM-5.3-Flash-UD-IQ4_XS (Fast Hybrid MoE Reasoner)"
+path = "models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+fallback_paths = ["unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"]
+ctx_size = 262144
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 8
+override_tensor = "exps=CPU"
+default_template = "coding_pinpoint"
+
+[models.kimi_k3]
+description = "Kimi-K3-Instruct-IQ4_XS (Long-Horizon Agentic MoE)"
+path = "models/Kimi-K3-Instruct-IQ4_XS-00001-of-00009.gguf"
+fallback_paths = []
+ctx_size = 1048576
+ctk = "q4_0"
+ctv = "q4_0"
+parallel = 2
+mla = 2
+override_tensor = "exps=CPU"
+default_template = "low_vram_1m"
+
+[models.recursive_flint]
+description = "Recursive-Flint-32B-Q6_K (Fast Speculative & Code Synthesis)"
+path = "models/Recursive-Flint-32B-Q6_K.gguf"
+fallback_paths = []
+ctx_size = 131072
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 2
+default_template = "max_throughput_np8"
+
+[models.diffusion_gemma]
+description = "DiffusionGemma-27B-IT-Q8_0 (Block-Diffusion Parallel Decoder)"
+path = "models/DiffusionGemma-27B-IT-Q8_0.gguf"
+fallback_paths = []
+ctx_size = 65536
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 2
+default_template = "coding_pinpoint"
+
+[models.leanstral_119b]
+description = "Leanstral-1.5-119B-A22B-Q4_K_M (Formal Theorem Proving MoE)"
+path = "models/Leanstral-1.5-119B-A22B-Q4_K_M.gguf"
+fallback_paths = []
+ctx_size = 131072
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 2
+override_tensor = "exps=CPU"
+default_template = "deep_formal_audit"

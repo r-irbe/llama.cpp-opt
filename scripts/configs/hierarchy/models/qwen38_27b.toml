@@ -1,0 +1,25 @@
+# =============================================================================
+# Layer 2: models/qwen38_27b.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.qwen38_27b]
+display_name = "Qwen3.8-27B-UD-Q4_K_XL (100% GPU VRAM Dense Flagship)"
+architecture = "qwen3 (GQA + FlashAttention-2)"
+parameter_scale = "27B Dense"
+quantization = "UD-Q4_K_XL"
+disk_size_gib = 16.13
+vram_footprint_gib = 20.89
+ram_footprint_gib = 17.04
+path = "models/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+fallback_paths = ["unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"]
+default_template = "coding_pinpoint"
+notes = "1,986 tok/s prefill, 45.7 tok/s decode; fits 256K context 100% inside 24 GiB RTX 4090 VRAM."
+
+[models.qwen38_27b.recommended]
+ctx_size = "262144"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+mla_mode = "0"
+override_tensor = "none"
+defer_ple = "off"
+parallel_slots = "8"

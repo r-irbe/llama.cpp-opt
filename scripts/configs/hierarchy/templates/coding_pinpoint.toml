@@ -1,0 +1,21 @@
+# =============================================================================
+# Layer 3: templates/coding_pinpoint.toml -- Reusable Configuration Template
+# =============================================================================
+
+[templates.coding_pinpoint]
+display_name = "Coding Agent Pinpoint (Zero-Decompaction + Fuse8 Capsules)"
+description = "Balanced low-TTFT coding agent preset with MaxSim+Exact-Cover pruning and Binary Fuse8 capsules."
+target_use_case = "Interactive coding agents (Pi, Antigravity, OpenCode, Claude Code)"
+built_in = true
+
+[templates.coding_pinpoint.overrides]
+evidence_strategy = "maxsim_exact_cover"
+evidence_chunk_tokens = "64"
+evidence_keep_ratio = "20%"
+global_summary_header = "on"
+capsule_filter = "fuse8_simhash64"
+wake_min_hamming_sim = "0.60"
+max_wake_per_turn = "4"
+zdd_sparse_kv = "on"
+cohort_sharing = "on"
+spec_bandit = "thompson_counterfactual"

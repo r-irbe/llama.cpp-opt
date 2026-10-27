@@ -1,0 +1,24 @@
+# =============================================================================
+# Layer 2: models/leanstral_119b.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.leanstral_119b]
+display_name = "Leanstral-1.5-119B-A22B-Q4_K_M (Formal Theorem Proving MoE)"
+architecture = "mixtral_lean (Formal Proof & Tactic Specialist)"
+parameter_scale = "119B Total / 22B Active"
+quantization = "Q4_K_M"
+disk_size_gib = 68.40
+vram_footprint_gib = 16.50
+ram_footprint_gib = 72.00
+path = "models/Leanstral-1.5-119B-A22B-Q4_K_M.gguf"
+fallback_paths = []
+default_template = "deep_formal_audit"
+notes = "Optimized for Lean 4 proof state navigation, tactic synthesis, and mathlib search."
+
+[models.leanstral_119b.recommended]
+ctx_size = "131072"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+override_tensor = "exps=CPU"
+temp = "0.0"
+evidence_strategy = "maxsim_exact_cover"

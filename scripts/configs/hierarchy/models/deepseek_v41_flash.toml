@@ -1,0 +1,26 @@
+# =============================================================================
+# Layer 2: models/deepseek_v41_flash.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.deepseek_v41_flash]
+display_name = "DeepSeek-V4.1-Flash (EngramQ8 Q2_K_Protected, 1T MoE)"
+architecture = "deepseek4 (MLA + 256 RoE + Engram PLE)"
+parameter_scale = "1000B Total / 32B Active"
+quantization = "Q2_K_Protected + Engram Q8_0"
+disk_size_gib = 386.37
+vram_footprint_gib = 13.70
+ram_footprint_gib = 185.64
+path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+fallback_paths = ["unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+default_template = "coding_pinpoint"
+notes = "512K..1M context fits in 24 GiB VRAM with MLA Q4_0 K-only cache + --defer-ple (22.88 tok/s decode)."
+
+[models.deepseek_v41_flash.recommended]
+ctx_size = "524288"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+mla_mode = "2"
+override_tensor = "exps=CPU,engram_embd=CPU,nextn=CPU"
+defer_ple = "on"
+defer_experts = "off"
+parallel_slots = "2"

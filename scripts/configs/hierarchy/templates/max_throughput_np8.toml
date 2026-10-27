@@ -1,0 +1,18 @@
+# =============================================================================
+# Layer 3: templates/max_throughput_np8.toml -- Reusable Configuration Template
+# =============================================================================
+
+[templates.max_throughput_np8]
+display_name = "Multi-Agent Swarm Throughput (-np 8..32 + Cross-Slot KV Clone)"
+description = "Optimizes multi-slot parallel throughput for concurrent subagent councils using cohort KV cloning."
+target_use_case = "RALPH 5-agent review councils, parallel subagent fleets"
+built_in = true
+
+[templates.max_throughput_np8.overrides]
+parallel_slots = "8"
+cohort_sharing = "on"
+cohort_min_prefix = "64"
+cross_slot_kv_clone = "on"
+batch_size = "4096"
+ubatch_size = "1024"
+concurrency_knee_guard = "on"

@@ -1,0 +1,59 @@
+# =============================================================================
+# Layer 4: instances/active_fleet.toml -- Multi-Model llama.cpp Fleet & Slabs
+# =============================================================================
+
+[fleet]
+active_instance_id = "llama-primary-8080"
+slab_arbitration_policy = "cooperative_lru_yield"
+total_instances = 3
+
+[fleet.instances."llama-primary-8080"]
+label = "Primary Coding & Reasoning Engine"
+engine_flavor = "ik_llama_rust_ffi"
+binary_path = "build/bin/llama-server"
+model_id = "deepseek_v41_flash"
+template_id = "coding_pinpoint"
+host = "127.0.0.1"
+port = 8080
+numa_nodes = "0-7 (NPS4 distribute)"
+gpu_device = 0
+vram_budget_gib = 14.00
+slab_priority = "realtime"
+status = "healthy"
+pid = 41820
+active_slots = 2
+last_replaced_from_binary = "none"
+
+[fleet.instances."llama-fast-8081"]
+label = "Fast Subagent & Draft Worker"
+engine_flavor = "ik_llama_opt"
+binary_path = "build/bin/llama-server"
+model_id = "qwen38_27b"
+template_id = "max_throughput_np8"
+host = "127.0.0.1"
+port = 8081
+numa_nodes = "0-3 (Socket 0)"
+gpu_device = 0
+vram_budget_gib = 8.50
+slab_priority = "cooperative"
+status = "healthy"
+pid = 41905
+active_slots = 8
+last_replaced_from_binary = "none"
+
+[fleet.instances."llama-formal-8082"]
+label = "Lean 4 Formal Verification Standby"
+engine_flavor = "ik_llama_rust_ffi"
+binary_path = "build/bin/llama-server"
+model_id = "leanstral_119b"
+template_id = "deep_formal_audit"
+host = "127.0.0.1"
+port = 8082
+numa_nodes = "4-7 (Socket 1)"
+gpu_device = 0
+vram_budget_gib = 1.50
+slab_priority = "background_yield"
+status = "stopped"
+pid = 0
+active_slots = 0
+last_replaced_from_binary = "none"

@@ -1,0 +1,19 @@
+# =============================================================================
+# Layer 3: templates/deep_formal_audit.toml -- Reusable Configuration Template
+# =============================================================================
+
+[templates.deep_formal_audit]
+display_name = "Deterministic Formal Proof & Perplexity Audit (Greedy + Q8_0 KV)"
+description = "Zero-temperature deterministic evaluation with high-precision Q8_0 KV and global occurrence counts."
+target_use_case = "Lean 4 formal verification, mathematical theorem proving, benchmark verification"
+built_in = true
+
+[templates.deep_formal_audit.overrides]
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+temp = "0.0"
+top_p = "1.00"
+min_p = "0.00"
+evidence_keep_ratio = "35%"
+global_summary_header = "on"
+capsule_filter = "fuse16_simhash64"

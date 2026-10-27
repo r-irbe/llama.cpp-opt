@@ -1,0 +1,19 @@
+# =============================================================================
+# Layer 3: templates/low_vram_1m.toml -- Reusable Configuration Template
+# =============================================================================
+
+[templates.low_vram_1m]
+display_name = "1M..10M Ultra-Long Context (Q4_0 KV + Tiered Host DMA + Fuse16)"
+description = "Maximizes context window up to 1M-10M tokens inside 24 GiB VRAM via Q4_0 KV and Fuse16 capsules."
+target_use_case = "Whole-repository audits, 10M-token logs, long-horizon agent sessions"
+built_in = true
+
+[templates.low_vram_1m.overrides]
+ctx_size = "1048576"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+tiered_kv_dma = "auto_hot_window"
+zdd_sparse_kv = "on"
+capsule_filter = "fuse16_simhash64"
+evidence_keep_ratio = "15%"
+wake_min_hamming_sim = "0.65"

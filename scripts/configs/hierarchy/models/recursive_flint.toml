@@ -1,0 +1,23 @@
+# =============================================================================
+# Layer 2: models/recursive_flint.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.recursive_flint]
+display_name = "Recursive-Flint-32B-Q6_K (Fast Speculative & Code Synthesis)"
+architecture = "flint (Hybrid Linear + Sliding Window Attention)"
+parameter_scale = "32B Dense/Hybrid"
+quantization = "Q6_K"
+disk_size_gib = 24.50
+vram_footprint_gib = 21.80
+ram_footprint_gib = 8.20
+path = "models/Recursive-Flint-32B-Q6_K.gguf"
+fallback_paths = []
+default_template = "max_throughput_np8"
+notes = "High speculative acceptance rate (alpha > 0.84) with TreeGraft + CCD suffix trie."
+
+[models.recursive_flint.recommended]
+ctx_size = "131072"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+spec_bandit = "thompson_counterfactual"
+treegraft_fusion = "on"

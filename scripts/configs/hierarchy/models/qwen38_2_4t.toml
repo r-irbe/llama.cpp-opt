@@ -1,0 +1,25 @@
+# =============================================================================
+# Layer 2: models/qwen38_2_4t.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.qwen38_2_4t]
+display_name = "Qwen3.8-2.4T-A95B-UD-Q1_0 (2.4T Ultra-Scale MoE, GGUF-X NPMC)"
+architecture = "qwen3moe (2.4T Total / 95B Active, Q1_0_G128)"
+parameter_scale = "2400B Total / 95B Active"
+quantization = "UD-Q1_0_G128 (Type 66)"
+disk_size_gib = 354.24
+vram_footprint_gib = 14.80
+ram_footprint_gib = 356.00
+path = "models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"
+fallback_paths = ["unsloth/Qwen3.8-2.4T-A95B-GGUF/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"]
+default_template = "deep_formal_audit"
+notes = "Repacked GGUF-X v3 eliminates 277 LINT005 shard jumps (-89.7% prefill jitter, 3.82 tok/s decode)."
+
+[models.qwen38_2_4t.recommended]
+ctx_size = "65536"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+override_tensor = "exps=CPU"
+npmc_superblock = "on"
+thp_hugepages = "on"
+parallel_slots = "1"
