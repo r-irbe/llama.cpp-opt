@@ -1,0 +1,36 @@
+# =============================================================================
+# Layer 2: models/deepseek-v4.1-1017-ud-q4kxl.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.deepseek-v4.1-1017-ud-q4kxl]
+display_name = "DeepSeek-V4.1-Flash-1017 (UD-Q4_K_XL + Engram + DSpark Q8_0)"
+architecture = "deepseek4 (MLA + DSA + Fused Indexer + 256 RoE + Engram Sidecar)"
+parameter_scale = "552B-1000B Total / 16B-32B Active"
+quantization = "UD-Q4_K_XL + Engram Q8_0 + DSpark Q8_0"
+disk_size_gib = 412.50
+vram_footprint_gib = 14.80
+ram_footprint_gib = 398.00
+path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"]
+default_template = "ds41-1017-np1-512k-max-speed"
+notes = "Production DeepSeek-V4.1-Flash-1017 UD-Q4_K_XL with --swa-compress, -fidx, -dsa -dsatk 1024, -ictk q8_0, --defer-ple (no --defer-experts), and DSpark + ngram-mod speculative chain."
+
+[models.deepseek-v4.1-1017-ud-q4kxl.recommended]
+ctx_size = "524288"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+indexer_cache_type_k = "q8_0"
+swa_compress = "on"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
+defer_ple = "on"
+defer_experts = "off"
+parallel_slots = "1"
+draft_model_path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+spec_type = "dspark_plus_ngram_mod"
+spec_ckpt_mode = "per-step"
+thinking_effort = "max_deep_think"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"

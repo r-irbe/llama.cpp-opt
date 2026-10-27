@@ -1,0 +1,31 @@
+# =============================================================================
+# Layer 3: templates/ds41-1017-np8-1m-swarm.toml -- Reusable Configuration Template
+# =============================================================================
+
+[templates.ds41-1017-np8-1m-swarm]
+display_name = "DS4.1-1017 NP8 1M High-Concurrency Swarm (8 Slots x 128K + Q4_0 Indexer)"
+description = "8-slot high-concurrency 1M aggregate preset: -np 8 -c 1048576 --swa-compress -cb -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -ictk q4_0 --cohort-prefix-sharing --cohort-min-prefix 64 --zdd-sparse-kv."
+target_use_case = "8-agent parallel council & multi-track fleet under 24 GiB VRAM ceiling"
+built_in = true
+
+[templates.ds41-1017-np8-1m-swarm.overrides]
+parallel_slots = "8"
+ctx_size = "1048576"
+swa_compress = "on"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+indexer_cache_type_k = "q4_0"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+defer_ple = "on"
+defer_experts = "off"
+cohort_sharing = "on"
+zdd_sparse_kv = "on"
+thp_hugepages = "on"
+threads = "56"
+numa_strategy = "distribute"
+concurrency_knee_guard = "on"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"
+thinking_effort = "high_analytical"

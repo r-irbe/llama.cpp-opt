@@ -1,0 +1,30 @@
+# =============================================================================
+# Layer 3: templates/ds41-1017-np4-512k-swarm.toml -- Reusable Configuration Template
+# =============================================================================
+
+[templates.ds41-1017-np4-512k-swarm]
+display_name = "DS4.1-1017 NP4 512K Agent Swarm (4 Slots x 128K + Cohort KV Clone)"
+description = "4-slot parallel agent swarm preset: -np 4 -c 524288 --swa-compress -cb -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -ictk q8_0 --cohort-prefix-sharing --cohort-min-prefix 64 --zdd-sparse-kv."
+target_use_case = "4-worker subagent coding & verification fleet with zero-copy prefix cloning"
+built_in = true
+
+[templates.ds41-1017-np4-512k-swarm.overrides]
+parallel_slots = "4"
+ctx_size = "524288"
+swa_compress = "on"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+indexer_cache_type_k = "q8_0"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+defer_ple = "on"
+defer_experts = "off"
+cohort_sharing = "on"
+zdd_sparse_kv = "on"
+thp_hugepages = "on"
+threads = "56"
+numa_strategy = "distribute"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"
+thinking_effort = "high_analytical"

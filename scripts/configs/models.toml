@@ -34,31 +34,57 @@ merged_profdata = ".pi/pto-profiles/merged.profdata"
 optimized_binary = "build-pto/bin/llama-server"
 shared_libs = ["build-pto/ggml/src/libggml.so", "build-pto/src/libllama.so"]
 
+[models.deepseek-v4.1-1017-ud-q4kxl]
+description = "DeepSeek-V4.1-Flash-1017 (UD-Q4_K_XL + Engram + DSpark Q8_0)"
+path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"]
+ctx_size = 524288
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 1
+mla = 2
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
+defer_ple = true
+default_template = "ds41-1017-np1-512k-max-speed"
+
+[models.deepseek-v4.1-1017-iq2xxs]
+description = "DeepSeek-V4.1-Flash-1017 (GSQ-RCO-IQ2_XXS + Engram + DSpark Q8_0)"
+path = "/home/radu/vm/llm/ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"]
+ctx_size = 524288
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 1
+mla = 2
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
+defer_ple = true
+default_template = "ds41-1017-np1-512k-max-speed"
+
 [models.deepseek_v41_flash]
 description = "DeepSeek-V4.1-Flash (EngramQ8 Q2_K_Protected, 1T MoE)"
-path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
-fallback_paths = ["unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf", "unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
 ctx_size = 524288
-ctk = "q4_0"
-ctv = "q4_0"
-parallel = 2
+ctk = "q8_0"
+ctv = "q8_0"
+parallel = 1
 mla = 2
-override_tensor = "exps=CPU,engram_embd=CPU,nextn=CPU"
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = true
-default_template = "coding_pinpoint"
+default_template = "ds41-1017-np1-512k-max-speed"
 
 [models.deepseek_v41_fastest_np8]
 description = "DeepSeek-V4.1-Fastest-NP8 (High-Concurrency Multi-Slot Server)"
-path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
-fallback_paths = []
-ctx_size = 65536
-ctk = "q8_0"
-ctv = "q8_0"
+path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+ctx_size = 1048576
+ctk = "q4_0"
+ctv = "q4_0"
 parallel = 8
 mla = 2
-override_tensor = "exps=CPU,engram_embd=CPU,nextn=CPU"
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = true
-default_template = "max_throughput_np8"
+default_template = "ds41-1017-np8-1m-swarm"
 
 [models.qwen38_27b]
 description = "Qwen3.8-27B-UD-Q4_K_XL (100% GPU VRAM Dense Flagship)"
@@ -99,7 +125,7 @@ fallback_paths = []
 ctx_size = 1048576
 ctk = "q4_0"
 ctv = "q4_0"
-parallel = 2
+parallel = 1
 mla = 2
 override_tensor = "exps=CPU"
 default_template = "low_vram_1m"
@@ -111,7 +137,7 @@ fallback_paths = []
 ctx_size = 131072
 ctk = "q8_0"
 ctv = "q8_0"
-parallel = 2
+parallel = 1
 default_template = "max_throughput_np8"
 
 [models.diffusion_gemma]
@@ -121,7 +147,7 @@ fallback_paths = []
 ctx_size = 65536
 ctk = "q8_0"
 ctv = "q8_0"
-parallel = 2
+parallel = 1
 default_template = "coding_pinpoint"
 
 [models.leanstral_119b]
@@ -131,6 +157,6 @@ fallback_paths = []
 ctx_size = 131072
 ctk = "q8_0"
 ctv = "q8_0"
-parallel = 2
+parallel = 1
 override_tensor = "exps=CPU"
 default_template = "deep_formal_audit"

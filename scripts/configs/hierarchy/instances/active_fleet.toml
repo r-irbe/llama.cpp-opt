@@ -9,19 +9,19 @@ total_instances = 3
 
 [fleet.instances."llama-primary-8080"]
 label = "Primary Coding & Reasoning Engine"
-engine_flavor = "ik_llama_rust_ffi"
-binary_path = "build/bin/llama-server"
-model_id = "deepseek_v41_flash"
-template_id = "coding_pinpoint"
+engine_flavor = "ik_llama_pto_lto"
+binary_path = "build-pto/bin/llama-server"
+model_id = "deepseek-v4.1-1017-ud-q4kxl"
+template_id = "ds41-1017-np1-512k-max-speed"
 host = "127.0.0.1"
 port = 8080
 numa_nodes = "0-7 (NPS4 distribute)"
 gpu_device = 0
-vram_budget_gib = 14.00
+vram_budget_gib = 14.80
 slab_priority = "realtime"
-status = "healthy"
-pid = 41820
-active_slots = 2
+status = "stopped"
+pid = 0
+active_slots = 0
 last_replaced_from_binary = "none"
 
 [fleet.instances."llama-fast-8081"]
@@ -36,9 +36,9 @@ numa_nodes = "0-3 (Socket 0)"
 gpu_device = 0
 vram_budget_gib = 8.50
 slab_priority = "cooperative"
-status = "healthy"
-pid = 41905
-active_slots = 8
+status = "stopped"
+pid = 0
+active_slots = 0
 last_replaced_from_binary = "none"
 
 [fleet.instances."llama-formal-8082"]

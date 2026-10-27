@@ -10,17 +10,27 @@ quantization = "Q2_K_Protected + Engram Q8_0"
 disk_size_gib = 386.37
 vram_footprint_gib = 13.70
 ram_footprint_gib = 185.64
-path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
-fallback_paths = ["unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
-default_template = "coding_pinpoint"
-notes = "512K..1M context fits in 24 GiB VRAM with MLA Q4_0 K-only cache + --defer-ple (22.88 tok/s decode)."
+path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf", "unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+default_template = "ds41-1017-np1-512k-max-speed"
+notes = "512K..1M context fits in 24 GiB VRAM with --swa-compress, -ictk q8_0, MLA -mla 2, and --defer-ple (22.88 tok/s decode)."
 
 [models.deepseek_v41_flash.recommended]
 ctx_size = "524288"
-kv_type_k = "q4_0"
-kv_type_v = "q4_0"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+indexer_cache_type_k = "q8_0"
+swa_compress = "on"
+fused_indexer = "on"
+dsa_attention = "on"
 mla_mode = "2"
-override_tensor = "exps=CPU,engram_embd=CPU,nextn=CPU"
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = "on"
 defer_experts = "off"
-parallel_slots = "2"
+parallel_slots = "1"
+draft_model_path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+spec_type = "dspark_plus_ngram_mod"
+spec_ckpt_mode = "per-step"
+thinking_effort = "max_deep_think"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"

@@ -1,0 +1,36 @@
+# =============================================================================
+# Layer 2: models/deepseek-v4.1-1017-iq2xxs.toml -- Declarative Model Specification
+# =============================================================================
+
+[models.deepseek-v4.1-1017-iq2xxs]
+display_name = "DeepSeek-V4.1-Flash-1017 (GSQ-RCO-IQ2_XXS + Engram + DSpark Q8_0)"
+architecture = "deepseek4 (MLA + DSA + Fused Indexer + 256 RoE + Engram Sidecar)"
+parameter_scale = "552B-1000B Total / 16B-32B Active"
+quantization = "GSQ-RCO-IQ2_XXS + Engram + DSpark Q8_0"
+disk_size_gib = 218.40
+vram_footprint_gib = 13.20
+ram_footprint_gib = 205.00
+path = "/home/radu/vm/llm/ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"
+fallback_paths = ["models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"]
+default_template = "ds41-1017-np1-512k-max-speed"
+notes = "Fast low-bandwidth GSQ-RCO-IQ2_XXS 4-shard backbone for 512K-1M context with RAM-resident routed experts and --defer-ple."
+
+[models.deepseek-v4.1-1017-iq2xxs.recommended]
+ctx_size = "524288"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+indexer_cache_type_k = "q8_0"
+swa_compress = "on"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
+defer_ple = "on"
+defer_experts = "off"
+parallel_slots = "1"
+draft_model_path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+spec_type = "dspark_plus_ngram_mod"
+spec_ckpt_mode = "per-step"
+thinking_effort = "max_deep_think"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"

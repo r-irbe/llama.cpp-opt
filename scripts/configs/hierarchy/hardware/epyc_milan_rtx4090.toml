@@ -5,7 +5,7 @@
 [hardware]
 id = "epyc_milan_rtx4090"
 display_name = "Dual AMD EPYC 7453 (56C Zen 3 NPS4) + NVIDIA RTX 4090 (24 GiB sm_89)"
-cpu_topology = "2x EPYC 7453 (56C/112T, 8 NUMA nodes NPS4, 16-ch DDR4-3200, 503 GiB RAM)"
+cpu_topology = "2x EPYC 7453 (56C/112T, 8 NUMA nodes NPS4, 16-ch DDR4-3200, 991 GiB RAM)"
 gpu_topology = "1x NVIDIA GeForce RTX 4090 (24 GiB GDDR6X, 72 MiB L2 Cache, sm_89)"
 storage_topology = "NVMe Gen4 Direct I/O + OpenZFS lavapool + 2 MiB HugeTLB"
 
