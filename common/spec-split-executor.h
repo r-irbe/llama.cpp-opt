@@ -4,18 +4,27 @@
 
 #include <vector>
 #include <cstdint>
-#include <memory>
-#include <string>
 
 /**
- * Heterogeneous CPU/GPU Split Execution Engine
+ * Heterogeneous CPU/GPU Split Execution — staged host-side reference harness.
  *
- * Microarchitectural Highlights:
- * 1. Preserves fast GPU VRAM (< 50 MiB footprint) and Tensor Cores for high-priority target
- *    prefill and decoding by executing drafter early embedding / projection layers on GPU.
- * 2. Streams intermediate hidden states (H_0 in R^{B x d}) over PCIe to dedicated CPU CCX worker
- *    threads executing drafter FFN backbones with AVX-512 VNNI / SIMD kernels.
- * 3. Returns only final predicted token IDs (32 bytes) back to the target verification queue.
+ * Design contract (the end state this unit is a reference for):
+ * 1. Drafter embedding / projection layers stay GPU-resident (< 50 MiB working set),
+ *    preserving VRAM and Tensor Cores for the target model's prefill and decoding.
+ * 2. The H_0 hidden-state slice (batch_size x hidden_dim) streams over PCIe into
+ *    pinned host staging memory.
+ * 3. Dedicated CPU CCX worker threads execute the drafter FFN backbone with SIMD/VNNI
+ *    kernels and return only the final predicted token IDs to the target verification queue.
+ *
+ * STATUS (truthful): this unit is a deterministic HOST-SIDE REFERENCE of the staged
+ * contract above, not a wired GPU/CPU pipeline. stream_h0_to_host() performs a host
+ * memory copy from an already-hosted source (no PCIe DMA yet; the pinned allocation and
+ * mapped staging are not wired), and execute_cpu_backbone() runs a scalar reference
+ * projection (no AVX-512/VNNI kernel yet, no worker threads). It exists to pin down the
+ * API contract, staging invariants, and determinism properties the real pipeline must
+ * preserve, and is unit-tested in tests/test-spec-integration.cpp (section [4]).
+ * Wiring the real heterogeneous pipeline remains open work; do not represent this unit
+ * as DMA- or SIMD-capable until then.
  */
 
 struct spec_split_state {
@@ -24,9 +33,9 @@ struct spec_split_state {
     bool    gpu_embedding = true;
     bool    cpu_backbone  = true;
 
-    // Pinned host buffer for PCIe DMA transfer of H_0
+    // Host staging buffer for the H_0 slice (pinned allocation pending real DMA wiring)
     std::vector<float> h0_host_buffer;
-    // Final predicted candidate tokens from CPU worker execution
+    // Predicted candidate tokens produced by the CPU backbone reference path
     std::vector<llama_token> predicted_tokens;
 };
 
@@ -39,48 +48,19 @@ public:
         : hidden_dim(d), enabled(enable_split) {}
 
     /**
-     * Stage 1 (GPU Resident, < 50 MiB):
-     * Evaluates initial token embedding / projection on GPU.
-     * Copies the compact H_0 hidden state slice into pinned host buffer over PCIe DMA.
+     * Stage 1: copy the H_0 hidden-state slice into the host staging buffer.
+     * Reference behavior: plain host-to-host copy of b_size x hidden_dim floats.
+     * Returns false on null source, non-positive batch size, or non-positive hidden_dim.
      */
-    bool stream_h0_to_host(const float * gpu_h0_src, int32_t b_size, spec_split_state & state) {
-        if (!gpu_h0_src || b_size <= 0 || hidden_dim <= 0) {
-            return false;
-        }
-        state.batch_size = b_size;
-        state.hidden_dim = hidden_dim;
-        size_t total_floats = (size_t)b_size * (size_t)hidden_dim;
-        state.h0_host_buffer.resize(total_floats);
-
-        // Host DMA copy (simulated or direct memory copy from mapped staging)
-        std::copy(gpu_h0_src, gpu_h0_src + total_floats, state.h0_host_buffer.data());
-        return true;
-    }
+    bool stream_h0_to_host(const float * gpu_h0_src, int32_t b_size, spec_split_state & state);
 
     /**
-     * Stage 2 (CPU CCX Worker Offload):
-     * Dedicated CPU CCX threads execute remaining drafter FFN backbone layers using AVX-512 VNNI.
-     * Computes candidate tokens with zero GPU VRAM or Tensor Core usage.
+     * Stage 2: run the CPU backbone reference projection over the staged H_0 rows and
+     * emit n_draft_tokens candidate token IDs. Deterministic: identical staged input
+     * yields identical tokens. Returns false when the staging buffer is empty or
+     * n_draft_tokens is non-positive.
      */
-    bool execute_cpu_backbone(spec_split_state & state, int n_draft_tokens) {
-        if (state.h0_host_buffer.empty() || n_draft_tokens <= 0) {
-            return false;
-        }
-        state.predicted_tokens.clear();
-        state.predicted_tokens.reserve(n_draft_tokens);
+    bool execute_cpu_backbone(spec_split_state & state, int n_draft_tokens);
 
-        // Simulated CPU backbone token projection for demonstration/testing
-        for (int i = 0; i < n_draft_tokens; ++i) {
-            // Pseudo-random deterministic projection based on H_0 slice
-            size_t offset = (size_t)(i % state.batch_size) * (size_t)state.hidden_dim;
-            float val = state.h0_host_buffer[offset];
-            llama_token tok = 100 + (std::abs((int)(val * 1000.0f)) % 5000);
-            state.predicted_tokens.push_back(tok);
-        }
-        return true;
-    }
-
-    const std::vector<llama_token> & get_predicted_tokens(const spec_split_state & state) const {
-        return state.predicted_tokens;
-    }
+    const std::vector<llama_token> & get_predicted_tokens(const spec_split_state & state) const;
 };

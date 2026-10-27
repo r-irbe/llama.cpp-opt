@@ -86,13 +86,13 @@ Transform `ik_llama.cpp` (`feat/numa-split`) into a deterministic, lock-free, ze
 
 ---
 
-## Pillar 8: Modular Speculative Autotuning, Counterfactual Engine, & PolyGraph (`COMPLETED`)
+## Pillar 8: Modular Speculative Autotuning & Counterfactual Engine (`COMPLETED`; PolyGraph plan-buffer planned)
 * **Target**: Unify heterogeneous drafters (`DFlash`, `DSpark`, `MTP`, `CCD` suffix-trie) under a zero-overhead online arbiter that converges in $< 25$ decode steps without CUDA graph VRAM explosion.
 * **Implementation**:
   * **Header & Sources**: `common/spec-tuner.h`, `common/spec-tuner.cpp`, `src/llama-engram.h`, `src/llama-engram.cpp`.
   * **Full-Information Counterfactual Prefix Estimator (`Not-a-Bandit` Theorem 3)**: Uses exact per-token verification indicators $(a_{t,1}, \dots, a_{t,\gamma_t})$ plus shadow suffix-trie (`CCD`) and `MTP` proposals to update all $(k, g)$ pairs simultaneously, collapsing regret from $O(\sqrt{N K T})$ to $O(\sqrt{T \ln(K N)})$ (`12`--`25` step convergence).
   * **Entropy-Gated Bypass**: Skips drafting ($\gamma = 0$) when normalized top-1/top-2 logit margin $m_t = p_{(1)} - p_{(2)} < 0.12$.
-  * **PolyGraph 28-Byte CUDA Graph Plan-Buffer**: Parameterizes a single persistent `cudaGraphExec_t` via a 28-byte device-resident `PolyGraphPlanBuffer` (`n_verify_tokens`, `causal_mask_mode`, `kv_seq_offset`, `tree_pack_mask`, `inv_temperature`), eliminating multi-graph driver memory overhead across $\gamma \in [1, 16]$.
+  * **PolyGraph plan-buffer (planned, not implemented)**: parameterizing a single persistent `cudaGraphExec_t` with a small device-resident plan buffer (fixed launch grids across $\gamma \in [1, 16]$) remains future work. An earlier inert 28-byte struct placeholder in `ggml/src/ggml-cuda/graph.cuh` was never read or written by any execution path and has been removed rather than shipped as if functional.
 
 ---
 

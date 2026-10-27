@@ -2,6 +2,7 @@
 #include "spec-counterfactual.h"
 #include "spec-systems-tuner.h"
 #include "spec-tuner.h"
+#include "spec-split-executor.h"
 
 #include <cstdio>
 #include <cassert>
@@ -143,6 +144,37 @@ int main() {
         TEST_ASSERT(reached_zero, "Target-only arm must remain reachable after the positive arms warm");
 
         printf("  Speculative Tuner feedback loop check PASSED OK.\n");
+    }
+
+    {
+        printf("\n[4] Verifying split-executor staged reference contract...\n");
+        spec_split_executor exec(8, true);
+        spec_split_state state;
+
+        const int B = 3;
+        float h0[B * 8];
+        for (int i = 0; i < B * 8; ++i) {
+            h0[i] = (float)(i % 7) * 0.25f - 0.5f;
+        }
+
+        TEST_ASSERT(exec.stream_h0_to_host(h0, B, state), "stage 1 must accept a valid H_0 slice");
+        TEST_ASSERT((int)state.h0_host_buffer.size() == B * 8, "staging buffer must hold B x d floats");
+        TEST_ASSERT(state.batch_size == B && state.hidden_dim == 8, "stage 1 must record batch and dims");
+
+        TEST_ASSERT(!exec.stream_h0_to_host(nullptr, B, state), "stage 1 must reject a null source");
+        TEST_ASSERT(!exec.stream_h0_to_host(h0, 0, state), "stage 1 must reject a non-positive batch size");
+
+        TEST_ASSERT(exec.execute_cpu_backbone(state, 4), "stage 2 must run on a staged state");
+        TEST_ASSERT((int)state.predicted_tokens.size() == 4, "backbone must emit n_draft_tokens candidate IDs");
+        const std::vector<llama_token> first_run = state.predicted_tokens;
+        TEST_ASSERT(exec.execute_cpu_backbone(state, 4), "stage 2 rerun on identical staging");
+        TEST_ASSERT(first_run == state.predicted_tokens, "backbone projection must be deterministic");
+
+        spec_split_state empty_state;
+        TEST_ASSERT(!exec.execute_cpu_backbone(empty_state, 4), "stage 2 must reject an unstaged state");
+        TEST_ASSERT(!exec.execute_cpu_backbone(state, 0), "stage 2 must reject a non-positive draft count");
+
+        printf("  Split-executor staged reference check PASSED OK.\n");
     }
 
     printf("\nAll test-spec-integration assertions PASSED cleanly!\n");

@@ -12,7 +12,7 @@ This document synthesizes the systems architecture, memory-hierarchy invariants,
 | `common/lockfree-ring.h` | `SpscRingBuffer`, `MpscVyukovQueue`, `DisruptorBroadcastRing` | `alignas(128)` (`COMMON_CACHE_LINE_BYTES = 128`) | Defeats Zen 3 adjacent-line spatial prefetcher false sharing; local `head_shadow_` / `tail_shadow_` achieve `> 96%` L1 hit ratio |
 | `common/kv-capsule-filter.h` | `BinaryFuse8`, `SimHash64`, `ContextCapsule` | `~9.0 bits/entry` (`1.125 B/key`) + 8-byte `SimHash64` | Graf & Lemire 3-wise XOR Binary Fuse Filter (`0.39%` FPR, 0 divisions via `mulhi64`) + Charikar 64-bit SimHash (`< 15 ns` cartridge rejection) |
 | `common/unreal-selector.h` | `unreal::selector` | Streaming SIMD MaxSim + BM25 + `compute_global_summary` | `1.14M chunks/s` pre-attention filtering; `73.7%`--`98.5%` KV VRAM reduction; exact pre-pruning corpus frequency summaries |
-| `common/spec-tuner.h` | `SpeculativeArbiter`, `PolyGraphPlanBuffer` | 28-byte `__constant__` / pinned CUDA plan-buffer | `Not-a-Bandit` Theorem 3 counterfactual prefix updates ($O(\sqrt{T \ln(KN)})$, 12--25 step convergence) + entropy gate ($m_t < 0.12$) |
+| `common/spec-tuner.h` | `spec_tuner`, `spec_arbiter` | SPSC/disruptor drafter rings + counterfactual attribution engine | `Not-a-Bandit` Theorem 3 counterfactual prefix updates ($O(\sqrt{T \ln(KN)})$, 12--25 step convergence) + entropy gate ($m_t < 0.12$) |
 
 ---
 
