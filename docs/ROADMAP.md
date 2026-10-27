@@ -29,9 +29,9 @@ Transform `ik_llama.cpp` (`feat/numa-split`) into a deterministic, lock-free, ze
 * **Target**: Sub-15-nanosecond pre-filtering for persisted KV cartridges and multi-tenant prompt caches prior to radix-tree traversal or PCIe/NVMe transfers.
 * **Implementation**:
   * **Header & Tooling**: `common/kv-capsule-filter.h`, `tools/ctx-capsule/`, `tests/test_ctx_capsule_tui.py`.
-  * **Graf & Lemire 8-Bit Binary Fuse Filter (`common::BinaryFuse8`)**: 3-wise XOR peelable hypergraph filter packing $N$ 64-bit token/chunk hashes at $pprox 9.0	ext{ bits/entry}$ ($1.125	ext{ bytes/key}$, $22\%$ smaller than classical Bloom filters) with a $0.39\%$ false-positive rate (`1/256`) and division-free `mulhi64` 3-lookup queries.
+  * **Graf & Lemire 8-Bit Binary Fuse Filter (`common::BinaryFuse8`)**: 3-wise XOR peelable hypergraph filter packing $N$ 64-bit token/chunk hashes at $\approx 9.0\text{ bits/entry}$ ($1.125\text{ bytes/key}$, $22\%$ smaller than classical Bloom filters) with a $0.39\%$ false-positive rate (`1/256`) and division-free `mulhi64` 3-lookup queries.
   * **Charikar 64-Bit Locality-Sensitive SimHash (`common::SimHash64`)**: Streaming 64-bit document fingerprint with single-instruction `__builtin_popcountll` Hamming distance (`is_near_duplicate`).
-  * **Unified `ContextCapsule`**: Pairs `SimHash64` + `BinaryFuse8` so `llama-server` and UNREAL skip non-matching KV cartridges in $< 15	ext{ ns}$.
+  * **Unified `ContextCapsule`**: Pairs `SimHash64` + `BinaryFuse8` so `llama-server` and UNREAL skip non-matching KV cartridges in $< 15\text{ ns}$.
 
 ---
 
@@ -40,7 +40,7 @@ Transform `ik_llama.cpp` (`feat/numa-split`) into a deterministic, lock-free, ze
 * **Implementation**:
   * **Header & Artifacts**: `common/unreal-selector.h`, `scripts/demo_unreal_rag.py`, `docs/reports/unreal_extreme_scaling_and_kv_caching.pdf`, `tests/test-unreal-selector.cpp`.
   * **Mechanics**: Model-internal token-embedding ColBERT-style MaxSim late interaction + BM25 lexical boost (`1.14M chunks/s` SIMD throughput) + `selector::compute_global_summary` pre-pruning corpus-wide token/document-frequency aggregation so global counting queries remain $100\%$ exact when $> 80\%$ of chunks are pruned.
-  * **Measured Impact**: `73.7%`--`98.5%` KV cache VRAM reduction, `100%` gold needle retrieval on Qwen3.8-Flash-Next MoE, and break-even context length $N^* pprox 18	ext{K}$--$32	ext{K}$ tokens.
+  * **Measured Impact**: `73.7%`--`98.5%` KV cache VRAM reduction, `100%` gold needle retrieval on Qwen3.8-Flash-Next MoE, and break-even context length $N^* \approx 18\text{K}$--$32\text{K}$ tokens.
 
 ---
 
