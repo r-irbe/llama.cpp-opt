@@ -39,6 +39,19 @@ numa_strategy = "distribute" # --numa
 thp_hugepages = "on" # -thp
 io_uring_direct = "on" # --io-uring
 rust_mmap_ffi = "on" # -DGGML_RUST_MMAP_ENGINE=ON
+pto_mode = "irpgo_thinlto_split" # --pto
+pto_trace_workload = "full_6stage_server_sweep" # --pto-workload
+pto_toolchain = "clang21_lld_znver3" # --compiler
+pto_target_linkage = "static_plus_shared_libs" # --shared-libs
 temp = "0.1" # --temp
 telemetry_mode = "pi_telemetry_plus_jsonl" # --telemetry
 sdk_sync_targets = "all_7_harnesses" # --sync-sdks
+
+[pto]
+pto_mode = "irpgo_thinlto_split"
+pto_trace_workload = "full_6stage_server_sweep"
+pto_toolchain = "clang21_lld_znver3"
+pto_target_linkage = "static_plus_shared_libs"
+profile_dir = ".pi/pto-profiles"
+merged_profdata = ".pi/pto-profiles/merged.profdata"
+optimized_binary = "build-pto/bin/llama-server"

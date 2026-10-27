@@ -18,3 +18,10 @@ fused_moe = "on"
 thp_hugepages = "madvise"
 io_uring_direct = "auto"
 l2_persisting_mb = "36"
+
+[pto]
+pto_mode = "irpgo_thinlto_split"
+pto_toolchain = "clang21_lld_znver3"
+pto_target_linkage = "static_plus_shared_libs"
+cflags = "-O3 -march=znver3 -mtune=znver3 -fsplit-machine-functions -flto=thin"
+ldflags = "-fuse-ld=lld -Wl,--icf=safe -Wl,--thinlto-cache-dir=.pi/thinlto-cache"

@@ -488,3 +488,116 @@ int main() {
         res_run = subprocess.run([str(bin_file)], capture_output=True, text=True, check=False)
         assert res_run.returncode == 0, f"Execution failed: {res_run.stderr}"
         assert "ALL KV CAPSULE FILTER C++ TESTS PASSED" in res_run.stdout
+
+
+def test_pto_profile_runner_and_ctx_capsule_ts_integration():
+    """Verify 6-stage PTO profile runner, Mode B live-daemon merge, pto_finetune.sh, and ctx_capsule_tui.ts --pto-optimize."""
+    pto_runner = REPO_ROOT / "scripts" / "pto_profile_runner.py"
+    pto_finetune = REPO_ROOT / "scripts" / "pto_finetune.sh"
+    ts_tui = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
+
+    assert pto_runner.exists()
+    assert pto_finetune.exists()
+    assert ts_tui.exists()
+
+    # 1. Verify --print-pgo-flags outputs Clang-21 IRPGO, CS-IRPGO, ThinLTO, and Machine Function Splitting
+    res_flags = subprocess.run(
+        [sys.executable, str(pto_runner), "--print-pgo-flags"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_flags.returncode == 0
+    assert "GGML_PTO_MODE=GENERATE" in res_flags.stdout
+    assert "GGML_PTO_MODE=CS_GENERATE" in res_flags.stdout
+    assert "GGML_THINLTO=ON" in res_flags.stdout
+    assert "GGML_SPLIT_MACHINE_FUNCTIONS=ON" in res_flags.stdout
+    assert "GGML_NCCL=OFF" in res_flags.stdout
+
+    # 2. Verify 6-stage synthetic sweep dry-run uses production env defaults (GGML_CUDA_NO_PINNED=0, -t 56)
+    res_dry = subprocess.run(
+        [sys.executable, str(pto_runner), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_dry.returncode == 0, f"pto_profile_runner --dry-run failed: {res_dry.stderr}"
+    assert "GGML_CUDA_NO_PINNED=0" in res_dry.stdout
+    assert "Stage 1/6:" in res_dry.stdout
+    assert "Stage 5/6: Live llama-server Multi-Slot HTTP" in res_dry.stdout
+    assert "Stage 6/6: llama-bench GEMM / FlashAttention / MoE Microbenchmark" in res_dry.stdout
+    assert "llvm-profdata" in res_dry.stdout
+
+    # 3. Verify Mode B (--live-daemon-merge) dry-run
+    res_merge = subprocess.run(
+        [sys.executable, str(pto_runner), "--live-daemon-merge", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_merge.returncode == 0
+    assert "PTO MODE B: CONTINUOUS LIVE-DAEMON TRACE MERGE" in res_merge.stdout
+
+    # 4. Verify scripts/pto_finetune.sh --dry-run routes through scripts/build-guard.sh
+    res_sh = subprocess.run(
+        [str(pto_finetune), "--pto=use", "--shared-libs", "--compiler=clang-21", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_sh.returncode == 0, f"pto_finetune.sh failed: {res_sh.stderr}"
+    assert "scripts/build-guard.sh" in res_sh.stdout
+    assert "-DGGML_NCCL=OFF" in res_sh.stdout
+    assert "-DGGML_THINLTO=ON" in res_sh.stdout
+    assert "-DGGML_SPLIT_MACHINE_FUNCTIONS=ON" in res_sh.stdout
+    assert "-DBUILD_SHARED_LIBS=ON" in res_sh.stdout
+
+    # 5. Verify tools/ctx-capsule/ctx_capsule_tui.ts --pto-optimize and --export-toml
+    res_pto_only = subprocess.run(
+        [
+            "node",
+            "--experimental-strip-types",
+            str(ts_tui),
+            "--pto-optimize",
+            "cs_irpgo_2stage",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_pto_only.returncode == 0, f"ctx_capsule_tui.ts --pto-optimize failed: {res_pto_only.stderr}"
+    assert "STATUS: PTO Fine-Tuned (cs_irpgo_2stage via clang21_lld_znver3)" in res_pto_only.stdout
+    assert "ik_llama_pto_lto" in res_pto_only.stdout
+
+    res_ts = subprocess.run(
+        [
+            "node",
+            "--experimental-strip-types",
+            str(ts_tui),
+            "--pto-optimize",
+            "cs_irpgo_2stage",
+            "--export-toml",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_ts.returncode == 0, f"ctx_capsule_tui.ts failed: {res_ts.stderr}"
+    assert "[capsule.pto.trace_and_optimize]" in res_ts.stdout
+    assert "[PTO Tune & Swap (p)]" in res_ts.stdout
+    defaults_toml = (REPO_ROOT / "scripts" / "configs" / "hierarchy" / "00-defaults.toml").read_text(encoding="utf-8")
+    assert "[pto]" in defaults_toml
+    assert 'pto_mode = "irpgo_thinlto_split"' in defaults_toml
+    models_toml = (REPO_ROOT / "scripts" / "configs" / "models.toml").read_text(encoding="utf-8")
+    assert "[pto]" in models_toml
+    assert 'pto_mode = "cs_irpgo_2stage"' in models_toml
+
+    # Restore default TOML bundle
+    subprocess.run(
+        ["node", "--experimental-strip-types", str(ts_tui), "--export-toml"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+

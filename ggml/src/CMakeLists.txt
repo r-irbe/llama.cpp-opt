@@ -260,6 +260,9 @@ if (GGML_CUDA)
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
         else()
+            if (NOT DEFINED CMAKE_CUDA_HOST_COMPILER AND DEFINED CMAKE_CXX_COMPILER)
+                set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
+            endif()
             enable_language(CUDA)
         endif()
 
@@ -1263,6 +1266,11 @@ if (GGML_CUDA)
 
     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
+    endif()
+
+    if (GGML_CUDA_ALLOW_UNSUPPORTED_COMPILER OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "22.0"))
+        message(STATUS "Passing -allow-unsupported-compiler to nvcc for ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+        list(APPEND CUDA_FLAGS -allow-unsupported-compiler)
     endif()
 
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")

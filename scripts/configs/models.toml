@@ -24,6 +24,16 @@ zdd_sparse_kv = true
 cohort_prefix_sharing = true
 spec_bandit = "thompson_counterfactual"
 
+[pto]
+pto_mode = "irpgo_thinlto_split"
+pto_trace_workload = "full_6stage_server_sweep"
+pto_toolchain = "clang21_lld_znver3"
+pto_target_linkage = "static_plus_shared_libs"
+profile_dir = ".pi/pto-profiles"
+merged_profdata = ".pi/pto-profiles/merged.profdata"
+optimized_binary = "build-pto/bin/llama-server"
+shared_libs = ["build-pto/ggml/src/libggml.so", "build-pto/src/libllama.so"]
+
 [models.deepseek_v41_flash]
 description = "DeepSeek-V4.1-Flash (EngramQ8 Q2_K_Protected, 1T MoE)"
 path = "models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
