@@ -226,11 +226,16 @@ MLA models already have the cache compressed, it doesn't really makes sense to c
 | `--yarn-orig-ctx N` | Original training context limit for YaRN | loaded from model | Base pre-trained context size (e.g. `4096`, `8192`, `32768`). |
 | `--yarn-ext-factor N` | YaRN extrapolation mix factor | -1.0 | Controls blending between interpolation and extrapolation (0.0 = full interpolation). |
 | `--yarn-attn-factor N` | YaRN attention temperature scale factor | -1.0 | Scales attention scores to prevent entropy collapse at high context. |
-| `-unreal, --unreal-filter` | Enable UNREAL model-internal evidence selection | disabled | Enables streaming late-interaction MaxSim evidence selection (`common/unreal-selector.h`) in `llama-cli` and `llama-server`. Filters long prompts down to top evidence chunks before slot ingestion, enabling virtual contexts up to 10M tokens within a physical context window. Grounded in Kinderman et al. (NVIDIA Research 2026, arXiv:2610.08463). |
-| `--no-unreal-filter` | Disable UNREAL evidence filtering | enabled | Default behavior. Passes the full prompt directly without evidence selection. |
-| `--unreal-chunk-size N` | UNREAL evidence chunk size in tokens | 140 | Chunk size ($T$) in tokens for exact-cover context partitioning. |
-| `--unreal-top-n N` | UNREAL top evidence chunks to retain | 10 | Number of top-scoring evidence chunks ($n$) to select via late-interaction MaxSim and BM25 lexical boost. |
-| `--unreal-min-tokens N` | Minimum prompt tokens before activating UNREAL | 4096 | Minimum prompt length ($N^*$) required to trigger UNREAL filtering. $0$ uses automatic theoretical break-even calculation. |
+| `-ef, --evidence-filter` | Enable UNREAL model-internal evidence selection | disabled | Enables streaming late-interaction MaxSim evidence selection (`common/unreal-selector.h`) in `llama-cli` and `llama-server`. Filters long prompts down to top evidence chunks before slot ingestion, enabling virtual contexts up to 10M tokens within a physical context window. Grounded in Kinderman et al. (NVIDIA Research 2026, arXiv:2610.08463). |
+| `-no-ef, --no-evidence-filter` | Disable UNREAL evidence filtering | enabled | Default behavior. Passes the full prompt directly without evidence selection. |
+| `-ect, --evidence-chunk-tokens N` | Evidence chunk size in tokens | 140 | Chunk size ($T$) in tokens for exact-cover context partitioning. |
+| `-etk, --evidence-top-k N` | Top evidence chunks to retain | 10 | Number of top-scoring evidence chunks ($n$) to select via late-interaction MaxSim and BM25 lexical boost. |
+| `--evidence-min-tokens N` | Minimum prompt tokens before activating filtering | 4096 | Minimum prompt length ($N^*$) required to trigger evidence filtering. $0$ uses automatic theoretical break-even calculation. |
+| `--evidence-strategy NAME` | Agent-tuned evidence selection strategy | `adaptive_default` | Strategy profile: `adaptive_default`, `code_pinpoint`, `narrative_recall`, `analytic_aggregate`, `temporal_window`, or `custom_weights`. Can also be overridden per HTTP request via `evidence_strategy`. |
+| `--evidence-symbol-boost F` | Lexical boost multiplier for code identifiers | 1.5 | Boosts exact identifier and symbol matches during MaxSim chunk scoring. |
+| `--evidence-chunk-expansion N` | Neighboring chunk expansion radius | 0 | Includes $\pm N$ adjacent chunks around each top-$k$ selected evidence chunk. |
+| `--evidence-maxsim-threshold F` | Minimum MaxSim score threshold | 0.0 | Prunes chunks whose normalized MaxSim similarity falls below $F$. |
+| `--evidence-symbol-regex REGEX` | Custom regex for identifier boosting | - | Custom regular expression matching high-priority symbols in `code_pinpoint` mode. |
 | `--zdd-sparse-kv` | Enable ZDD sparse KV block selection | disabled | Enables Minato ZDD decision-diagram indexing over 64-token KV blocks (`src/llama-kv-zdd.h`). Inactive blocks are filled with `-INF` in the KQ attention mask (`src/llama.cpp` input stage) and skipped across all 6 CUDA FlashAttention kernel families (`op_params[5] == 1`). |
 | `--no-zdd-sparse-kv` | Disable ZDD sparse KV block selection | enabled | Default behavior (`include/llama.h` `zdd_sparse_kv = false`). The environment variable `LLAMA_KV_ZDD_SKIP` also enables the hook without the flag. |
 | `--no-context-shift` | Disable context-shift | - |  |

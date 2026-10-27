@@ -99,7 +99,20 @@ Transform `ik_llama.cpp` (`feat/numa-split`) into a deterministic, lock-free, ze
 ## Pillar 9: Zero-Copy Rust Mmap Engine & Lean 4 SafeVerify FFI (`COMPLETED`)
 * **Target**: Sub-100ns zero-copy MoE expert slice dispatch and machine-checked formal verification of memory-mapping, alignment, and speculative bounds.
 * **Implementation**:
-  * **CMake & FFI**: `GGML_RUST_MMAP_ENGINE=ON` (`CMakeLists.txt`, `src/llama-mmap.cpp`) linking `/home/radu/code/rust-mmap-engine` (`librust_mmap_engine.so`).
+  * **CMake & FFI**: `GGML_RUST_MMAP_ENGINE=ON` (`CMakeLists.txt`, `src/llama-mmap.cpp`) linking `../rust-mmap-engine` (`librust_mmap_engine.so`).
   * **Measured FFI Latencies**:
     * `rust_mmap_expert_slice` (`Superblock2MiBView` zero-copy 2 MiB slice lookup): **73.59 ns/call** (`13.59M ops/s`).
     * Lean 4 -> C -> Rust AVX2 `Q4_0` GEMV (`4096 x 4096` projection): **2,191.99 ns** (`2.19 us` total round-trip, `< 18 ns` FFI overhead).
+
+---
+
+## Pillar 10: Profile-Targeted Optimization (`PTO`) & Pure TypeScript FOOP Hexagonal Control Plane (`COMPLETED`)
+* **Target**: Eliminate compiler front-end instruction cache misses, branch mispredictions, and cross-TU call overhead in `libggml` / `libllama` / `llama-server` while providing an interactive, type-safe control plane (`ctx-capsule`) for hierarchical TOML configuration and zero-downtime PTO binary replacement.
+* **Implementation**:
+  * **CMake & Driver Pipeline**: `GGML_PTO_MODE` (`OFF | GENERATE | CS_GENERATE | USE`), `GGML_THINLTO`, `GGML_SPLIT_MACHINE_FUNCTIONS`, and `GGML_USE_LLD` in `CMakeLists.txt` and `ggml/CMakeLists.txt`, orchestrated by `scripts/pto_finetune.sh` and `scripts/pto_profile_runner.py` (`Clang 21.1.8` + `ld.lld-21` + `llvm-profdata-21`).
+  * **Hexagonal FOOP Control Plane (`tools/ctx-capsule/ctx_capsule_tui.ts` & `scripts/configs/hierarchy/`)**:
+    * Pure Functional Object-Oriented Programming (FOOP) domain with `Result<T, E>` (`Ok` / `Err`), branded types, zero raw `try/catch` in domain modules, and hexagonal outbound ports (`FileSystemPort`, `LlamaProcessPort`, `TelemetryPort`, `AgentSdkPort`, `PtoOptimizationPort`).
+    * Compiles a 5-layer hierarchical TOML configuration (`00-defaults.toml`, `hardware/`, `models/`, `templates/`, `instances/`) into `scripts/configs/models.toml` and supports one-key (`p` / `--pto-optimize`) PTO trace collection, ThinLTO rebuild, and in-place `llama-server` fleet binary swap.
+  * **Measured Hardware PMU & Throughput Impact (`perf stat` + `llama-bench`)**:
+    * **CPU / Hybrid Hot-Path (`-ngl 0 -t 56 -fa 1`)**: `pp512` jumps `+119.27%` (`71,527 -> 156,836 tok/s`), `pp2048` jumps `+89.54%` (`38,548 -> 73,065 tok/s`), and `tg128` jumps `+924.89%` (`410.58 -> 4,208.01 tok/s`), with CPU cycles reduced by `-67.58%` (`IPC 0.36 -> 0.72`), `L1-icache-load-misses` reduced by `-55.60%`, `branch-misses` reduced by `-27.02%`, and `iTLB-load-misses` reduced by `-16.94%`.
+    * **CUDA Graph & Host Dispatch (`-ngl 99 -fa 1` on RTX 4090)**: `pp2048` increases `+90.57%` (`43,878 -> 83,620 tok/s`) on micro-models and reaches `2,734.42 +- 40.19 tok/s` (`pp2048`) and `47.82 +- 0.03 tok/s` (`tg128`, `CV = 0.06%`, `IPC = 2.30`) on `Qwen3.8-27B-UD-Q4_K_XL`, and `19.04 +- 0.06 tok/s` (`tg32`, `CV = 0.31%`, `IPC = 1.77`) on `GLM-5.3-Flash-UD-IQ4_XS`.
