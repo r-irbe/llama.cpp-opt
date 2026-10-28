@@ -19,7 +19,10 @@ void llama_graph_apply_zdd_fattn_op_params(
         return;
     }
     const char * env_skip = std::getenv("LLAMA_KV_ZDD_SKIP");
-    const bool zdd_enabled = zdd_sparse_kv || (env_skip != nullptr && env_skip[0] != '\0' && env_skip[0] != '0');
+    // env "0" forces the skip-mask OFF even when the zdd-sparse-kv flag is on
+    // (clean A/B: manager memory behavior held constant, mask toggled alone).
+    const bool env_off = env_skip != nullptr && env_skip[0] == '0';
+    const bool zdd_enabled = !env_off && (zdd_sparse_kv || (env_skip != nullptr && env_skip[0] != '\0'));
     if (zdd_enabled) {
         dst->op_params[5] = 1;
     }
@@ -56,7 +59,8 @@ bool llm_build_context::llama_graph_build_zdd_skip_mask(
         int32_t n_kv,
         std::vector<uint8_t> & out_skip_mask) {
     const char * env_skip = std::getenv("LLAMA_KV_ZDD_SKIP");
-    const bool zdd_enabled = lctx.cparams.zdd_sparse_kv || (env_skip != nullptr && env_skip[0] != '\0' && env_skip[0] != '0');
+    const bool env_off = env_skip != nullptr && env_skip[0] == '0';
+    const bool zdd_enabled = !env_off && (lctx.cparams.zdd_sparse_kv || (env_skip != nullptr && env_skip[0] != '\0'));
     if (!zdd_enabled || n_kv <= 0) {
         out_skip_mask.clear();
         return false;
