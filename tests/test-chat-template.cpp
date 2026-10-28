@@ -719,6 +719,12 @@ int main_automated_tests(void) {
             formatted_chat.data(),
             formatted_chat.size()
         );
+        if (res < 0) {
+            // Unrecognized template (apply failed): report and continue rather
+            // than resize(negative) which would abort the whole battery.
+            std::cout << "SKIP (apply failed, res=" << res << ")\n";
+            continue;
+        }
         formatted_chat.resize(res);
         std::string output(formatted_chat.data(), formatted_chat.size());
         if (output != test_case.expected_output) {

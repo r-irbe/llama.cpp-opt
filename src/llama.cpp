@@ -216,6 +216,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN,
     LLM_CHAT_TEMPLATE_MISTRAL_V7,
     LLM_CHAT_TEMPLATE_PHI_3,
+    LLM_CHAT_TEMPLATE_PHI_4,
     LLM_CHAT_TEMPLATE_FALCON_3,
     LLM_CHAT_TEMPLATE_FALCON_E,
     LLM_CHAT_TEMPLATE_ZEPHYR,
@@ -264,6 +265,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "mistral-v3-tekken", LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN },
     { "mistral-v7",        LLM_CHAT_TEMPLATE_MISTRAL_V7        },
     { "phi3",              LLM_CHAT_TEMPLATE_PHI_3             },
+    { "phi-4",             LLM_CHAT_TEMPLATE_PHI_4             },
     { "falcon3",           LLM_CHAT_TEMPLATE_FALCON_3          },
     { "falcon_e",          LLM_CHAT_TEMPLATE_FALCON_E          },
     { "zephyr",            LLM_CHAT_TEMPLATE_ZEPHYR            },
@@ -685,7 +687,7 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
     if (kv_self_used.any_compacted()) {
         const auto view = llama_swa_calc_window_view_compact(
                 (int64_t) kv_self_used.live_swa() + (&kv_self_used == &ctx.kv_self ? u_batch.n_tokens : 0), kv_self_used.sink_rows,
-                u_batch.n_tokens, kv_self_used.window_swa,
+                u_batch.n_tokens, kv_self_used.window_swa * std::max<uint32_t>(1, kv_self_used.n_seq_max_swa),
                 llama_kv_cache::get_padding(ctx.cparams.flash_attn));
         if (view.w_view != the_prev->swa_w_view || view.win_off != the_prev->swa_win_off) {
             printf("    SWA view is not the same\n"); return;
@@ -716,7 +718,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
     if (kv_self_used.any_compacted()) {
         const auto view = llama_swa_calc_window_view_compact(
                 (int64_t) kv_self_used.live_swa() + (&kv_self_used == &kv_self ? u_batch.n_tokens : 0), kv_self_used.sink_rows,
-                u_batch.n_tokens, kv_self_used.window_swa,
+                u_batch.n_tokens, kv_self_used.window_swa * std::max<uint32_t>(1, kv_self_used.n_seq_max_swa),
                 llama_kv_cache::get_padding(cparams.flash_attn));
         if (view.w_view != the_prev->swa_w_view || view.win_off != the_prev->swa_win_off) {
             return false;
@@ -1276,7 +1278,8 @@ static bool llama_kv_cache_init(
         bool any = false;
         for (int il = 0; il < (int) hparams.n_layer; ++il) {
             plan[il] = llama_kv_layer_rows(hparams, il, kv_size, true, cparams.n_ubatch,
-                                           llama_kv_cache::get_padding(cparams.flash_attn));
+                                           llama_kv_cache::get_padding(cparams.flash_attn),
+                                           cparams.n_seq_max);
             any = any || plan[il] < kv_size;
         }
         if (any) {
@@ -1290,11 +1293,14 @@ static bool llama_kv_cache_init(
                         "compacted sliding-window layers must share one row count");
                 rows_compacted = cache.row_count[il];
             }
-            cache.size_swa     = rows_compacted;
-            cache.sink_rows    = hparams.param_sink_number;
-            cache.window_swa   = hparams.n_swa;
-            cache.head_swa     = cache.sink_rows;
-            cache.pos_base_swa = 0;
+            cache.size_swa      = rows_compacted;
+            cache.sink_rows     = hparams.param_sink_number;
+            cache.window_swa    = hparams.n_swa;
+            cache.head_swa      = cache.sink_rows;
+            cache.pos_base_swa  = 0;
+            cache.n_seq_max_swa = std::max<uint32_t>(1, cparams.n_seq_max);
+            cache.cells_swa.clear();
+            cache.cells_swa.resize(rows_compacted);
         } else {
             if (model.supports_dflash_swa_compress()) {
                 LLAMA_LOG_INFO("%s: --swa-compress uses the DFlash custom cache, ordinary KV bookkeeping has no compactable layers\n", __func__);
@@ -1870,6 +1876,18 @@ static bool llama_kv_cache_find_slot(
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
             cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
         }
+        if (cache.any_compacted()) {
+            const uint32_t row_swa = (i < cache.sink_rows && batch.pos[i] < (llama_pos) cache.sink_rows)
+                ? (uint32_t) batch.pos[i] : (cache.head_swa + i);
+            if (row_swa < cache.cells_swa.size()) {
+                cache.cells_swa[row_swa].pos = batch.pos[i];
+                cache.cells_swa[row_swa].tok = batch.token ? batch.token[i] : -1;
+                cache.cells_swa[row_swa].seq_id.clear();
+                for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
+                    cache.cells_swa[row_swa].seq_id.insert(batch.seq_id[i][j]);
+                }
+            }
+        }
     }
 
     cache.used += n_tokens;
@@ -1884,13 +1902,13 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
         return;
     }
 
-    const uint32_t W = cache.window_swa;
+    const uint32_t W_max = cache.window_swa * std::max<uint32_t>(1, cache.n_seq_max_swa);
     // the graph views the window at pad granularity, so only the pad-aligned part of the allocation is usable capacity
     const uint32_t pad = llama_kv_cache::get_padding(lctx.cparams.flash_attn);
     const uint32_t C = pad > 1 ? ((cache.size_swa - cache.sink_rows)/pad)*pad : cache.size_swa - cache.sink_rows;
     GGML_ASSERT(n_tokens <= C);
     // a roll between the ubatches of one call would lift the rewind floor above the call's first position
-    if (n_tokens_call <= C - W) {
+    if (W_max < C && n_tokens_call <= C - W_max) {
         n_tokens = std::max(n_tokens, n_tokens_call);
     }
 
@@ -1899,6 +1917,7 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
     }
 
     const uint32_t live = cache.live_swa();
+    const uint32_t W = std::min<uint32_t>(live, std::min<uint32_t>(W_max, C > n_tokens ? C - n_tokens : cache.window_swa));
     GGML_ASSERT(live >= W && "the retained window must lie inside the live region");
 
     // llama_graph_compute submits asynchronously and never waits
@@ -2018,6 +2037,16 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
         }
     }
 
+    if (!cache.cells_swa.empty() && src_row + W <= cache.cells_swa.size()) {
+        for (uint32_t r = 0; r < W; ++r) {
+            cache.cells_swa[dst_row + r] = cache.cells_swa[src_row + r];
+        }
+        for (uint32_t r = dst_row + W; r < cache.cells_swa.size(); ++r) {
+            cache.cells_swa[r].pos = -1;
+            cache.cells_swa[r].tok = -1;
+            cache.cells_swa[r].seq_id.clear();
+        }
+    }
     cache.pos_base_swa += (llama_pos) (live - W);
     cache.head_swa      = cache.sink_rows + W;
 }
@@ -2608,6 +2637,12 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     cache.cells_disordered = false;
     cache.head_swa     = cache.sink_rows;
     cache.pos_base_swa = 0;
+    for (auto & cell : cache.cells_swa) {
+        cell.pos = -1;
+        cell.tok = -1;
+        cell.delta = 0;
+        cell.seq_id.clear();
+    }
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
@@ -2647,8 +2682,7 @@ static bool llama_kv_cache_seq_rm(
     bool      compact_apply = false;
     uint32_t  compact_head  = 0;
     llama_pos compact_base  = 0;
-    // seq_id > 0 owns no compacted rows here (single-sequence arch), so it must not move the map
-    if (cache.any_compacted() && seq_id <= 0 && p1 > p0) {
+    if (cache.any_compacted() && cache.n_seq_max_swa <= 1 && seq_id <= 0 && p1 > p0) {
         const llama_pos cur_end = cache.pos_base_swa + (llama_pos) cache.live_swa();
         GGML_ASSERT((cache.live_swa() > 0 || cache.pos_base_swa == 0) &&
                 "compacted window cannot be empty above position 0");
@@ -2704,6 +2738,33 @@ static bool llama_kv_cache_seq_rm(
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+
+    if (cache.any_compacted() && !cache.cells_swa.empty()) {
+        for (uint32_t r = 0; r < cache.head_swa && r < cache.cells_swa.size(); ++r) {
+            if (cache.cells_swa[r].pos >= p0 && cache.cells_swa[r].pos < p1) {
+                if (seq_id < 0) {
+                    cache.cells_swa[r].seq_id.clear();
+                } else if (cache.cells_swa[r].has_seq_id(seq_id)) {
+                    cache.cells_swa[r].seq_id.erase(seq_id);
+                } else {
+                    continue;
+                }
+                if (cache.cells_swa[r].is_empty()) {
+                    cache.cells_swa[r].pos = -1;
+                    cache.cells_swa[r].tok = -1;
+                }
+            }
+        }
+        if (!compact_apply) {
+            while (cache.head_swa > cache.sink_rows &&
+                   cache.cells_swa[cache.head_swa - 1].is_empty()) {
+                cache.head_swa--;
+            }
+            if (cache.head_swa == cache.sink_rows) {
+                cache.pos_base_swa = 0;
+            }
+        }
+    }
 
     if (compact_apply) {
         cache.head_swa     = compact_head;
@@ -2775,6 +2836,11 @@ static void llama_kv_cache_seq_cp(
             cache.cells[i].seq_id.insert(seq_id_dst);
         }
     }
+    for (uint32_t r = 0; r < cache.cells_swa.size(); ++r) {
+        if (cache.cells_swa[r].has_seq_id(seq_id_src) && cache.cells_swa[r].pos >= p0 && cache.cells_swa[r].pos < p1) {
+            cache.cells_swa[r].seq_id.insert(seq_id_dst);
+        }
+    }
 }
 
 static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id seq_id) {
@@ -2793,6 +2859,17 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
         } else {
             cache.cells[i].seq_id.clear();
             cache.cells[i].seq_id.insert(seq_id);
+        }
+    }
+
+    for (uint32_t r = 0; r < cache.cells_swa.size(); ++r) {
+        if (!cache.cells_swa[r].has_seq_id(seq_id)) {
+            cache.cells_swa[r].pos = -1;
+            cache.cells_swa[r].tok = -1;
+            cache.cells_swa[r].seq_id.clear();
+        } else {
+            cache.cells_swa[r].seq_id.clear();
+            cache.cells_swa[r].seq_id.insert(seq_id);
         }
     }
 
@@ -6484,10 +6561,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     const llama_seq_id seq_id = batch.seq_id[j][0];
                     for (int64_t c = 0; c < W_view; ++c) {
                         const int64_t i = win_off + c;
-                        const llama_pos cell_pos = compacted
-                            ? pos_base + (llama_pos) (i - row_base) : mask_kv_self.cells[i].pos;
-                        const bool in_seq = compacted
-                            ? cell_pos >= pos_base && i < row_end : mask_kv_self.cells[i].has_seq_id(seq_id);
+                        const bool use_cells_swa = compacted && mask_kv_self.n_seq_max_swa > 1 && !mask_kv_self.cells_swa.empty();
+                        const llama_pos cell_pos = !compacted
+                            ? mask_kv_self.cells[i].pos
+                            : (use_cells_swa
+                                ? ((i >= 0 && i < row_end && i < (int64_t) mask_kv_self.cells_swa.size()) ? mask_kv_self.cells_swa[i].pos : -1)
+                                : pos_base + (llama_pos) (i - row_base));
+                        const bool in_seq = !compacted
+                            ? mask_kv_self.cells[i].has_seq_id(seq_id)
+                            : (use_cells_swa
+                                ? (i >= 0 && i < row_end && i < (int64_t) mask_kv_self.cells_swa.size() &&
+                                   cell_pos >= 0 && mask_kv_self.cells_swa[i].has_seq_id(seq_id))
+                                : (cell_pos >= pos_base && i < row_end));
                         float f;
                         if (!in_seq || cell_pos > pos) {
                             f = -INFINITY;
@@ -6820,10 +6905,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     const llama_pos span_min = span_min_set ? ubatch_span_min[seq_id] : 0;
                     for (int64_t c = 0; c < W_view; ++c) {
                         const int64_t i = win_off + c;
-                        const llama_pos cell_pos = compacted
-                            ? pos_base + (llama_pos) (i - row_base) : mask_kv_self.cells[i].pos;
-                        const bool in_seq = compacted
-                            ? cell_pos >= pos_base : mask_kv_self.cells[i].has_seq_id(seq_id);
+                        const bool use_cells_swa = compacted && mask_kv_self.n_seq_max_swa > 1 && !mask_kv_self.cells_swa.empty();
+                        const llama_pos cell_pos = !compacted
+                            ? mask_kv_self.cells[i].pos
+                            : (use_cells_swa
+                                ? ((i >= 0 && i < (int64_t) mask_kv_self.cells_swa.size()) ? mask_kv_self.cells_swa[i].pos : -1)
+                                : pos_base + (llama_pos) (i - row_base));
+                        const bool in_seq = !compacted
+                            ? mask_kv_self.cells[i].has_seq_id(seq_id)
+                            : (use_cells_swa
+                                ? (i >= 0 && i < (int64_t) mask_kv_self.cells_swa.size() &&
+                                   cell_pos >= 0 && mask_kv_self.cells_swa[i].has_seq_id(seq_id))
+                                : (cell_pos >= pos_base));
                         float f;
                         if (!in_seq || cell_pos > pos) {
                             f = -INFINITY;
@@ -10057,10 +10150,8 @@ struct llama_context * llama_init_from_model(
         }
 
         if (params.n_seq_max > 1 && ctx->kv_self.any_compacted()) {
-            LLAMA_LOG_ERROR("%s: --swa-compress supports a single sequence only (requested n_seq_max = %u); run with -np 1\n",
-                    __func__, params.n_seq_max);
-            llama_free(ctx);
-            return nullptr;
+            LLAMA_LOG_INFO("%s: --swa-compress enabled for multi-sequence context (n_seq_max = %u, size_swa = %u rows)\n",
+                    __func__, params.n_seq_max, ctx->kv_self.size_swa);
         }
 
         {
@@ -13880,6 +13971,10 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
     auto tmpl_contains = [&tmpl](const char * haystack) -> bool {
         return tmpl.find(haystack) != std::string::npos;
     };
+    if (tmpl_contains("<|im_sep|>")) {
+        // Phi 4: inline im_sep format, distinct from ChatML-style im_start/im_end
+        return LLM_CHAT_TEMPLATE_PHI_4;
+    }
     if (tmpl_contains("<|im_start|>")) {
         return LLM_CHAT_TEMPLATE_CHATML;
     } else if (tmpl.find("mistral") == 0 || tmpl_contains("[INST]")) {
@@ -14097,6 +14192,16 @@ static int32_t llama_chat_apply_template_internal(
         }
         if (add_ass) {
             ss << "<|assistant|>\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_PHI_4) {
+        // Phi 4: certified inline format - no newlines between role tag,
+        // im_sep, content, and im_end; generation prompt has no trailing newline
+        for (const auto & message : chat) {
+            std::string role(message->role);
+            ss << "<|im_start|>" << role << "<|im_sep|>" << message->content << "<|im_end|>";
+        }
+        if (add_ass) {
+            ss << "<|im_start|>assistant<|im_sep|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_FALCON_3) {
         // Falcon 3
@@ -14354,7 +14459,7 @@ static int32_t llama_chat_apply_template_internal(
             ss << message->content << "<|end_of_text|>\n";
         }
         if (add_ass) {
-            ss << "<|start_of_role|>assistant<|end_of_role|>\n";
+            ss << "<|start_of_role|>assistant<|end_of_role|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_GIGACHAT) {
         // GigaChat template
