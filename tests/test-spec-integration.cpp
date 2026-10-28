@@ -1,5 +1,4 @@
 #include "spec-arbiter.h"
-#include "spec-counterfactual.h"
 #include "spec-systems-tuner.h"
 #include "spec-tuner.h"
 #include "spec-split-executor.h"
@@ -7,7 +6,6 @@
 #include <cstdio>
 #include <cassert>
 #include <vector>
-#include <cmath>
 
 #define TEST_ASSERT(cond, msg) \
     do { \
@@ -175,6 +173,54 @@ int main() {
         TEST_ASSERT(!exec.execute_cpu_backbone(state, 0), "stage 2 must reject a non-positive draft count");
 
         printf("  Split-executor staged reference check PASSED OK.\n");
+    }
+
+    {
+        printf("\n[5] Verifying verify_pinned tuner arm integration...\n");
+        common_params_speculative tp;
+        tp.spec_verify_pinned = false;
+        spec_tuner tuner;
+        tuner.init(COMMON_SPECULATIVE_TYPE_NONE, tp, nullptr);
+        TEST_ASSERT(tuner.enabled, "tuner must be enabled after init");
+
+        spec_tuner_coord * vp = nullptr;
+        for (auto & c : tuner.coords) {
+            if (c.name == "verify_pinned") vp = &c;
+        }
+        TEST_ASSERT(vp != nullptr, "verify_pinned coord must exist");
+        TEST_ASSERT(vp->arms.size() == 2, "verify_pinned coord must have exactly two arms");
+        TEST_ASSERT((int) vp->arms[vp->current_idx].value == 0,
+            "initial arm must follow the user flag (dynamic)");
+
+        // Learning: the dynamic arm earns 20 TPS, the pinned arm 40 TPS. The
+        // coord update is deterministic (Welford mean + best tracking).
+        vp->current_idx = 0;
+        for (int i = 0; i < 8; ++i) tuner.accept_feedback(2, 4, 20.0);
+        vp->current_idx = 1;
+        for (int i = 0; i < 8; ++i) tuner.accept_feedback(4, 6, 40.0);
+        TEST_ASSERT(vp->arms[1].Q > vp->arms[0].Q,
+            "pinned arm must hold the higher mean reward after shaping");
+        TEST_ASSERT(vp->best_idx == 1, "best arm must move to pinned under higher measured TPS");
+
+        // Write coupling: neutralize the posterior so Thompson sampling
+        // explores both arms equally, then verify propose() writes whichever
+        // arm it selects into the active params.
+        for (auto & arm : vp->arms) {
+            arm.Q  = 30.0;
+            arm.N  = 4;
+            arm.M2 = 4.0;
+        }
+        bool saw_dynamic = false, saw_pinned = false;
+        common_params_speculative p2;
+        p2.spec_verify_pinned = false;
+        for (int i = 0; i < 200; ++i) {
+            tuner.propose(p2);
+            if (p2.spec_verify_pinned) saw_pinned = true; else saw_dynamic = true;
+        }
+        TEST_ASSERT(saw_dynamic && saw_pinned,
+            "propose must write both arms into the active params under a neutral posterior");
+
+        printf("  verify_pinned tuner arm check PASSED OK.\n");
     }
 
     printf("\nAll test-spec-integration assertions PASSED cleanly!\n");

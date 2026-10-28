@@ -166,6 +166,7 @@ void spec_tuner::write_best(common_params_speculative & params) const {
         else if (coord.name == "ngram_size_m")         params.ngram_size_m         = (uint16_t)val;
         else if (coord.name == "ngram_min_hits")       params.ngram_min_hits       = (uint16_t)val;
         else if (coord.name == "suffix_min_match_len") params.suffix_min_match_len = (int32_t)val;
+        else if (coord.name == "verify_pinned")        params.spec_verify_pinned = ((int32_t)val != 0);
     }
 }
 
@@ -225,6 +226,17 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
 
     if (type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK || type == COMMON_SPECULATIVE_TYPE_MTP) {
         dflash_quarantined.assign(coords[0].arms.size(), false);
+    }
+
+    // PolyGraph verify-pinning arm: 0 = dynamic verify batch shape,
+    // 1 = pinned (stage n_max + 1 rows). The initial arm follows the user's
+    // --spec-verify-pinned; with --spec-autotune the tuner explores both arms
+    // and learns the per-workload winner from measured step TPS.
+    {
+        spec_tuner_coord coord;
+        coord.name = "verify_pinned";
+        coord.build_grid_int(0, 1, 1, user_params.spec_verify_pinned ? 1 : 0);
+        coords.push_back(std::move(coord));
     }
 
     if (type == COMMON_SPECULATIVE_TYPE_DRAFT) {
@@ -473,6 +485,7 @@ void spec_tuner::propose(common_params_speculative & params) {
         else if (coord.name == "ngram_size_m")         params.ngram_size_m         = (uint16_t)val;
         else if (coord.name == "ngram_min_hits")       params.ngram_min_hits       = (uint16_t)val;
         else if (coord.name == "suffix_min_match_len") params.suffix_min_match_len = (int32_t)val;
+        else if (coord.name == "verify_pinned")        params.spec_verify_pinned = ((int32_t)val != 0);
     }
 
     // Unified online entropy & acceptance-rate gate across DFlash, DSpark, MTP, and CCD suffix-trie
