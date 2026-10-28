@@ -76,6 +76,10 @@ struct server_slot {
     // non-empty if we went to evaluate draft tokens
     // ref: https://github.com/ggml-org/llama.cpp/pull/17808
     std::vector<int32_t> i_batch_dft;
+    // PolyGraph pinned verification: batch indices of padding rows (not real
+    // drafts — excluded from acceptance bookkeeping, removed by checkpoint
+    // surgery and the post-accept commit trim).
+    std::vector<int32_t> i_batch_pad;
 
     std::vector<completion_token_output> generated_token_probs;
 

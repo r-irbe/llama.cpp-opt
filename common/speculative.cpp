@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "spec-verify-planner.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -3635,15 +3636,36 @@ common_speculative_round_result common_speculative_run_round(
         return result;
     }
 
-    llama_batch verify_batch = llama_batch_init((int) draft.size() + 1, 0, 1);
+    // PolyGraph pinned verification: pad to gamma_max + 1 rows (Lean:
+    // Limits.rows) so repeated decodes keep one CUDA graph instance. Padding
+    // rows sit at causally-hidden positions after the real rows; their
+    // outputs are discarded and their KV cells are trimmed by the commit rm
+    // (llama_kv_cache_seq_rm from the accepted tail to end-of-sequence).
+    const bool pin_batch = params.spec_verify_pinned && !draft.empty();
+    int32_t n_pad = 0;
+    if (pin_batch) {
+        const int32_t pos_room = (int32_t) llama_n_ctx(ctx) - 1
+            - (n_past + (int32_t) draft.size() + 1);
+        n_pad = std::min(params.get_max_stage_n_max() - (int32_t) draft.size(), pos_room);
+        n_pad = std::max(n_pad, 0);
+    }
+    llama_batch verify_batch = llama_batch_init((int) draft.size() + 1 + n_pad, 0, 1);
     std::vector<int> verify_indices;
-    verify_indices.reserve(draft.size() + 1);
+    verify_indices.reserve(draft.size() + 1 + n_pad);
 
-    common_batch_add(verify_batch, result.sampled_before, n_past, { seq_id }, true);
+    // Lean-certified row map (PolyGraph.Basic): row r carries position
+    // pos_base + r; rows 0..active_len are real (root + drafts), the rest are
+    // causally-hidden padding whose outputs are discarded.
+    const polygraph::Plan plan{(uint32_t) draft.size(), (uint32_t) n_past, 0u, 0u, 0u, 0u, 0u};
+    common_batch_add(verify_batch, result.sampled_before, (llama_pos) polygraph::row_pos(plan, 0), { seq_id }, true);
     verify_indices.push_back(0);
     for (size_t i = 0; i < draft.size(); ++i) {
-        common_batch_add(verify_batch, draft[i], n_past + 1 + (llama_pos) i, { seq_id }, true);
+        common_batch_add(verify_batch, draft[i], (llama_pos) polygraph::row_pos(plan, (uint32_t) i + 1), { seq_id }, true);
         verify_indices.push_back((int) i + 1);
+    }
+    for (int32_t p = 0; p < n_pad; ++p) {
+        const uint32_t row = (uint32_t) draft.size() + 1 + (uint32_t) p;
+        common_batch_add(verify_batch, draft.back(), (llama_pos) polygraph::row_pos(plan, row), { seq_id }, true);
     }
 
     if (llama_decode(ctx, verify_batch) != 0) {

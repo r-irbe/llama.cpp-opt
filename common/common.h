@@ -281,6 +281,12 @@ struct common_params_speculative {
     std::string cache_type_v = ""; // KV cache data type for V for the draft model
 
     bool autotune = false; // automatically optimize speculative params for max tokens/sec
+    // PolyGraph pinned verification (Lean-certified plan semantics in
+    // rust-mmap-engine/formalization/PolyGraph): pad every speculative verify
+    // batch to the stage n_max + 1 rows so the target decode graph keeps a
+    // single CUDA graph instance. Default off; padding rows are causally
+    // hidden and their KV cells are trimmed by the post-accept commit.
+    bool spec_verify_pinned = false;
 
     // ConcurrencyKnee (systems tuner): active-stream / queue-depth threshold at
     // which speculative drafting is throttled to target-only so it cannot steal

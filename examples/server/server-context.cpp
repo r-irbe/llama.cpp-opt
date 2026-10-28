@@ -10,6 +10,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "spec-verify-planner.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -3846,6 +3847,7 @@ void server_context::add_sampled_tokens() {
                 slot.drafted.clear();
                 slot.draft_proposal_dists.clear();
                 slot.i_batch_dft.clear();
+                slot.i_batch_pad.clear();
             } else {
                 if (slot.spec_target_only) {
                     SLT_DBG(slot, "%s\n", "selected target-only arm: root-only target batch");
@@ -3865,6 +3867,34 @@ void server_context::add_sampled_tokens() {
                     common_batch_add(batch, draft[i], slot.cache_tokens.pos_next(), { slot.id }, true);
                     slot.cache_tokens.push_back(draft[i]);
                 }
+
+                // PolyGraph pinned verification: pad the batch to gamma_max + 1
+                // rows (Lean: Limits.rows) so repeated decodes keep one CUDA
+                // graph instance. Padding rows carry the slot sequence at
+                // causally-hidden positions after the real rows; acceptance
+                // reads logits via i_batch_dft only, and the post-accept commit
+                // trim (speculative.cpp) removes their KV cells together with
+                // the rejected-draft tail. Padding rows are NOT pushed to
+                // cache_tokens and NOT tracked as drafts.
+                if (slot.params.speculative.spec_verify_pinned && !draft.empty()) {
+                    const int32_t gamma_max = slot.params.speculative.get_max_stage_n_max();
+                    // rows occupy pos_root .. pos_root + draft.size() (root + drafts)
+                    const int32_t pos_root = (int32_t) slot.cache_tokens.pos_next() - ((int32_t) draft.size() + 1);
+                    const polygraph::Plan plan{(uint32_t) draft.size(), (uint32_t) pos_root, 0u, 0u, 0u, 0u, 0u};
+                    int32_t n_pad = gamma_max - (int32_t) draft.size();
+                    slot.i_batch_pad.clear();
+                    for (int32_t p = 0; p < n_pad; ++p) {
+                        const uint32_t row = (uint32_t) draft.size() + 1 + (uint32_t) p;
+                        const llama_pos pos = (llama_pos) polygraph::row_pos(plan, row);
+                        if (pos >= (llama_pos) slot.n_ctx) {
+                            break; // keep positions inside the slot's context window
+                        }
+                        slot.i_batch_pad.push_back(batch.n_tokens);
+                        // padding token content is irrelevant; its output is discarded
+                        common_batch_add(batch, slot.sampled, pos, { slot.id }, true);
+                    }
+                }
+
                 slot.drafted = std::move(draft);
                 slot.draft_proposal_dists = std::move(proposal_dists);
             }
@@ -4654,6 +4684,7 @@ void server_context::speculative_decoding_accept() {
         }
 
         slot.i_batch_dft.clear();
+        slot.i_batch_pad.clear();
         slot.drafted.clear();
         slot.draft_proposal_dists.clear();
 
@@ -5373,6 +5404,11 @@ void server_context::update_slots() {
                     remove[index] = 1;
                 }
             }
+            for (const int32_t index : slot.i_batch_pad) {
+                if (index >= 0 && index < old_n_tokens) {
+                    remove[index] = 1;
+                }
+            }
 
             std::vector<int32_t> remap(old_n_tokens, -1);
             int32_t write = 0;
@@ -5400,6 +5436,7 @@ void server_context::update_slots() {
             slot.drafted.clear();
             slot.draft_proposal_dists.clear();
             slot.i_batch_dft.clear();
+            slot.i_batch_pad.clear();
             slot.n_past = slot.cache_tokens.n_tokens();
             slot.spec_target_only = false;
             SLT_WRN(slot, "%s", "spec checkpoint unavailable; removed draft rows and continuing root-only\n");

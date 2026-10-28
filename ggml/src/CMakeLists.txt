@@ -310,9 +310,13 @@ if (GGML_CUDA)
         add_compile_definitions(GGML_CUDA_MIN_BATCH_OFFLOAD=${GGML_CUDA_MIN_BATCH_OFFLOAD})
         add_compile_definitions(GGML_CUDA_FUSION=${GGML_CUDA_FUSION})
 
-        if (GGML_CUDA_USE_GRAPHS)
-            add_compile_definitions(GGML_CUDA_USE_GRAPHS)
-        endif()
+        # USE_CUDA_GRAPH is unconditionally required: HEAD's llama-graph.cpp
+        # calls ggml_backend_cuda_stream_paged_kv_blocks (defined only under
+        # this guard), so leaving it undefined breaks every fresh llama-server
+        # link. The GGML_CUDA_USE_GRAPHS option gate stopped propagating this
+        # define through fresh configures; define it beside the other CUDA
+        # defines where propagation is proven to work.
+        add_compile_definitions(USE_CUDA_GRAPH)
 
         if (GGML_CUDA_FORCE_DMMV)
             add_compile_definitions(GGML_CUDA_FORCE_DMMV)
@@ -964,6 +968,11 @@ set(CUDA_CXX_FLAGS "")
 
 if (GGML_CUDA)
     set(CUDA_FLAGS -use_fast_math -extended-lambda -lineinfo)
+    # USE_CUDA_GRAPH is required by HEAD's llama-graph.cpp
+    # (ggml_backend_cuda_stream_paged_kv_blocks is defined only under this
+    # guard); delivered here because this list provably reaches the .cu
+    # compile lines on fresh configures.
+    list(APPEND CUDA_FLAGS -DUSE_CUDA_GRAPH)
 	message("-- CUDA Toolkit: ${CUDAToolkit_VERSION}")
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
         # Options are:
@@ -980,7 +989,13 @@ if (GGML_CUDA)
     endif()
 
     if (GGML_ALL_WARNINGS AND NOT MSVC)
-        set(NVCC_CMD ${CMAKE_CUDA_COMPILER} .c)
+        # Probe input file: nvcc requires an input file; a literal `.c` does not
+        # exist in fresh build dirs, which made the host-compiler version probe
+        # fail silently, fall into the GNU branch with an empty version, and
+        # crash get_flags with an arity error on every fresh CUDA configure.
+        # Generate the input file instead.
+        file(WRITE "${CMAKE_BINARY_DIR}/.c" "")
+        set(NVCC_CMD ${CMAKE_CUDA_COMPILER} "${CMAKE_BINARY_DIR}/.c")
         if (NOT CMAKE_CUDA_HOST_COMPILER STREQUAL "")
             list(APPEND NVCC_CMD -ccbin ${CMAKE_CUDA_HOST_COMPILER})
         endif()
@@ -998,13 +1013,20 @@ if (GGML_CUDA)
                 OUTPUT_VARIABLE CUDA_CCVER
                 ERROR_QUIET
             )
+            # sanitize: keep the first line only (multi-line output breaks
+            # get_flags argument arity and version comparisons)
+            string(REGEX REPLACE "\n.*$" "" CUDA_CCVER "${CUDA_CCVER}")
         else()
             if (CUDA_CCFULLVER MATCHES Apple)
                 set(CUDA_CCID "AppleClang")
             else()
                 set(CUDA_CCID "Clang")
             endif()
-            string(REGEX REPLACE "^.* version ([0-9.]*).*$" "\\1" CUDA_CCVER ${CUDA_CCFULLVER})
+            # extract the version from the first line only: the unquoted
+            # multi-line banner expanded to multiple arguments and broke
+            # string(REGEX REPLACE) argument arity on fresh CUDA configure
+            string(REGEX REPLACE "\n.*$" "" CUDA_CCVER "${CUDA_CCFULLVER}")
+            string(REGEX REPLACE "^.* version ([0-9.]*).*$" "\\1" CUDA_CCVER "${CUDA_CCVER}")
         endif()
 
         message("-- CUDA host compiler is ${CUDA_CCID} ${CUDA_CCVER}")

@@ -40,19 +40,22 @@ Row layout for every verification step (`rows = γ_max + 1`):
 ```
 row 0                : root token (last accepted)        seq = slot
 rows 1..γ_act        : drafted tokens (real)             seq = slot
-rows γ_act+1..γ_max  : padding tokens (any value)        seq = scratch
+rows γ_act+1..γ_max  : padding tokens (any value)        seq = slot (v1)
 ```
 
-- `llama_batch` supports per-row `seq_id`; real rows never attend across
-  sequences, so **padding rows cannot leak into real rows' attention**. This is
-  the formal safety property (Lean: `no_padding_flow`, below).
-- Scratch-sequence KV cells are rewritten every step at the same positions —
-  the scratch seq never grows; it is cleared (or simply overwritten in place)
-  per step. The fork already uses companion-sequence patterns for drafters, so
-  the pattern has precedent.
-- Positions: `rowPos(r) = posBase + r` for all rows (padding positions are
-  valid RoPE positions; their outputs are discarded). `(rowSeq, rowPos)` is
-  injective across rows ⇒ no two rows share a KV cell (Lean: `kv_cells_disjoint`).
+**As-built v1 mechanism (same-seq, causality-isolated):** padding rows ride
+the SAME slot sequence at higher positions. Causal attention masking already
+prevents real rows from attending them (a real row at position p attends only
+positions ≤ p; padding sits at p+1..γ_max), padding outputs are discarded, and
+the post-accept commit trim (`llama_kv_cache_seq_rm(seq, accepted_tail, -1)`)
+removes the padding cells together with rejected draft rows. This keeps the
+feature working on caches with `n_seq_max = 1` (single-tenant spec runs).
+The scratch-sequence variant below remains the v2 upgrade for multi-seq caches
+and is what the Lean model's `rowSeq` encodes; both satisfy the certified
+contract (distinct `(seq, pos)` per row via `kv_cells_disjoint`, padding never
+flows into real outputs via `mask_closure`).
+
+Legacy scratch-sequence design (v2, planned):
 
 ### 3.2 Plan buffer (28 bytes, host-authored)
 
