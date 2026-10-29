@@ -2293,6 +2293,11 @@ void llm_load_hparams(
                                 model.engram_pad_mapped = true;
                             }
                         }
+||||||| 2959611ea
+                        ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
+                        ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
+                        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
+                        ml.get_key(LLM_KV_ENGRAM_PAD_ID,         model.engram_pad_id);
                         if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
                             throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
                         }
@@ -2337,6 +2342,11 @@ void llm_load_hparams(
                         if (model.engram_pad_mapped && model.engram_pad_id >= model.engram_token_map.size()) {
                             throw std::runtime_error("engram pad token id is outside the token map");
                         }
+||||||| 2959611ea
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS),     model.engram_offsets);
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP),   model.engram_token_map);
                         const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                         if (model.engram_multipliers.size() != (size_t) hparams.engram_n_layer * hparams.engram_max_ngram_size) {
                             throw std::runtime_error("engram multiplier count does not match layers * ngram size");

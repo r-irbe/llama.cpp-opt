@@ -337,8 +337,8 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     int trace = 0;
-    if (getenv("LLAMA_TRACE")) {
-        trace = atoi(getenv("LLAMA_TRACE"));
+    if (const char * env_trace = getenv("LLAMA_TRACE")) {
+        trace = atoi(env_trace);
     }
 
 #ifdef _WIN32
@@ -613,6 +613,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         }
     }
 
+||||||| 2959611ea
     std::set<std::string> tensor_names;
     for (auto & w : weights) {
         n_elements += ggml_nelements(w.tensor);
