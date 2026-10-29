@@ -1,0 +1,41 @@
+{
+  "sdk": "oh-my-agents-weftd",
+  "daemon": "weftd",
+  "bridge": "ctx-capsule",
+  "endpoint": "http://127.0.0.1:8083/v1",
+  "model": "qwen38_27b",
+  "template": "coding_pinpoint",
+  "headers": {
+    "X-Llama-Cohort": "cohort-qwen38_27b-coding_pinpoint",
+    "X-Llama-Capsule-Filter": "fuse8_simhash64",
+    "X-Llama-Evidence-Strategy": "maxsim_exact_cover",
+    "X-Llama-Evidence-Keep": "20%",
+    "X-Llama-Engine-Flavor": "ik_llama_pto_lto",
+    "X-Evidence-Filter": "true",
+    "X-Evidence-Strategy": "maxsim_exact_cover",
+    "X-Evidence-Top-K": "20",
+    "X-Evidence-Chunk-Tokens": "128",
+    "X-Evidence-Symbol-Boost": "0.15",
+    "X-Evidence-Chunk-Expansion": "true",
+    "X-Llama-Thinking-Effort": "max_deep_think"
+  },
+  "requestDefaults": {
+    "evidence_filter": true,
+    "evidence_strategy": "maxsim_exact_cover",
+    "evidence_chunk_tokens": 128,
+    "evidence_top_k": 20,
+    "evidence_symbol_boost": 0.15,
+    "evidence_chunk_expansion": true,
+    "thinking_effort": "max_deep_think",
+    "reasoning_budget": -1,
+    "evidence_capsule": {
+      "enabled": true,
+      "strategy": "maxsim_exact_cover",
+      "chunk_tokens": 128,
+      "top_k": 20,
+      "symbol_boost": 0.15,
+      "chunk_expansion": true,
+      "capsule_filter": "fuse8_simhash64"
+    }
+  }
+}

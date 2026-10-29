@@ -1162,39 +1162,100 @@ int main(int argc, char ** argv) {
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
 
-                const bool enable_evidence = json_value(data, "evidence_filter", ctx_server.params_base.unreal_filter);
+                bool enable_evidence = json_value(data, "evidence_filter", ctx_server.params_base.unreal_filter);
+                const json ev_capsule = (data.contains("evidence_capsule") && data["evidence_capsule"].is_object())
+                    ? data["evidence_capsule"] : json::object();
+                if (!ev_capsule.empty()) {
+                    enable_evidence = json_value(ev_capsule, "enabled", json_value(ev_capsule, "evidence_filter", true));
+                }
+                unreal::filter_telemetry ev_telemetry;
                 if (enable_evidence) {
                     gpt_params unreal_params = ctx_server.params_base;
                     unreal_params.unreal_filter = true;
                     unreal_params.n_ctx = ctx_server.n_ctx;
-                    if (data.contains("evidence_chunk_tokens")) {
-                        unreal_params.unreal_chunk_size = data["evidence_chunk_tokens"].get<int32_t>();
-                    }
-                    if (data.contains("evidence_top_k")) {
-                        unreal_params.unreal_top_n = data["evidence_top_k"].get<int32_t>();
-                    }
-                    if (data.contains("evidence_min_tokens")) {
-                        unreal_params.unreal_min_tokens = data["evidence_min_tokens"].get<int32_t>();
-                    }
-                    if (data.contains("evidence_strategy")) {
-                        unreal_params.unreal_evidence_strategy = data["evidence_strategy"].get<std::string>();
-                    }
-                    if (data.contains("symbol_boost")) {
-                        unreal_params.unreal_symbol_boost = data["symbol_boost"].get<float>();
-                    }
-                    if (data.contains("chunk_expansion")) {
-                        unreal_params.unreal_chunk_expansion = data["chunk_expansion"].get<int32_t>();
-                    }
-                    if (data.contains("maxsim_threshold")) {
-                        unreal_params.unreal_maxsim_threshold = data["maxsim_threshold"].get<float>();
+                    auto apply_ev_overrides = [&](const json & j, bool is_capsule) {
+                        if (j.contains("evidence_chunk_tokens") && j["evidence_chunk_tokens"].is_number_integer()) {
+                            unreal_params.unreal_chunk_size = j["evidence_chunk_tokens"].get<int32_t>();
+                        } else if (j.contains("chunk_tokens") && j["chunk_tokens"].is_number_integer()) {
+                            unreal_params.unreal_chunk_size = j["chunk_tokens"].get<int32_t>();
+                        } else if (j.contains("chunk_size") && j["chunk_size"].is_number_integer()) {
+                            unreal_params.unreal_chunk_size = j["chunk_size"].get<int32_t>();
+                        }
+                        if (j.contains("evidence_top_k") && j["evidence_top_k"].is_number_integer()) {
+                            unreal_params.unreal_top_n = j["evidence_top_k"].get<int32_t>();
+                        } else if (j.contains("top_m") && j["top_m"].is_number_integer()) {
+                            unreal_params.unreal_top_n = j["top_m"].get<int32_t>();
+                        } else if (is_capsule && j.contains("top_k") && j["top_k"].is_number_integer()) {
+                            unreal_params.unreal_top_n = j["top_k"].get<int32_t>();
+                        }
+                        if (j.contains("evidence_min_tokens") && j["evidence_min_tokens"].is_number_integer()) {
+                            unreal_params.unreal_min_tokens = j["evidence_min_tokens"].get<int32_t>();
+                        } else if (j.contains("min_tokens") && j["min_tokens"].is_number_integer()) {
+                            unreal_params.unreal_min_tokens = j["min_tokens"].get<int32_t>();
+                        }
+                        if (j.contains("evidence_strategy") && j["evidence_strategy"].is_string()) {
+                            unreal_params.unreal_evidence_strategy = j["evidence_strategy"].get<std::string>();
+                        } else if (j.contains("strategy") && j["strategy"].is_string()) {
+                            unreal_params.unreal_evidence_strategy = j["strategy"].get<std::string>();
+                        }
+                        if (j.contains("symbol_boost") && j["symbol_boost"].is_number()) {
+                            unreal_params.unreal_symbol_boost = j["symbol_boost"].get<float>();
+                        } else if (j.contains("evidence_symbol_boost") && j["evidence_symbol_boost"].is_number()) {
+                            unreal_params.unreal_symbol_boost = j["evidence_symbol_boost"].get<float>();
+                        }
+                        if (j.contains("chunk_expansion") && j["chunk_expansion"].is_number_integer()) {
+                            unreal_params.unreal_chunk_expansion = j["chunk_expansion"].get<int32_t>();
+                        } else if (j.contains("evidence_chunk_expansion") && j["evidence_chunk_expansion"].is_number_integer()) {
+                            unreal_params.unreal_chunk_expansion = j["evidence_chunk_expansion"].get<int32_t>();
+                        }
+                        if (j.contains("maxsim_threshold") && j["maxsim_threshold"].is_number()) {
+                            unreal_params.unreal_maxsim_threshold = j["maxsim_threshold"].get<float>();
+                        }
+                        if (j.contains("unreal_keep_head") && j["unreal_keep_head"].is_number_integer()) {
+                            unreal_params.unreal_keep_head = j["unreal_keep_head"].get<int32_t>();
+                        } else if (j.contains("evidence_keep_head") && j["evidence_keep_head"].is_number_integer()) {
+                            unreal_params.unreal_keep_head = j["evidence_keep_head"].get<int32_t>();
+                        } else if (j.contains("keep_head") && j["keep_head"].is_number_integer()) {
+                            unreal_params.unreal_keep_head = j["keep_head"].get<int32_t>();
+                        }
+                        if (j.contains("unreal_keep_tail") && j["unreal_keep_tail"].is_number_integer()) {
+                            unreal_params.unreal_keep_tail = j["unreal_keep_tail"].get<int32_t>();
+                        } else if (j.contains("evidence_keep_tail") && j["evidence_keep_tail"].is_number_integer()) {
+                            unreal_params.unreal_keep_tail = j["evidence_keep_tail"].get<int32_t>();
+                        } else if (j.contains("keep_tail") && j["keep_tail"].is_number_integer()) {
+                            unreal_params.unreal_keep_tail = j["keep_tail"].get<int32_t>();
+                        }
+                    };
+                    apply_ev_overrides(data, false);
+                    if (!ev_capsule.empty()) {
+                        apply_ev_overrides(ev_capsule, true);
                     }
                     for (size_t k = 0; k < inputs.size(); ++k) {
                         if (!inputs[k].has_mtmd_data()) {
-                            auto filtered = unreal::filter_prompt(ctx_server.model, inputs[k].get_text_tokens(), unreal_params);
+                            auto filtered = unreal::filter_prompt(ctx_server.model, inputs[k].get_text_tokens(), unreal_params, nullptr, &ev_telemetry);
                             if (filtered.size() < inputs[k].size()) {
                                 inputs[k] = server_tokens(filtered, false);
                             }
                         }
+                    }
+                    if (ev_telemetry.tokens_before > 0) {
+                        data["__evidence_telemetry"] = json {
+                            {"active",        ev_telemetry.active},
+                            {"tokens_before", ev_telemetry.tokens_before},
+                            {"tokens_after",  ev_telemetry.tokens_after},
+                            {"chunks_kept",   ev_telemetry.chunks_kept},
+                            {"chunks_total",  ev_telemetry.chunks_total},
+                            {"keep_head",     ev_telemetry.keep_head},
+                            {"keep_tail",     ev_telemetry.keep_tail},
+                            {"strategy",      ev_telemetry.strategy},
+                            {"elapsed_ms",    ev_telemetry.elapsed_ms},
+                        };
+                        res.set_header("X-Evidence-Filter-Applied", ev_telemetry.active ? "true" : "false");
+                        res.set_header("X-Evidence-Tokens-Before", std::to_string(ev_telemetry.tokens_before));
+                        res.set_header("X-Evidence-Tokens-After",  std::to_string(ev_telemetry.tokens_after));
+                        res.set_header("X-Evidence-Chunks-Kept",   std::to_string(ev_telemetry.chunks_kept));
+                        res.set_header("X-Evidence-Chunks-Total",  std::to_string(ev_telemetry.chunks_total));
+                        res.set_header("X-Evidence-Strategy",      ev_telemetry.strategy);
                     }
                 }
 
@@ -1246,9 +1307,13 @@ int main(int argc, char ** argv) {
                 }
                 else {
                     json arr = json::array();
-                    for (auto& res : all_results.results) {
-                        GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                        arr.push_back(res->to_json());
+                    for (auto& r_item : all_results.results) {
+                        GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(r_item.get()) != nullptr);
+                        json r_json = r_item->to_json();
+                        if (data.contains("__evidence_telemetry")) {
+                            r_json["evidence_telemetry"] = data["__evidence_telemetry"];
+                        }
+                        arr.push_back(std::move(r_json));
                     }
                     // if single request, return single object instead of array
                     res_ok(res, arr.size() == 1 ? arr[0] : arr);
@@ -1275,7 +1340,7 @@ int main(int argc, char ** argv) {
                 }
                 // next responses are streamed
                 json first_result_json = first_result->to_json();
-                const auto chunked_content_provider = [first_result_json, rd, oaicompat](size_t, httplib::DataSink& sink) mutable -> bool {
+                const auto chunked_content_provider = [first_result_json, rd, oaicompat, &ctx_server](size_t, httplib::DataSink& sink) mutable -> bool {
                     const auto sse = [oaicompat, &sink](const json& res) {
                         if (oaicompat == OAICOMPAT_TYPE_ANTHROPIC) {
                             return server_sent_anthropic_event(sink, res);
@@ -1329,6 +1394,12 @@ int main(int argc, char ** argv) {
                         if (oaicompat != OAICOMPAT_TYPE_ANTHROPIC && oaicompat != OAICOMPAT_TYPE_NONE && oaicompat != OAICOMPAT_TYPE_RESP) {
                             static const std::string ev_done = "data: [DONE]\n\n";
                             sink.write(ev_done.data(), ev_done.size());
+                        } else if (ctx_server.params_base.send_done) {
+                            // --send-done (wired 2026-10-28): additionally emit
+                            // the OAI [DONE] terminator for stream flavors that
+                            // omit it by default (anthropic / none / resp).
+                            static const std::string ev_done = "data: [DONE]\n\n";
+                            sink.write(ev_done.data(), ev_done.size());
                         }
                         sink.done();
                         return false; // no more data, go to on_complete()
@@ -1345,12 +1416,85 @@ int main(int argc, char ** argv) {
             }
     };
 
-    const auto handle_completions = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
-        log_prompt(ctx_server.params_base, json::parse(req.body));
-        auto data = json::parse(req.body);
+    const auto inject_request_headers = [](const httplib::Request & req, json & data) {
         if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
             data["cohort_id"] = req.get_header_value("X-Cohort-ID");
         }
+        if (req.has_header("X-Evidence-Filter") && !data.contains("evidence_filter")) {
+            std::string val = req.get_header_value("X-Evidence-Filter");
+            for (char & c : val) c = (char) std::tolower((unsigned char) c);
+            data["evidence_filter"] = (val == "1" || val == "true" || val == "on" || val == "yes");
+        }
+        if (req.has_header("X-Evidence-Strategy") && !data.contains("evidence_strategy")) {
+            data["evidence_strategy"] = req.get_header_value("X-Evidence-Strategy");
+        }
+        if (req.has_header("X-Evidence-Chunk-Tokens") && !data.contains("evidence_chunk_tokens")) {
+            try { data["evidence_chunk_tokens"] = std::stoi(req.get_header_value("X-Evidence-Chunk-Tokens")); } catch (...) {}
+        } else if (req.has_header("X-Evidence-Chunk-Size") && !data.contains("evidence_chunk_tokens")) {
+            try { data["evidence_chunk_tokens"] = std::stoi(req.get_header_value("X-Evidence-Chunk-Size")); } catch (...) {}
+        }
+        if (req.has_header("X-Evidence-Top-K") && !data.contains("evidence_top_k")) {
+            try { data["evidence_top_k"] = std::stoi(req.get_header_value("X-Evidence-Top-K")); } catch (...) {}
+        } else if (req.has_header("X-Evidence-Top-M") && !data.contains("evidence_top_k")) {
+            try { data["evidence_top_k"] = std::stoi(req.get_header_value("X-Evidence-Top-M")); } catch (...) {}
+        }
+        if (req.has_header("X-Evidence-Min-Tokens") && !data.contains("evidence_min_tokens")) {
+            try { data["evidence_min_tokens"] = std::stoi(req.get_header_value("X-Evidence-Min-Tokens")); } catch (...) {}
+        }
+        if (req.has_header("X-Evidence-Symbol-Boost") && !data.contains("symbol_boost")) {
+            try { data["symbol_boost"] = std::stof(req.get_header_value("X-Evidence-Symbol-Boost")); } catch (...) {}
+        }
+        if (req.has_header("X-Evidence-Chunk-Expansion") && !data.contains("chunk_expansion")) {
+            try { data["chunk_expansion"] = std::stoi(req.get_header_value("X-Evidence-Chunk-Expansion")); } catch (...) {}
+        }
+        if (req.has_header("X-Evidence-Keep-Head") && !data.contains("unreal_keep_head")) {
+            try { data["unreal_keep_head"] = std::stoi(req.get_header_value("X-Evidence-Keep-Head")); } catch (...) {}
+        }
+        if (req.has_header("X-Evidence-Keep-Tail") && !data.contains("unreal_keep_tail")) {
+            try { data["unreal_keep_tail"] = std::stoi(req.get_header_value("X-Evidence-Keep-Tail")); } catch (...) {}
+        }
+    };
+
+    const auto forward_evidence_fields = [](const json & body, json & data) {
+        if (!body.is_object()) {
+            return;
+        }
+        static const char * const k_ev_fields[] = {
+            "evidence_filter",
+            "evidence_capsule",
+            "evidence_strategy",
+            "strategy",
+            "evidence_chunk_tokens",
+            "chunk_tokens",
+            "chunk_size",
+            "evidence_top_k",
+            "top_m",
+            "evidence_min_tokens",
+            "min_tokens",
+            "evidence_symbol_boost",
+            "symbol_boost",
+            "evidence_chunk_expansion",
+            "chunk_expansion",
+            "maxsim_threshold",
+            "unreal_keep_head",
+            "evidence_keep_head",
+            "keep_head",
+            "unreal_keep_tail",
+            "evidence_keep_tail",
+            "keep_tail",
+            "cohort_id",
+        };
+        for (const char * key : k_ev_fields) {
+            if (body.contains(key) && !data.contains(key)) {
+                data[key] = body[key];
+            }
+        }
+    };
+
+    const auto handle_completions = [&ctx_server, &handle_completions_impl, &inject_request_headers](const httplib::Request & req, httplib::Response & res) {
+        log_prompt(ctx_server.params_base, json::parse(req.body));
+        auto data = json::parse(req.body);
+        inject_request_headers(req, data);
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1361,13 +1505,12 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE);
     };
 
-    const auto handle_completions_oai = [&ctx_server, &handle_completions_impl](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_completions_oai = [&ctx_server, &handle_completions_impl, &inject_request_headers, &forward_evidence_fields](const httplib::Request& req, httplib::Response& res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(body);
-        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
-            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
-        }
+        forward_evidence_fields(body, data);
+        inject_request_headers(req, data);
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1441,14 +1584,13 @@ int main(int argc, char ** argv) {
 
 
 
-    const auto handle_chat_completions = [&ctx_server, &params, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_completions = [&ctx_server, &params, &handle_completions_impl, &inject_request_headers, &forward_evidence_fields](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
-        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
-            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
-        }
+        forward_evidence_fields(body, data);
+        inject_request_headers(req, data);
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -1458,15 +1600,14 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_CHAT);
     };
 
-    const auto handle_responses = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_responses = [&ctx_server, &handle_completions_impl, &inject_request_headers, &forward_evidence_fields](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json body_parsed = server_chat_convert_responses_to_chatcmpl(body);
         json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files);
-        if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
-            data["cohort_id"] = req.get_header_value("X-Cohort-ID");
-        }
+        forward_evidence_fields(body, data);
+        inject_request_headers(req, data);
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -1476,16 +1617,19 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_RESP);
     };
 
-    const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl, &inject_request_headers, &forward_evidence_fields](const httplib::Request & req, httplib::Response & res) {
         std::vector<raw_buffer> files;
-        log_prompt(ctx_server.params_base, json::parse(req.body));
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        auto raw_body = json::parse(req.body);
+        log_prompt(ctx_server.params_base, raw_body);
+        json body = server_chat_convert_anthropic_to_oai(raw_body);
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             ctx_server.chat_params,
             files);
+        forward_evidence_fields(raw_body, body_parsed);
+        inject_request_headers(req, body_parsed);
         return handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,

@@ -2,11 +2,11 @@
   "project": "r-irbe/ctx-capsule",
   "version": "2.0.0",
   "selected_harness": "all (Pi+OpenCode+Claude+Codex+Copilot)",
-  "cli_flags": "--evidence-filter --evidence-strategy code_pinpoint --evidence-chunk-tokens 140 --evidence-top-k 10 --evidence-symbol-boost 3.5 --evidence-chunk-expansion 1 -ctk q8_0 -ctv q8_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram 0 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-experts --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on",
+  "cli_flags": "--no-evidence-filter -ctk q4_0 -ctv q4_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on",
   "http_headers": {
-    "X-Evidence-Filter": "ON",
-    "X-Evidence-Strategy": "code_pinpoint",
-    "X-Evidence-Chunk-Tokens": "140",
+    "X-Evidence-Filter": "OFF",
+    "X-Evidence-Strategy": "adaptive_default",
+    "X-Evidence-Chunk-Tokens": "512",
     "X-Evidence-Top-K": "10",
     "X-Evidence-Symbol-Boost": "3.5",
     "X-Evidence-Chunk-Expansion": "1",
@@ -15,32 +15,38 @@
     "X-Universal-Slab-Arena": "ON",
     "X-Spec-Type": "treegraft",
     "X-Spec-Autotune": "ON",
-    "X-Reasoning-Effort": "high"
+    "X-Reasoning-Effort": "100"
   },
   "request_payload": {
     "temperature": 0.2,
     "top_k": 40,
     "top_p": 0.95,
     "min_p": 0.05,
-    "reasoning_effort": "high",
+    "reasoning_effort": "100",
     "grammar_mode": "json_schema_strict",
+    "evidence_filter": false,
+    "evidence_strategy": "adaptive_default",
+    "evidence_chunk_tokens": 512,
+    "evidence_top_k": 10,
+    "evidence_symbol_boost": 3.5,
+    "evidence_chunk_expansion": 1,
     "evidence_capsule": {
-      "enabled": true,
-      "strategy": "code_pinpoint",
-      "chunk_tokens": 140,
+      "enabled": false,
+      "strategy": "adaptive_default",
+      "chunk_tokens": 512,
       "top_k": 10,
       "symbol_boost": 3.5,
       "chunk_expansion": 1,
       "capsule_filter": "binary_fuse_8bit"
     },
     "kv_paging": {
-      "cache_type_k": "q8_0",
-      "cache_type_v": "q8_0",
+      "cache_type_k": "q4_0",
+      "cache_type_v": "q4_0",
       "zdd_sparse_kv": true,
       "mla_attn": 3,
       "cohort_prefix_sharing": true,
       "cohort_min_prefix": 64,
-      "cache_ram": 0,
+      "cache_ram": -1,
       "universal_slab_arena": true
     },
     "speculative": {
@@ -56,28 +62,28 @@
       "cpu_threads": "16/32",
       "flash_attn": "on",
       "transparent_huge_pages": true,
-      "defer_io_uring": "defer-both",
+      "defer_io_uring": "defer-ple",
       "cuda_l2_persistence": true
     }
   },
   "categories": {
     "evidence": {
-      "evidence_filter": "ON",
-      "evidence_strategy": "code_pinpoint",
-      "evidence_chunk_tokens": 140,
+      "evidence_filter": "OFF",
+      "evidence_strategy": "adaptive_default",
+      "evidence_chunk_tokens": 512,
       "evidence_top_k": 10,
       "evidence_symbol_boost": 3.5,
       "evidence_chunk_expansion": 1,
       "capsule_filter": "binary_fuse_8bit"
     },
     "kv_cache": {
-      "cache_type_k": "q8_0",
-      "cache_type_v": "q8_0",
+      "cache_type_k": "q4_0",
+      "cache_type_v": "q4_0",
       "zdd_sparse_kv": "ON",
       "mla_attn": 3,
       "cohort_prefix_sharing": "ON",
       "cohort_min_prefix": 64,
-      "cache_ram": 0,
+      "cache_ram": -1,
       "universal_slab_arena": "ON"
     },
     "speculative": {
@@ -93,7 +99,7 @@
       "cpu_threads": "16/32",
       "flash_attn": "on",
       "transparent_huge_pages": "ON",
-      "defer_io_uring": "defer-both",
+      "defer_io_uring": "defer-ple",
       "cuda_l2_persistence": "ON"
     },
     "sampling": {
@@ -101,7 +107,7 @@
       "top_k": 40,
       "top_p": 0.95,
       "min_p": 0.05,
-      "reasoning_effort": "high",
+      "reasoning_effort": "100",
       "grammar_json": "json_schema_strict",
       "agent_harness": "all (Pi+OpenCode+Claude+Codex+Copilot)"
     }
@@ -110,11 +116,11 @@
     "pi": {
       "CompactionOverride": "disabled",
       "EvidenceBridge": "ctx-capsule",
-      "cli_flags": "--evidence-filter --evidence-strategy code_pinpoint --evidence-chunk-tokens 140 --evidence-top-k 10 --evidence-symbol-boost 3.5 --evidence-chunk-expansion 1 -ctk q8_0 -ctv q8_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram 0 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-experts --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on",
+      "cli_flags": "--no-evidence-filter -ctk q4_0 -ctv q4_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on",
       "http_headers": {
-        "X-Evidence-Filter": "ON",
-        "X-Evidence-Strategy": "code_pinpoint",
-        "X-Evidence-Chunk-Tokens": "140",
+        "X-Evidence-Filter": "OFF",
+        "X-Evidence-Strategy": "adaptive_default",
+        "X-Evidence-Chunk-Tokens": "512",
         "X-Evidence-Top-K": "10",
         "X-Evidence-Symbol-Boost": "3.5",
         "X-Evidence-Chunk-Expansion": "1",
@@ -123,32 +129,38 @@
         "X-Universal-Slab-Arena": "ON",
         "X-Spec-Type": "treegraft",
         "X-Spec-Autotune": "ON",
-        "X-Reasoning-Effort": "high"
+        "X-Reasoning-Effort": "100"
       },
       "request_defaults": {
         "temperature": 0.2,
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -164,16 +176,16 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
     },
     "opencode": {
       "provider_headers": {
-        "X-Evidence-Filter": "ON",
-        "X-Evidence-Strategy": "code_pinpoint",
-        "X-Evidence-Chunk-Tokens": "140",
+        "X-Evidence-Filter": "OFF",
+        "X-Evidence-Strategy": "adaptive_default",
+        "X-Evidence-Chunk-Tokens": "512",
         "X-Evidence-Top-K": "10",
         "X-Evidence-Symbol-Boost": "3.5",
         "X-Evidence-Chunk-Expansion": "1",
@@ -182,7 +194,7 @@
         "X-Universal-Slab-Arena": "ON",
         "X-Spec-Type": "treegraft",
         "X-Spec-Autotune": "ON",
-        "X-Reasoning-Effort": "high"
+        "X-Reasoning-Effort": "100"
       },
       "disable_auto_compact": true,
       "llama_cpp_options": {
@@ -190,25 +202,31 @@
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -224,22 +242,22 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
     },
     "claude_code": {
       "env": {
-        "ANTHROPIC_CUSTOM_HEADERS": "{\"X-Evidence-Filter\": \"ON\", \"X-Evidence-Strategy\": \"code_pinpoint\", \"X-Evidence-Chunk-Tokens\": \"140\", \"X-Evidence-Top-K\": \"10\", \"X-Evidence-Symbol-Boost\": \"3.5\", \"X-Evidence-Chunk-Expansion\": \"1\", \"X-Capsule-Filter\": \"binary_fuse_8bit\", \"X-ZDD-Sparse-KV\": \"ON\", \"X-Universal-Slab-Arena\": \"ON\", \"X-Spec-Type\": \"treegraft\", \"X-Spec-Autotune\": \"ON\", \"X-Reasoning-Effort\": \"high\"}",
-        "CTX_CAPSULE_CLI_FLAGS": "--evidence-filter --evidence-strategy code_pinpoint --evidence-chunk-tokens 140 --evidence-top-k 10 --evidence-symbol-boost 3.5 --evidence-chunk-expansion 1 -ctk q8_0 -ctv q8_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram 0 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-experts --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on"
+        "ANTHROPIC_CUSTOM_HEADERS": "{\"X-Evidence-Filter\": \"OFF\", \"X-Evidence-Strategy\": \"adaptive_default\", \"X-Evidence-Chunk-Tokens\": \"512\", \"X-Evidence-Top-K\": \"10\", \"X-Evidence-Symbol-Boost\": \"3.5\", \"X-Evidence-Chunk-Expansion\": \"1\", \"X-Capsule-Filter\": \"binary_fuse_8bit\", \"X-ZDD-Sparse-KV\": \"ON\", \"X-Universal-Slab-Arena\": \"ON\", \"X-Spec-Type\": \"treegraft\", \"X-Spec-Autotune\": \"ON\", \"X-Reasoning-Effort\": \"100\"}",
+        "CTX_CAPSULE_CLI_FLAGS": "--no-evidence-filter -ctk q4_0 -ctv q4_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on"
       }
     },
     "codex_cli": {
       "model_provider_headers": {
-        "X-Evidence-Filter": "ON",
-        "X-Evidence-Strategy": "code_pinpoint",
-        "X-Evidence-Chunk-Tokens": "140",
+        "X-Evidence-Filter": "OFF",
+        "X-Evidence-Strategy": "adaptive_default",
+        "X-Evidence-Chunk-Tokens": "512",
         "X-Evidence-Top-K": "10",
         "X-Evidence-Symbol-Boost": "3.5",
         "X-Evidence-Chunk-Expansion": "1",
@@ -248,32 +266,38 @@
         "X-Universal-Slab-Arena": "ON",
         "X-Spec-Type": "treegraft",
         "X-Spec-Autotune": "ON",
-        "X-Reasoning-Effort": "high"
+        "X-Reasoning-Effort": "100"
       },
       "model_parameters": {
         "temperature": 0.2,
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -289,27 +313,27 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
     },
     "github_copilot": {
       "chat.advanced.contextCapsule": {
-        "evidence_filter": "ON",
-        "evidence_strategy": "code_pinpoint",
-        "evidence_chunk_tokens": 140,
+        "evidence_filter": "OFF",
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
         "evidence_top_k": 10,
         "evidence_symbol_boost": 3.5,
         "evidence_chunk_expansion": 1,
         "capsule_filter": "binary_fuse_8bit",
-        "cache_type_k": "q8_0",
-        "cache_type_v": "q8_0",
+        "cache_type_k": "q4_0",
+        "cache_type_v": "q4_0",
         "zdd_sparse_kv": "ON",
         "mla_attn": 3,
         "cohort_prefix_sharing": "ON",
         "cohort_min_prefix": 64,
-        "cache_ram": 0,
+        "cache_ram": -1,
         "universal_slab_arena": "ON",
         "spec_type": "treegraft",
         "spec_autotune": "ON",
@@ -321,13 +345,13 @@
         "cpu_threads": "16/32",
         "flash_attn": "on",
         "transparent_huge_pages": "ON",
-        "defer_io_uring": "defer-both",
+        "defer_io_uring": "defer-ple",
         "cuda_l2_persistence": "ON",
         "temp": 0.2,
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_json": "json_schema_strict",
         "agent_harness": "all (Pi+OpenCode+Claude+Codex+Copilot)"
       },
@@ -336,25 +360,31 @@
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -370,7 +400,7 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
@@ -380,11 +410,11 @@
     "pi": {
       "CompactionOverride": "disabled",
       "EvidenceBridge": "ctx-capsule",
-      "cli_flags": "--evidence-filter --evidence-strategy code_pinpoint --evidence-chunk-tokens 140 --evidence-top-k 10 --evidence-symbol-boost 3.5 --evidence-chunk-expansion 1 -ctk q8_0 -ctv q8_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram 0 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-experts --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on",
+      "cli_flags": "--no-evidence-filter -ctk q4_0 -ctv q4_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on",
       "http_headers": {
-        "X-Evidence-Filter": "ON",
-        "X-Evidence-Strategy": "code_pinpoint",
-        "X-Evidence-Chunk-Tokens": "140",
+        "X-Evidence-Filter": "OFF",
+        "X-Evidence-Strategy": "adaptive_default",
+        "X-Evidence-Chunk-Tokens": "512",
         "X-Evidence-Top-K": "10",
         "X-Evidence-Symbol-Boost": "3.5",
         "X-Evidence-Chunk-Expansion": "1",
@@ -393,32 +423,38 @@
         "X-Universal-Slab-Arena": "ON",
         "X-Spec-Type": "treegraft",
         "X-Spec-Autotune": "ON",
-        "X-Reasoning-Effort": "high"
+        "X-Reasoning-Effort": "100"
       },
       "request_defaults": {
         "temperature": 0.2,
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -434,16 +470,16 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
     },
     "opencode": {
       "provider_headers": {
-        "X-Evidence-Filter": "ON",
-        "X-Evidence-Strategy": "code_pinpoint",
-        "X-Evidence-Chunk-Tokens": "140",
+        "X-Evidence-Filter": "OFF",
+        "X-Evidence-Strategy": "adaptive_default",
+        "X-Evidence-Chunk-Tokens": "512",
         "X-Evidence-Top-K": "10",
         "X-Evidence-Symbol-Boost": "3.5",
         "X-Evidence-Chunk-Expansion": "1",
@@ -452,7 +488,7 @@
         "X-Universal-Slab-Arena": "ON",
         "X-Spec-Type": "treegraft",
         "X-Spec-Autotune": "ON",
-        "X-Reasoning-Effort": "high"
+        "X-Reasoning-Effort": "100"
       },
       "disable_auto_compact": true,
       "llama_cpp_options": {
@@ -460,25 +496,31 @@
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -494,22 +536,22 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
     },
     "claude_code": {
       "env": {
-        "ANTHROPIC_CUSTOM_HEADERS": "{\"X-Evidence-Filter\": \"ON\", \"X-Evidence-Strategy\": \"code_pinpoint\", \"X-Evidence-Chunk-Tokens\": \"140\", \"X-Evidence-Top-K\": \"10\", \"X-Evidence-Symbol-Boost\": \"3.5\", \"X-Evidence-Chunk-Expansion\": \"1\", \"X-Capsule-Filter\": \"binary_fuse_8bit\", \"X-ZDD-Sparse-KV\": \"ON\", \"X-Universal-Slab-Arena\": \"ON\", \"X-Spec-Type\": \"treegraft\", \"X-Spec-Autotune\": \"ON\", \"X-Reasoning-Effort\": \"high\"}",
-        "CTX_CAPSULE_CLI_FLAGS": "--evidence-filter --evidence-strategy code_pinpoint --evidence-chunk-tokens 140 --evidence-top-k 10 --evidence-symbol-boost 3.5 --evidence-chunk-expansion 1 -ctk q8_0 -ctv q8_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram 0 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-experts --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on"
+        "ANTHROPIC_CUSTOM_HEADERS": "{\"X-Evidence-Filter\": \"OFF\", \"X-Evidence-Strategy\": \"adaptive_default\", \"X-Evidence-Chunk-Tokens\": \"512\", \"X-Evidence-Top-K\": \"10\", \"X-Evidence-Symbol-Boost\": \"3.5\", \"X-Evidence-Chunk-Expansion\": \"1\", \"X-Capsule-Filter\": \"binary_fuse_8bit\", \"X-ZDD-Sparse-KV\": \"ON\", \"X-Universal-Slab-Arena\": \"ON\", \"X-Spec-Type\": \"treegraft\", \"X-Spec-Autotune\": \"ON\", \"X-Reasoning-Effort\": \"100\"}",
+        "CTX_CAPSULE_CLI_FLAGS": "--no-evidence-filter -ctk q4_0 -ctv q4_0 --zdd-sparse-kv -mla 3 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-type mtp:n_max=8,p_min=0.0 --spec-autotune --numa expert --numa-replicate-shared -t 16 -tb 32 -fa on --transparent-huge-pages --defer-ple --temp 0.2 --top-k 40 --top-p 0.95 --min-p 0.05 --reasoning on"
       }
     },
     "codex_cli": {
       "model_provider_headers": {
-        "X-Evidence-Filter": "ON",
-        "X-Evidence-Strategy": "code_pinpoint",
-        "X-Evidence-Chunk-Tokens": "140",
+        "X-Evidence-Filter": "OFF",
+        "X-Evidence-Strategy": "adaptive_default",
+        "X-Evidence-Chunk-Tokens": "512",
         "X-Evidence-Top-K": "10",
         "X-Evidence-Symbol-Boost": "3.5",
         "X-Evidence-Chunk-Expansion": "1",
@@ -518,32 +560,38 @@
         "X-Universal-Slab-Arena": "ON",
         "X-Spec-Type": "treegraft",
         "X-Spec-Autotune": "ON",
-        "X-Reasoning-Effort": "high"
+        "X-Reasoning-Effort": "100"
       },
       "model_parameters": {
         "temperature": 0.2,
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -559,27 +607,27 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }
     },
     "github_copilot": {
       "chat.advanced.contextCapsule": {
-        "evidence_filter": "ON",
-        "evidence_strategy": "code_pinpoint",
-        "evidence_chunk_tokens": 140,
+        "evidence_filter": "OFF",
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
         "evidence_top_k": 10,
         "evidence_symbol_boost": 3.5,
         "evidence_chunk_expansion": 1,
         "capsule_filter": "binary_fuse_8bit",
-        "cache_type_k": "q8_0",
-        "cache_type_v": "q8_0",
+        "cache_type_k": "q4_0",
+        "cache_type_v": "q4_0",
         "zdd_sparse_kv": "ON",
         "mla_attn": 3,
         "cohort_prefix_sharing": "ON",
         "cohort_min_prefix": 64,
-        "cache_ram": 0,
+        "cache_ram": -1,
         "universal_slab_arena": "ON",
         "spec_type": "treegraft",
         "spec_autotune": "ON",
@@ -591,13 +639,13 @@
         "cpu_threads": "16/32",
         "flash_attn": "on",
         "transparent_huge_pages": "ON",
-        "defer_io_uring": "defer-both",
+        "defer_io_uring": "defer-ple",
         "cuda_l2_persistence": "ON",
         "temp": 0.2,
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_json": "json_schema_strict",
         "agent_harness": "all (Pi+OpenCode+Claude+Codex+Copilot)"
       },
@@ -606,25 +654,31 @@
         "top_k": 40,
         "top_p": 0.95,
         "min_p": 0.05,
-        "reasoning_effort": "high",
+        "reasoning_effort": "100",
         "grammar_mode": "json_schema_strict",
+        "evidence_filter": false,
+        "evidence_strategy": "adaptive_default",
+        "evidence_chunk_tokens": 512,
+        "evidence_top_k": 10,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
         "evidence_capsule": {
-          "enabled": true,
-          "strategy": "code_pinpoint",
-          "chunk_tokens": 140,
+          "enabled": false,
+          "strategy": "adaptive_default",
+          "chunk_tokens": 512,
           "top_k": 10,
           "symbol_boost": 3.5,
           "chunk_expansion": 1,
           "capsule_filter": "binary_fuse_8bit"
         },
         "kv_paging": {
-          "cache_type_k": "q8_0",
-          "cache_type_v": "q8_0",
+          "cache_type_k": "q4_0",
+          "cache_type_v": "q4_0",
           "zdd_sparse_kv": true,
           "mla_attn": 3,
           "cohort_prefix_sharing": true,
           "cohort_min_prefix": 64,
-          "cache_ram": 0,
+          "cache_ram": -1,
           "universal_slab_arena": true
         },
         "speculative": {
@@ -640,7 +694,7 @@
           "cpu_threads": "16/32",
           "flash_attn": "on",
           "transparent_huge_pages": true,
-          "defer_io_uring": "defer-both",
+          "defer_io_uring": "defer-ple",
           "cuda_l2_persistence": true
         }
       }

@@ -288,9 +288,39 @@ def test_cli_flags_and_http_payload_combinations():
 
     headers, payload = tui.build_http_headers_and_payload()
     assert headers["X-Evidence-Filter"] == "OFF"
+    assert payload["evidence_filter"] is False
     assert payload["evidence_capsule"]["enabled"] is False
     assert payload["kv_paging"]["zdd_sparse_kv"] is False
     assert payload["speculative"]["spec_type"] == "dflash"
+
+    # Test DeepSeek-V4.1-Flash-1017 presets and DSpark + ngram-mod flags
+    for ds_preset in [
+        "ds41-1017-np1-512k-max-speed",
+        "ds41-1017-np1-1m-extreme",
+        "ds41-1017-np4-512k-swarm",
+        "ds41-1017-np8-1m-swarm",
+    ]:
+        tui.apply_preset(ds_preset)
+        ds_flags = tui.build_cli_flags()
+        assert "--spec-type ngram-mod:n_max=6,n_min=2" in ds_flags
+        # Two-stage chains require a self-spec stage first (ngram-mod); the
+        # dflash-family dspark neural stage is a valid second stage and the
+        # -md drafter supplies its weights.
+        assert "--spec-type dspark:n_max=6,n_min=1" in ds_flags
+        assert "--spec-ckpt-mode per-step" in ds_flags
+        assert "-mla 2" in ds_flags
+        assert "--evidence-top-k 16" in ds_flags
+        assert "--defer-ple" in ds_flags and "--defer-experts" not in ds_flags
+        if ds_preset == "ds41-1017-np1-512k-max-speed":
+            assert "-ctk q8_0" in ds_flags and "-ctv q8_0" in ds_flags
+        else:
+            assert "-ctk q4_0" in ds_flags and "-ctv q4_0" in ds_flags
+        _, ds_payload = tui.build_http_headers_and_payload()
+        assert ds_payload["evidence_filter"] is True
+        assert ds_payload["evidence_strategy"] == "code_pinpoint"
+        assert ds_payload["evidence_top_k"] == 16
+        assert ds_payload["evidence_capsule"]["enabled"] is True
+
     tui.reset_defaults()
 
 
@@ -599,5 +629,196 @@ def test_pto_profile_runner_and_ctx_capsule_ts_integration():
         text=True,
         check=False,
     )
+
+
+def test_live_http_server_evidence_handshake_chat_and_completions():
+    """Verify live HTTP /v1/chat/completions and /v1/completions evidence_capsule & X-Evidence-* forwarding without top_k collision."""
+    import http.client
+    import time
+    import numpy as np
+
+    server_bin = REPO_ROOT / "build-pto" / "bin" / "llama-server"
+    vocab_gguf = REPO_ROOT / "models" / "ggml-vocab-gpt-2.gguf"
+    if not server_bin.exists() or not vocab_gguf.exists():
+        pytest.skip("llama-server or ggml-vocab-gpt-2.gguf not available")
+
+    sys.path.insert(0, str(REPO_ROOT / "gguf-py"))
+    import gguf
+
+    with tempfile.TemporaryDirectory(prefix="ev_http_test_") as tmpdir:
+        model_path = Path(tmpdir) / "tiny_gpt2.gguf"
+        reader = gguf.GGUFReader(str(vocab_gguf))
+        writer = gguf.GGUFWriter(str(model_path), "llama")
+        writer.add_uint32("llama.context_length", 4096)
+        writer.add_uint32("llama.embedding_length", 64)
+        writer.add_uint32("llama.block_count", 1)
+        writer.add_uint32("llama.feed_forward_length", 128)
+        writer.add_uint32("llama.attention.head_count", 2)
+        writer.add_uint32("llama.attention.head_count_kv", 2)
+        writer.add_float32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+        writer.add_string(
+            "tokenizer.chat_template",
+            "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}assistant: ",
+        )
+
+        for key, field in reader.fields.items():
+            if key.startswith("tokenizer."):
+                val_type = field.types[0]
+                if val_type == gguf.GGUFValueType.STRING:
+                    s = bytes(field.parts[field.data[0]]).decode("utf-8")
+                    writer.add_string(key, s)
+                elif val_type == gguf.GGUFValueType.UINT32:
+                    writer.add_uint32(key, int(field.parts[field.data[0]][0]))
+                elif val_type == gguf.GGUFValueType.ARRAY:
+                    sub_type = field.types[1]
+                    if sub_type == gguf.GGUFValueType.STRING:
+                        arr = [bytes(field.parts[idx]).decode("utf-8", errors="replace") for idx in field.data]
+                        writer.add_array(key, arr)
+                    elif sub_type == gguf.GGUFValueType.INT32:
+                        arr = [int(field.parts[idx][0]) for idx in field.data]
+                        writer.add_array(key, arr)
+                    elif sub_type == gguf.GGUFValueType.FLOAT32:
+                        arr = [float(field.parts[idx][0]) for idx in field.data]
+                        writer.add_array(key, arr)
+
+        n_vocab = len(reader.fields["tokenizer.ggml.tokens"].data)
+        n_embd = 64
+        n_ff = 128
+        rng = np.random.default_rng(42)
+        writer.add_tensor("token_embd.weight", (rng.standard_normal((n_vocab, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("output_norm.weight", np.ones((n_embd,), dtype=np.float32))
+        writer.add_tensor("output.weight", (rng.standard_normal((n_vocab, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.attn_norm.weight", np.ones((n_embd,), dtype=np.float32))
+        writer.add_tensor("blk.0.attn_q.weight", (rng.standard_normal((n_embd, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.attn_k.weight", (rng.standard_normal((n_embd, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.attn_v.weight", (rng.standard_normal((n_embd, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.attn_output.weight", (rng.standard_normal((n_embd, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.ffn_norm.weight", np.ones((n_embd,), dtype=np.float32))
+        writer.add_tensor("blk.0.ffn_gate.weight", (rng.standard_normal((n_ff, n_embd)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.ffn_down.weight", (rng.standard_normal((n_embd, n_ff)) * 0.02).astype(np.float32))
+        writer.add_tensor("blk.0.ffn_up.weight", (rng.standard_normal((n_ff, n_embd)) * 0.02).astype(np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+        port = 18599
+        srv = subprocess.Popen(
+            [
+                str(server_bin),
+                "-m",
+                str(model_path),
+                "--port",
+                str(port),
+                "-c",
+                "2048",
+                "-np",
+                "1",
+                "-ngl",
+                "0",
+                "--jinja",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(40):
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                    conn.request("GET", "/health")
+                    resp = conn.getresponse()
+                    resp.read()
+                    conn.close()
+                    if resp.status == 200:
+                        break
+                except Exception:
+                    time.sleep(0.25)
+            else:
+                pytest.fail("llama-server did not become healthy")
+
+            haystack = " ".join(
+                [f"Section {i}: alpha beta gamma delta epsilon zeta eta theta." for i in range(60)]
+            )
+            messages = [
+                {"role": "system", "content": "You are a precise code analysis assistant."},
+                {"role": "user", "content": haystack + "\nQuestion: What is in Section 42?"},
+            ]
+
+            # 1. /v1/chat/completions with JSON body evidence_capsule + top_k=40 (sampling top_k) + evidence_top_k=2
+            payload1 = {
+                "model": "test",
+                "messages": messages,
+                "max_tokens": 4,
+                "top_k": 40,
+                "evidence_top_k": 2,
+                "evidence_capsule": {
+                    "enabled": True,
+                    "strategy": "code_pinpoint",
+                    "chunk_tokens": 32,
+                    "top_k": 2,
+                    "min_tokens": 64,
+                    "keep_head": 16,
+                    "keep_tail": 32,
+                },
+            }
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(payload1),
+                headers={"Content-Type": "application/json"},
+            )
+            resp1 = conn.getresponse()
+            hdrs1 = dict(resp1.getheaders())
+            body1 = json.loads(resp1.read().decode("utf-8"))
+            conn.close()
+
+            assert hdrs1.get("X-Evidence-Filter-Applied") == "true"
+            assert int(hdrs1.get("X-Evidence-Tokens-Before", "0")) > int(hdrs1.get("X-Evidence-Tokens-After", "0"))
+            assert int(hdrs1.get("X-Evidence-Chunks-Kept", "0")) == 2
+            assert hdrs1.get("X-Evidence-Strategy") == "code_pinpoint"
+            assert body1["evidence_telemetry"]["active"] is True
+            assert body1["evidence_telemetry"]["chunks_kept"] == 2
+            assert body1["evidence_telemetry"]["keep_head"] == 16
+            assert body1["evidence_telemetry"]["keep_tail"] == 32
+
+            # 2. /v1/chat/completions with X-Evidence-* headers (including X-Evidence-Top-M & X-Evidence-Chunk-Size) and top_k=40
+            payload2 = {
+                "model": "test",
+                "messages": messages,
+                "max_tokens": 4,
+                "top_k": 40,
+            }
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(payload2),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Evidence-Filter": "true",
+                    "X-Evidence-Strategy": "maxsim_exact_cover",
+                    "X-Evidence-Chunk-Size": "32",
+                    "X-Evidence-Top-M": "3",
+                    "X-Evidence-Min-Tokens": "64",
+                    "X-Evidence-Keep-Head": "20",
+                    "X-Evidence-Keep-Tail": "28",
+                },
+            )
+            resp2 = conn.getresponse()
+            hdrs2 = dict(resp2.getheaders())
+            body2 = json.loads(resp2.read().decode("utf-8"))
+            conn.close()
+
+            assert hdrs2.get("X-Evidence-Filter-Applied") == "true"
+            assert int(hdrs2.get("X-Evidence-Chunks-Kept", "0")) == 3
+            assert hdrs2.get("X-Evidence-Strategy") == "maxsim_exact_cover"
+            assert body2["evidence_telemetry"]["chunks_kept"] == 3
+            assert body2["evidence_telemetry"]["keep_head"] == 20
+            assert body2["evidence_telemetry"]["keep_tail"] == 28
+        finally:
+            srv.terminate()
+            srv.wait(timeout=5)
+
 
 

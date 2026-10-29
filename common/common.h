@@ -541,7 +541,7 @@ struct gpt_params {
     int32_t timeout_read   = 600;          // http read timeout in seconds
     int32_t timeout_write  = timeout_read; // http write timeout in seconds
     int32_t n_threads_http = -1;           // number of threads to process HTTP requests
-    bool    send_done      = false;        // send done message as required for OAI compatibility
+    bool    send_done      = false;        // additionally emit the OAI "data: [DONE]" terminator on stream flavors that omit it by default (anthropic/none/resp); wired into the streaming done path 2026-10-28
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";
@@ -608,7 +608,9 @@ struct gpt_params {
     float   unreal_symbol_boost     = 1.5f;  // identifier / symbol lexical boost weight
     int32_t unreal_chunk_expansion  = 0;     // radius of contiguous neighbour chunks to expand around top hits
     float   unreal_maxsim_threshold = -1.0f; // minimum MaxSim threshold (-1.0f = disabled)
-    std::string unreal_symbol_regex = "";    // custom regex pattern for symbol boost matching
+    std::string unreal_symbol_regex = "";    // custom regex pattern for symbol boost matching (matched against detokenized chunk text; wired 2026-10-28)
+    int32_t unreal_keep_head        = 0;     // explicit head prefix tokens to preserve (0 = auto)
+    int32_t unreal_keep_tail        = 0;     // explicit tail query tokens to preserve (0 = auto)
 
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot

@@ -331,8 +331,13 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
             return fail("two-stage speculative mode currently requires a self-spec stage first");
         }
 
-        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT) {
-            return fail("two-stage speculative mode currently supports only MTP or draft-model fallback after self-spec");
+        // dflash-family stages (dspark/dflash) are also valid neural second
+        // stages: the composite init wires target IO sharing for any chain
+        // containing a dflash-family stage (speculative.cpp has_dflash_stage),
+        // and the TreeGraft arbiter fuses the lexical + neural branches.
+        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT &&
+                !common_speculative_type_is_dflash_family(second)) {
+            return fail("two-stage speculative mode currently supports only MTP, draft-model fallback, or a dflash-family stage after self-spec");
         }
     }
 
@@ -3174,6 +3179,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.unreal_chunk_vectors = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--evidence-keep-head" || arg == "--unreal-keep-head") {
+        CHECK_ARG
+        params.unreal_keep_head = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--evidence-keep-tail" || arg == "--unreal-keep-tail") {
+        CHECK_ARG
+        params.unreal_keep_tail = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--context-file") {
         CHECK_ARG
         std::ifstream file(argv[i], std::ios::binary);
@@ -3720,12 +3735,17 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
     options.push_back({ "*",           "       --fit",                  "automatically determine which tensors to offload to the GPU(s)"});
     options.push_back({ "*",           "       --numa TYPE",            "attempt optimizations that help on some NUMA systems\n"
-                                                                        "  - distribute: spread execution evenly over all nodes\n"
-                                                                        "  - split: documented alias of distribute (identical strategy)\n"
+                                                                        "  - distribute: spread execution evenly over all nodes (thread-block binding only; no page migration)\n"
+                                                                        "  - split: alias of distribute (identical strategy, kept for older launch scripts)\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
-                                                                        "  - expert: bind routed MoE expert tensors across NUMA nodes\n"
-                                                                        "  - mirror: pin worker threads across NUMA nodes for mirrored execution\n"
+                                                                        "  - expert: thread-block binding + mbind(MPOL_BIND,MPOL_MF_MOVE) round-robin rebind of routed\n"
+                                                                        "    MoE expert tensor pages across nodes (requires movable, i.e. unpinned, host pages)\n"
+                                                                        "  - mirror: thread-block binding as distribute; with GGML_NUMA_REPLICATE_SHARED=1 also replicates\n"
+                                                                        "    shared-expert tensors per node (replicas are fresh normal memory; only the base pages matter)\n"
+                                                                        "note: under expert (or mirror+replicate) CUDA host pinning is auto-disabled, because\n"
+                                                                        "page-locked pages cannot be migrated by mbind(MPOL_MF_MOVE) or compacted into THP;\n"
+                                                                        "set GGML_CUDA_PINNED_FORCE=1 to keep pinning when the GPU actively streams those buffers\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
 
@@ -3798,6 +3818,26 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*", "--spec-verify-pinned",     "pad speculative verify batches to n_max+1 rows for a single-CUDA-graph decode (PolyGraph)" });
     options.push_back({ "*", "--spec-c-knee F",          "active-stream threshold that throttles speculation to target-only (Concurrent Knee; 0 disables, default 8)" });
 
+    options.push_back({ "evidence" });
+    options.push_back({ "evidence", "  -ef,  --evidence-filter",        "enable X-Evidence retrieval-filtered context injection (default: disabled)" });
+    options.push_back({ "evidence", "       --evidence-strategy STR",   "evidence scoring strategy (adaptive_default, code_pinpoint, maxsim_exact_cover, ...; default: adaptive_default)" });
+    options.push_back({ "evidence", "  -ect, --evidence-chunk-tokens N", "tokens per evidence chunk T (default: %d)", params.unreal_chunk_size });
+    options.push_back({ "evidence", "  -etk, --evidence-top-k N",      "max evidence chunks injected per turn (default: %d)", params.unreal_top_n });
+    options.push_back({ "evidence", "       --evidence-symbol-boost F", "lexical symbol overlap boost weight (default: %.1f)", (double)params.unreal_symbol_boost });
+    options.push_back({ "evidence", "       --evidence-chunk-expansion N", "neighbor chunk expansion radius (default: %d)", params.unreal_chunk_expansion });
+    options.push_back({ "evidence", "       --evidence-maxsim-threshold F", "minimum MaxSim gate (-1 disables, default)" });
+    options.push_back({ "evidence", "       --evidence-symbol-regex RE", "detokenized-text symbol regex; query matches boost chunks containing them (scoring-level, wired 2026-10-28)" });
+    options.push_back({ "evidence", "       --evidence-min-tokens N",  "minimum prompt tokens to activate filtering (default: %d)", params.unreal_min_tokens });
+    options.push_back({ "evidence", "       --evidence-query-groups N", "pooled query token groups G (default: %d)", params.unreal_query_groups });
+    options.push_back({ "evidence", "       --evidence-chunk-vectors N", "pooled vectors per chunk Lp (default: %d)", params.unreal_chunk_vectors });
+
+    options.push_back({ "kv-sparse" });
+    options.push_back({ "kv-sparse", "       --zdd-sparse-kv",          "ZDD-based sparse KV block indexing (drop dormant blocks)" });
+    options.push_back({ "kv-sparse", "       --cohort-prefix-sharing",  "share KV slabs across slots with identical prefixes" });
+    options.push_back({ "kv-sparse", "       --cohort-min-prefix N",    "minimum shared prefix tokens for cohort grouping (default: %d)", params.cohort_min_prefix });
+    options.push_back({ "kv-sparse", "       --cohort-max-idle-sec S",  "idle seconds before a slot cache is evicted (default: %d)", params.cohort_max_idle_sec });
+    options.push_back({ "server",      "       --send-done",          "additionally emit the OAI 'data: [DONE]' terminator on stream flavors that omit it by default (anthropic/none/resp)" });
+
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });
     options.push_back({ "retrieval",   "       --chunk-size N",         "minimum length of embedded text chunks (default: %d)", params.chunk_size });
@@ -3863,7 +3903,6 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "-sps,  --slot-prompt-similarity SIMILARITY",
                                                                         "how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity });
     options.push_back({ "server",      "       --lora-init-without-apply",     "load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"});
-    options.push_back({ "server",      "       --send-done",                 "send 'done' signal to the client when generation is complete" });
     options.push_back({ "server",      "       --sql-save-file FNAME",       "save chat history to a SQLite database" });
     options.push_back({ "server",      "       --sqlite-zstd-ext-file FNAME",     "path to SQLite ZSTD extension for compression" });
 

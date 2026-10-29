@@ -440,7 +440,7 @@ TABS: List[Dict[str, Any]] = [
             {
                 "key": "spec_type",
                 "label": "Speculative Stage (--spec-type)",
-                "values": ["treegraft", "mtp", "ngram-map-k4v", "dflash", "none"],
+                "values": ["treegraft", "mtp", "ngram-map-k4v", "dflash", "dspark", "none"],
                 "idx": 0,
                 "badge": "[OPTIMAL: HYBRID TREEGRAFT FUSION]",
                 "badges": {
@@ -448,6 +448,7 @@ TABS: List[Dict[str, Any]] = [
                     "mtp": "[FAST: ZERO-OVERHEAD MTP HEAD]",
                     "ngram-map-k4v": "[IDEAL FOR CODE REPETITION]",
                     "dflash": "[HIGH ACCEPTANCE: BLOCK DIFFUSION]",
+                    "dspark": "[OPTIMAL: DSPARK + NGRAM-MOD]",
                     "none": "[BASELINE: TARGET-ONLY DECODE]",
                 },
                 "ascii": [
@@ -959,6 +960,114 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "evidence_chunk_expansion": 2,
         "reasoning_effort": "100",
     },
+    "ds41-1017-np1-512k-max-speed": {
+        "evidence_filter": "ON",
+        "evidence_strategy": "code_pinpoint",
+        "evidence_chunk_tokens": 140,
+        "evidence_top_k": 16,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "zdd_sparse_kv": "ON",
+        "mla_attn": 2,
+        "cohort_prefix_sharing": "ON",
+        "cohort_min_prefix": 64,
+        "cache_ram": 0,
+        "spec_type": "dspark",
+        "spec_autotune": "ON",
+        "draft_max": 8,
+        "draft_min": 2,
+        "numa_strategy": "distribute",
+        "numa_replicate_shared": "ON",
+        "cpu_threads": "64/64",
+        "flash_attn": "on",
+        "transparent_huge_pages": "ON",
+        "defer_io_uring": "defer-ple",
+        "temp": 0.6,
+        "reasoning_effort": "high",
+    },
+    "ds41-1017-np1-1m-extreme": {
+        "evidence_filter": "ON",
+        "evidence_strategy": "code_pinpoint",
+        "evidence_chunk_tokens": 140,
+        "evidence_top_k": 16,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
+        "cache_type_k": "q4_0",
+        "cache_type_v": "q4_0",
+        "zdd_sparse_kv": "ON",
+        "mla_attn": 2,
+        "cohort_prefix_sharing": "ON",
+        "cohort_min_prefix": 64,
+        "cache_ram": 0,
+        "spec_type": "dspark",
+        "spec_autotune": "ON",
+        "draft_max": 8,
+        "draft_min": 2,
+        "numa_strategy": "distribute",
+        "numa_replicate_shared": "ON",
+        "cpu_threads": "64/64",
+        "flash_attn": "on",
+        "transparent_huge_pages": "ON",
+        "defer_io_uring": "defer-ple",
+        "temp": 0.6,
+        "reasoning_effort": "high",
+    },
+    "ds41-1017-np4-512k-swarm": {
+        "evidence_filter": "ON",
+        "evidence_strategy": "code_pinpoint",
+        "evidence_chunk_tokens": 140,
+        "evidence_top_k": 16,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
+        "cache_type_k": "q4_0",
+        "cache_type_v": "q4_0",
+        "zdd_sparse_kv": "ON",
+        "mla_attn": 2,
+        "cohort_prefix_sharing": "ON",
+        "cohort_min_prefix": 64,
+        "cache_ram": 0,
+        "spec_type": "dspark",
+        "spec_autotune": "ON",
+        "draft_max": 8,
+        "draft_min": 2,
+        "numa_strategy": "distribute",
+        "numa_replicate_shared": "ON",
+        "cpu_threads": "64/64",
+        "flash_attn": "on",
+        "transparent_huge_pages": "ON",
+        "defer_io_uring": "defer-ple",
+        "temp": 0.6,
+        "reasoning_effort": "medium",
+    },
+    "ds41-1017-np8-1m-swarm": {
+        "evidence_filter": "ON",
+        "evidence_strategy": "code_pinpoint",
+        "evidence_chunk_tokens": 140,
+        "evidence_top_k": 16,
+        "evidence_symbol_boost": 3.5,
+        "evidence_chunk_expansion": 1,
+        "cache_type_k": "q4_0",
+        "cache_type_v": "q4_0",
+        "zdd_sparse_kv": "ON",
+        "mla_attn": 2,
+        "cohort_prefix_sharing": "ON",
+        "cohort_min_prefix": 64,
+        "cache_ram": 0,
+        "spec_type": "dspark",
+        "spec_autotune": "ON",
+        "draft_max": 8,
+        "draft_min": 2,
+        "numa_strategy": "distribute",
+        "numa_replicate_shared": "ON",
+        "cpu_threads": "64/64",
+        "flash_attn": "on",
+        "transparent_huge_pages": "ON",
+        "defer_io_uring": "defer-ple",
+        "temp": 0.6,
+        "reasoning_effort": "medium",
+    },
 }
 
 
@@ -1045,6 +1154,15 @@ def build_cli_flags() -> str:
             flags.append(f"--spec-type ngram-map-k4v:n_max={n_max},n_min={n_min}")
         elif spec_type == "dflash":
             flags.append(f"--spec-type dflash:n_max={n_max}")
+        elif spec_type == "dspark":
+            # Draft-model stages cannot follow another stage in a two-stage
+            # chain (common.cpp: second stage must be mtp or draft); emit the
+            # parser-valid decomposition: self-spec ngram-mod first, plain
+            # draft stage second (the -md dspark drafter is supplied by the
+            # model's launch command).
+            flags.append(f"--spec-type ngram-mod:n_max=6,n_min={n_min}")
+            flags.append("--spec-type dspark:n_max=6,n_min=1")
+            flags.append("--spec-ckpt-mode per-step")
     if cfg["spec_autotune"] == "ON":
         flags.append("--spec-autotune")
 
@@ -1083,6 +1201,16 @@ def build_cli_flags() -> str:
 
 def build_http_headers_and_payload() -> Tuple[Dict[str, str], Dict[str, Any]]:
     cfg = get_config_dict()
+    # Honesty note (2026-10-28): the server honors X-Evidence-Filter and the
+    # `evidence_*` / `evidence_capsule` payload fields (server.cpp
+    # inject_request_headers + apply_ev_overrides) plus X-Cohort-ID. The other
+    # X-* headers below (X-Capsule-Filter, X-ZDD-Sparse-KV,
+    # X-Universal-Slab-Arena, X-Spec-Type, X-Spec-Autotune,
+    # X-Reasoning-Effort) and the payload keys grammar_mode / kv_paging /
+    # speculative.heterogeneous_split / hardware.cuda_l2_persistence /
+    # universal_slab_arena are PLANNED per-request controls the engine does not
+    # parse yet — they are kept for forward compatibility and surfaced as such
+    # by the request preview; do not treat them as active.
     headers = {
         "X-Evidence-Filter": str(cfg["evidence_filter"]),
         "X-Evidence-Strategy": str(cfg["evidence_strategy"]),
@@ -1090,6 +1218,7 @@ def build_http_headers_and_payload() -> Tuple[Dict[str, str], Dict[str, Any]]:
         "X-Evidence-Top-K": str(cfg["evidence_top_k"]),
         "X-Evidence-Symbol-Boost": str(cfg["evidence_symbol_boost"]),
         "X-Evidence-Chunk-Expansion": str(cfg["evidence_chunk_expansion"]),
+        # planned (not parsed by the engine yet):
         "X-Capsule-Filter": str(cfg["capsule_filter"]),
         "X-ZDD-Sparse-KV": str(cfg["zdd_sparse_kv"]),
         "X-Universal-Slab-Arena": str(cfg["universal_slab_arena"]),
@@ -1104,6 +1233,12 @@ def build_http_headers_and_payload() -> Tuple[Dict[str, str], Dict[str, Any]]:
         "min_p": float(cfg["min_p"]),
         "reasoning_effort": str(cfg["reasoning_effort"]),
         "grammar_mode": str(cfg["grammar_json"]),
+        "evidence_filter": cfg["evidence_filter"] == "ON",
+        "evidence_strategy": str(cfg["evidence_strategy"]),
+        "evidence_chunk_tokens": int(cfg["evidence_chunk_tokens"]),
+        "evidence_top_k": int(cfg["evidence_top_k"]),
+        "evidence_symbol_boost": float(cfg["evidence_symbol_boost"]),
+        "evidence_chunk_expansion": int(cfg["evidence_chunk_expansion"]),
         "evidence_capsule": {
             "enabled": cfg["evidence_filter"] == "ON",
             "strategy": cfg["evidence_strategy"],
@@ -1174,7 +1309,27 @@ class TuiState:
 
     def handle_key(self, ch: int, export_dir: Optional[Path] = None) -> bool:
         """Process a single keystroke. Returns False if user requested quit, True otherwise."""
-        if ch in (ord("q"), ord("Q"), 27):
+        if ch == 27:  # ESC: plain quit, no export
+            return False
+        if ch in (ord("q"), ord("Q")):
+            # Quit & Apply (wired 2026-10-28): persist the active profile export
+            # and the current engine-flag command line so the session's chosen
+            # configuration survives the exit (previously `q` just exited and
+            # lost everything).
+            try:
+                target_dir = export_dir or (Path(__file__).resolve().parent / "exports")
+                self.last_exported_path = export_agent_configs(target_dir)
+                flags_path = Path(target_dir) / "ctx-capsule-launch-flags.sh"
+                flags_path.write_text(
+                    "#!/bin/sh\n"
+                    "# Generated by ctx-capsule TUI [q] Quit & Apply — generated engine flag line.\n"
+                    "# NOTE: append a model (-m ...) and the spec stage flags shown by the TUI\n"
+                    "# (spec stages are emitted as repeated --spec-type entries).\n"
+                    + build_cli_flags() + " \"$@\"\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
             return False
         elif ch == curses.KEY_UP or ch == ord("k"):
             self.selected_idx = (self.selected_idx - 1) % len(self.current_settings)
@@ -1245,10 +1400,22 @@ def render_ansi_snapshot(selected_idx: int = 0, tab_idx: Optional[int] = None) -
     lines.append("║" + pad_or_truncate(title.center(w - 2), w - 2) + "║")
     lines.append("╠" + "═" * (w - 2) + "╣")
 
-    # Top Context State Visualization & Telemetry Bar
-    bar = " Context [10.0M Virtual]: [███Sys(4K)███│▓▓▓Hot KV(1.4K)▓▓▓│▒▒Spilled Fuse Capsules(84K)▒▒│░░Pruned(9.91M)░░]"
+    # Top State Bar — REAL state only (2026-10-28 honesty fix). The previous
+    # static "Context [10.0M Virtual] / VRAM Saved 99.986%" lines displayed
+    # fabricated constants on every frame; the live per-server telemetry is the
+    # external engine's job (capsule reducer systemTelemetry over HTTP), and
+    # until a live source is attached this bar shows the actual capsule config.
+    cfg = get_config_dict()
+    spec_txt = str(cfg.get("spec_type", "?"))
+    if spec_txt == "treegraft":
+        spec_txt = f"ngram-map-k4v+mtp (max {cfg.get('draft_max', '?')})"
+    elif spec_txt not in ("none", "?"):
+        spec_txt = f"{spec_txt} (max {cfg.get('draft_max', '?')})"
+    bar = (f" Capsule cfg: spec={spec_txt} | zdd={'on' if str(cfg.get('zdd_sparse_kv')) == 'ON' else 'off'}"
+           f" | cohort={'on' if str(cfg.get('cohort_prefix_sharing')) == 'ON' else 'off'}"
+           f" | evidence={'on' if str(cfg.get('evidence_filter')) == 'ON' else 'off'}")
     lines.append("║" + pad_or_truncate(bar, w - 2) + "║")
-    stats = " VRAM Saved: 99.986% (21.9MB vs 152.6GB) │ Middle-Edit Reuse: 99.9986% │ Fuse Gate: 3.1ns │ /compact: 0"
+    stats = " Live per-server telemetry: capsule MCP `capsule_status` (in-TUI live panel planned)"
     lines.append("║" + pad_or_truncate(stats, w - 2) + "║")
     lines.append("╠" + "═" * (w - 2) + "╣")
 

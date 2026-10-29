@@ -11,6 +11,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <regex>
+#include <vector>
+#include <string>
 
 #include "llama.h"
 #include "common.h"
@@ -57,6 +60,18 @@ struct chunk_span {
 // so global counting and frequency queries remain 100% exact even when >80% of chunks are
 // pruned by Late-Interaction MaxSim filtering.
 // =========================================================================================
+struct filter_telemetry {
+    bool        active        = false;
+    int32_t     tokens_before = 0;
+    int32_t     tokens_after  = 0;
+    int32_t     chunks_kept   = 0;
+    int32_t     chunks_total  = 0;
+    int32_t     keep_head     = 0;
+    int32_t     keep_tail     = 0;
+    std::string strategy      = "adaptive_default";
+    double      elapsed_ms    = 0.0;
+};
+
 struct global_aggregation_summary {
     int total_chunks_scanned = 0;
     int total_tokens_scanned = 0;
@@ -443,6 +458,27 @@ private:
     std::unordered_map<llama_token, std::vector<float>> cache_;
 };
 
+// Detokenize a token range into text (model-level vocab, no special tokens).
+// Used by the --evidence-symbol-regex scoring path (2026-10-28 wiring).
+inline std::string unreal_detok_tokens(
+        const struct llama_model * model,
+        const std::vector<llama_token> & tokens,
+        size_t start, size_t count) {
+    std::string out;
+    if (!model) {
+        return out;
+    }
+    char buf[256];
+    const size_t end = std::min(start + count, tokens.size());
+    for (size_t t = start; t < end; ++t) {
+        const int32_t n = llama_token_to_piece(model, tokens[t], buf, sizeof(buf), 0, false);
+        if (n > 0) {
+            out.append(buf, (size_t) n);
+        }
+    }
+    return out;
+}
+
 // =========================================================================================
 // End-to-End UNREAL Long-Context Prompt Evidence Filter (arXiv:2610.08463)
 // - Partitions prompt into prefix, context haystack, and query spans
@@ -456,8 +492,17 @@ inline std::vector<llama_token> filter_prompt(
     const struct llama_model * model,
     const std::vector<llama_token> & prompt_tokens,
     const gpt_params & params,
-    global_aggregation_summary * out_summary = nullptr)
+    global_aggregation_summary * out_summary = nullptr,
+    filter_telemetry * out_telemetry = nullptr)
 {
+    if (out_telemetry) {
+        out_telemetry->active = false;
+        out_telemetry->tokens_before = (int32_t)prompt_tokens.size();
+        out_telemetry->tokens_after  = (int32_t)prompt_tokens.size();
+        out_telemetry->chunks_kept   = 0;
+        out_telemetry->chunks_total  = 0;
+        out_telemetry->strategy      = params.unreal_evidence_strategy;
+    }
     if (!params.unreal_filter) {
         return prompt_tokens;
     }
@@ -483,11 +528,15 @@ inline std::vector<llama_token> filter_prompt(
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // 1. Structure the prompt into:
-    //    - prefix_tokens (system prompt, instruction preamble, up to 512 tokens)
+    //    - prefix_tokens (system prompt, instruction preamble)
     //    - context_tokens (the long documents/haystack)
-    //    - query_tokens (the question/task, up to 1024 tokens)
-    int query_len = std::min(1024, std::max(32, N / 16));
-    int prefix_len = std::min(512, std::max(16, N / 32));
+    //    - query_tokens (the question/task / latest turn tail)
+    int query_len  = params.unreal_keep_tail > 0
+        ? std::min(N / 2, params.unreal_keep_tail)
+        : std::min(1024, std::max(32, N / 16));
+    int prefix_len = params.unreal_keep_head > 0
+        ? std::min(N / 3, params.unreal_keep_head)
+        : std::min(512, std::max(16, N / 32));
 
     // Ensure prefix and query do not overlap
     if (prefix_len + query_len + params.unreal_chunk_size >= N) {
@@ -505,6 +554,33 @@ inline std::vector<llama_token> filter_prompt(
     }
 
     int top_n = std::min((int)spans.size(), params.unreal_top_n);
+
+    // --evidence-symbol-regex: compile the user symbol pattern once, extract the
+    // distinct symbols matched in the query tail, and later boost chunks whose
+    // text contains them (real consumer for params.unreal_symbol_regex). An
+    // invalid pattern is ignored (with a warning) rather than aborting the
+    // filter — matching the "lexical boost" tolling semantics.
+    std::regex symbol_re;
+    bool have_symbol_re = false;
+    if (!params.unreal_symbol_regex.empty()) {
+        try {
+            symbol_re.assign(params.unreal_symbol_regex);
+            have_symbol_re = true;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "%s: warning: invalid --evidence-symbol-regex pattern ignored: %s\n", __func__, e.what());
+        }
+    }
+    std::vector<std::string> query_symbols;
+    if (have_symbol_re) {
+        const std::string query_text = unreal_detok_tokens(model, prompt_tokens, (size_t) std::max(0, N - query_len), (size_t) query_len);
+        for (std::sregex_iterator it = std::sregex_iterator(query_text.begin(), query_text.end(), symbol_re);
+             it != std::sregex_iterator(); ++it) {
+            std::string m = it->str();
+            if (!m.empty() && std::find(query_symbols.begin(), query_symbols.end(), m) == query_symbols.end()) {
+                query_symbols.push_back(std::move(m));
+            }
+        }
+    }
 
     // Ensure total filtered tokens never exceed physical context size
     if (params.n_ctx > 0) {
@@ -611,9 +687,35 @@ inline std::vector<llama_token> filter_prompt(
             }
 
             float maxsim = compute_maxsim(query_vecs.data(), chunk_vecs.data(), cfg.n_query_groups, cfg.n_chunk_vectors, d);
-            score = maxsim + 1.5f * lexical_overlap;
+            float sym_boost = params.unreal_symbol_boost > 0.0f ? params.unreal_symbol_boost : 1.5f;
+            if (params.unreal_evidence_strategy == "code_pinpoint" || params.unreal_evidence_strategy == "maxsim_exact_cover") {
+                sym_boost = std::max(sym_boost, 2.25f);
+            } else if (params.unreal_evidence_strategy == "narrative_recall") {
+                sym_boost = std::min(sym_boost, 1.0f);
+            }
+            if (params.unreal_maxsim_threshold > 0.0f && maxsim < params.unreal_maxsim_threshold) {
+                score = -1e9f;
+            } else {
+                score = maxsim + sym_boost * lexical_overlap;
+            }
         } else {
             score = lexical_overlap;
+        }
+
+        // --evidence-symbol-regex boost: fraction of distinct query symbols
+        // present in the chunk text, scaled by the lexical boost weight.
+        if (have_symbol_re && !query_symbols.empty() && score > -1e8f) {
+            const std::string chunk_text = unreal_detok_tokens(model, prompt_tokens, (size_t) c_start, (size_t) c_count);
+            int present = 0;
+            for (const auto & sym : query_symbols) {
+                if (chunk_text.find(sym) != std::string::npos) {
+                    present++;
+                }
+            }
+            if (present > 0) {
+                const float sym_boost = params.unreal_symbol_boost > 0.0f ? params.unreal_symbol_boost : 1.5f;
+                score += sym_boost * ((float) present / (float) query_symbols.size());
+            }
         }
 
         if ((int)min_heap.size() < candidate_pool_size) {
@@ -635,8 +737,19 @@ inline std::vector<llama_token> filter_prompt(
     });
 
     std::vector<int> selected_chunk_indices;
-    for (int k = 0; k < top_n && k < (int)candidates.size(); ++k) {
-        selected_chunk_indices.push_back(candidates[k].first);
+    std::unordered_set<int> selected_set;
+    const int expand_radius = std::max(0, params.unreal_chunk_expansion);
+    for (int k = 0; k < top_n && k < (int)candidates.size() && (int)selected_chunk_indices.size() < top_n; ++k) {
+        int base_idx = candidates[k].first;
+        for (int delta = -expand_radius; delta <= expand_radius; ++delta) {
+            int idx = base_idx + delta;
+            if (idx >= 0 && idx < (int)spans.size() && !selected_set.count(idx)) {
+                if ((int)selected_chunk_indices.size() < top_n) {
+                    selected_set.insert(idx);
+                    selected_chunk_indices.push_back(idx);
+                }
+            }
+        }
     }
 
     // 5. Chronological Reassembly to preserve document context flow without distractors
@@ -670,6 +783,18 @@ inline std::vector<llama_token> filter_prompt(
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    if (out_telemetry) {
+        out_telemetry->active        = true;
+        out_telemetry->tokens_before = N;
+        out_telemetry->tokens_after  = (int32_t)filtered.size();
+        out_telemetry->chunks_kept   = (int32_t)reassembled_spans.size();
+        out_telemetry->chunks_total  = (int32_t)spans.size();
+        out_telemetry->keep_head     = prefix_len;
+        out_telemetry->keep_tail     = query_len;
+        out_telemetry->strategy      = params.unreal_evidence_strategy;
+        out_telemetry->elapsed_ms    = elapsed_ms;
+    }
 
     fprintf(stderr, "\nUNREAL: prompt compressed from %d to %d tokens (%.1fx compression, %.1f%% KV savings) in %.2f ms [selected %d/%d chunks]\n\n",
         N, (int)filtered.size(),

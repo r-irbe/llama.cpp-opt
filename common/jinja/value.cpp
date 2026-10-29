@@ -367,6 +367,26 @@ const func_builtins & global_builtins() {
             }
             return out;
         }},
+        {"dict", [](const func_args & args) -> value {
+            // Python dict semantics: dict() empty, dict(mapping) copies in order,
+            // dict(mapping, **kwargs) copies then overrides/extends with kwargs
+            auto out = mk_val<value_object>();
+            for (const auto & arg : args.get_args()) {
+                if (!is_val<value_kwarg>(arg)) {
+                    // a positional argument must be a mapping (value_object)
+                    if (!std::dynamic_pointer_cast<value_object_t>(arg)) {
+                        throw raised_exception("dict() requires keyword arguments or one mapping argument");
+                    }
+                    for (const auto & pair : arg->as_ordered_object()) {
+                        out->insert(pair.first, pair.second);
+                    }
+                } else {
+                    auto kwarg = cast_val<value_kwarg>(arg);
+                    out->insert(kwarg->key, kwarg->val);
+                }
+            }
+            return out;
+        }},
         {"strftime_now", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string format = args.get_pos(0)->as_string().str();

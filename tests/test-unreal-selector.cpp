@@ -424,6 +424,51 @@ int main() {
                   << "% chunks pruned OK\n";
     }
 
+    // -----------------------------------------------------------------------
+    // 12. Filter Telemetry, Keep-Head/Tail & maxsim_exact_cover Strategy
+    // -----------------------------------------------------------------------
+    std::cout << "\n[Step 12] Verifying filter_telemetry, unreal_keep_head/tail, and maxsim_exact_cover...\n";
+    {
+        gpt_params params;
+        params.unreal_filter = true;
+        params.unreal_chunk_size = 128;
+        params.unreal_top_n = 3;
+        params.unreal_min_tokens = 1024;
+        params.unreal_keep_head = 192;
+        params.unreal_keep_tail = 320;
+        params.unreal_evidence_strategy = "maxsim_exact_cover";
+
+        std::vector<llama_token> corpus(4096, 100);
+        // Query tokens in tail
+        for (size_t i = 4096 - 64; i < 4096; ++i) {
+            corpus[i] = 4242;
+        }
+        // Matching chunks in body
+        corpus[512 + 10] = 4242;
+        corpus[1024 + 20] = 4242;
+        corpus[2048 + 30] = 4242;
+
+        unreal::filter_telemetry telemetry;
+        auto filtered = unreal::filter_prompt(nullptr, corpus, params, nullptr, &telemetry);
+
+        ASSERT_TRUE(telemetry.active);
+        ASSERT_TRUE(telemetry.tokens_before == 4096);
+        ASSERT_TRUE(telemetry.tokens_after == (int32_t)filtered.size());
+        ASSERT_TRUE(telemetry.tokens_after < telemetry.tokens_before);
+        ASSERT_TRUE(telemetry.chunks_kept == 3);
+        ASSERT_TRUE(telemetry.chunks_total > telemetry.chunks_kept);
+        ASSERT_TRUE(telemetry.keep_head == 192);
+        ASSERT_TRUE(telemetry.keep_tail == 320);
+        ASSERT_TRUE(telemetry.strategy == "maxsim_exact_cover");
+        // Expected filtered length: keep_head (192) + 3 * 128 (384) + keep_tail (320) = 896
+        ASSERT_TRUE(filtered.size() == 896);
+
+        std::cout << "  Telemetry verified: " << telemetry.tokens_before << " -> " << telemetry.tokens_after
+                  << " tokens (" << telemetry.chunks_kept << "/" << telemetry.chunks_total
+                  << " chunks, head=" << telemetry.keep_head << ", tail=" << telemetry.keep_tail
+                  << ", strategy=" << telemetry.strategy << ") OK\n";
+    }
+
     std::cout << "\n===================================================================\n";
     std::cout << "  ALL UNREAL SELECTOR TESTS PASSED WITH 100% SUCCESS               \n";
     std::cout << "===================================================================\n";
