@@ -21,9 +21,18 @@ elif [[ -f "${WORKSPACE_ROOT}/env.sh" ]]; then
     source "${WORKSPACE_ROOT}/env.sh"
 fi
 
-MODEL_PATH="${MODEL_PATH:-/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf}"
-DRAFT_PATH="${DRAFT_PATH:-/home/radu/code/llama.cpp/unsloth/Smalinin-Deepseek-v41-flash/DeepSeek-V4.1-Flash-DSpark-AUTO.gguf}"
-BINARY="${WORKSPACE_ROOT}/build/bin/llama-cli"
+# NOTE: prefer the capsule domain models.toml (`LLAMA_MODEL_ROOT` default is
+# resolved there). The UD-Q4_K_XL container is a completed 9-shard HF download
+# and is now LOADABLE: mainline type 43 (MXFP8, gather-only engram table) was
+# ported and validated with a serving smoke test on 2026-10-29 (binary
+# 125fdd9b; plan ledger: scratch/2026-10-28-mxfp8-engram-port-and-removals-
+# audit.md, "UD-Q4_K_XL mainline packaging" section). Entrainless note: the
+# load requires the deepseek41.en-graph KV fallback path (ple.* keys) which
+# is part of that port; no sidecar needed.
+UD_Q4KXL_ROOT="${LLAMA_MODEL_ROOT:-${HOME}/vm/llm}"
+MODEL_PATH="${MODEL_PATH:-${UD_Q4KXL_ROOT}/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf}"
+DRAFT_PATH="${DRAFT_PATH:-${LLAMA_MODEL_ROOT:-${WORKSPACE_ROOT}/models}/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf}"
+BINARY="${WORKSPACE_ROOT}/build-pto/bin/llama-cli"
 
 if [[ ! -f "${MODEL_PATH}" ]]; then
     echo "ERROR: Target model not found at ${MODEL_PATH}" >&2

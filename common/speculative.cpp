@@ -10,6 +10,8 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-arbiter.h"
+#include "spec-counterfactual.h"
 #include "suffix-tree.h"
 
 #include <algorithm>
@@ -1102,6 +1104,26 @@ struct common_speculative {
     common_speculative_checkpoint checkpoint;
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
     std::unique_ptr<spec_tuner> tuner;
+    // TreeGraft fusion state (2026-10-28 wiring): the fused candidate tree from
+    // spec_arbiter::fuse_treegraft is now CONSUMED by adaptive divergence
+    // arbitration in common_speculative_draft — the branch (neural vs lexical)
+    // with the better acceptance EMA provides the post-trunk continuation,
+    // linearized for the verify pass (no tree-attention masks in the graph yet;
+    // full tree verify is the follow-up stage). Feedback updates the EMAs in
+    // common_speculative_accept.
+    spec_fused_candidates last_fused;
+    int32_t  last_fused_source    = 0; // 0=none/single-stage, 1=neural continuation, 2=ngram continuation
+    int32_t  last_fused_trunk_len = 0; // trunk length of the last fusion (acceptance attribution)
+    float    ngram_branch_ema     = 0.5f;
+    float    neural_branch_ema    = 0.5f;
+    uint64_t n_treegraft_fusions     = 0;
+    uint64_t n_treegraft_neural_wins = 0;
+    uint64_t n_treegraft_ngram_wins  = 0;
+    // NOTE (2026-10-28): the spec_arbiter instance member was removed — it was
+    // never touched (no pushes into ring_ngram/ring_neural, poll_and_fuse never
+    // called). The arbiter library itself remains unit-tested
+    // (tests/test-spec-arbiter.cpp); wire an async producer before consuming it
+    // in production (the rings are not fed on the decoding thread).
     int last_n_drafted = 0;
     int64_t t_step_start_us = 0;
     bool last_step_target_only = false;
@@ -1556,17 +1578,28 @@ common_speculative * common_speculative_init(
     };
     common_speculative_prepare_request(result, params);
 
-    // initialize autotune if requested
-    if (params.autotune && params.has_composite_stage_chain()) {
-        LOG_WRN("Autotune disabled — explicit speculative stage chains are not supported yet\n");
-    } else if (params.autotune && !result->impls.empty()) {
-        auto actual_type = result->impls[0]->type;
+    // initialize autotune if requested (supports both single-stage and composite stage chains)
+    if (params.autotune && !result->impls.empty()) {
+        size_t tune_idx = 0;
+        for (size_t i = 0; i < result->impls.size(); ++i) {
+            const auto t = result->impls[i]->type;
+            if (t == COMMON_SPECULATIVE_TYPE_DSPARK ||
+                t == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                t == COMMON_SPECULATIVE_TYPE_MTP ||
+                t == COMMON_SPECULATIVE_TYPE_DRAFT) {
+                tune_idx = i;
+                break;
+            }
+        }
+        auto actual_type = result->impls[tune_idx]->type;
         if (actual_type != COMMON_SPECULATIVE_TYPE_NONE &&
             actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
             result->tuner = std::make_unique<spec_tuner>();
-            result->tuner->init(actual_type, result->configs[0].params, llama_get_model(ctx_tgt));
-            LOG_DBG("Autotune initialized for %s, tuning %zu parameters\n",
+            result->tuner->init(actual_type, result->configs[tune_idx].params, llama_get_model(ctx_tgt));
+            LOG_INF("Autotune initialized for stage[%zu]=%s (chain size=%zu), tuning %zu parameters\n",
+                    tune_idx,
                     common_speculative_type_to_str(actual_type).c_str(),
+                    result->impls.size(),
                     result->tuner->coords.size());
         } else {
             LOG_WRN("Autotune disabled — speculative type %s is not supported for autotuning\n",
@@ -1626,6 +1659,14 @@ llama_tokens common_speculative_draft(
     const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
 
     spec->curr_impl = nullptr; // reset current implementation
+    spec->last_fused_source    = 0; // reset per-step fusion attribution
+    spec->last_fused_trunk_len = 0;
+
+    llama_tokens neural_branch;
+    llama_tokens ngram_branch;
+    common_speculative_state * neural_impl = nullptr;
+    common_speculative_state * ngram_impl  = nullptr;
+    int max_total_tokens = std::max(1, params.n_max);
 
     for (size_t i = 0; i < spec->impls.size(); ++i) {
         auto & impl = spec->impls[i];
@@ -1641,7 +1682,7 @@ llama_tokens common_speculative_draft(
                 impl_params.suffix_min_match_len = params.suffix_min_match_len;
             }
         }
-        result.clear();
+        max_total_tokens = std::max(max_total_tokens, impl_params.n_max);
 
         if (spec->tuner && spec->tuner->has_dflash_target_only_arm() &&
                 (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH ||
@@ -1651,30 +1692,106 @@ llama_tokens common_speculative_draft(
             spec->last_step_target_only = true;
             LOG_DBG("%s: selected %s target-only arm\n", __func__,
                     common_speculative_type_to_str(impl->type).c_str());
-            break;
-        }
-
-        {
-            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
-            impl->draft(impl_params, prompt_tgt, id_last, draft_base_pos, draft_seq_id, result);
-            impl->n_call_draft++;
-        }
-
-        if (result.empty()) {
             continue;
         }
 
-        if (common_speculative_type_is_self_spec(impl->type) && impl_params.n_min > 0 && (int)result.size() < impl_params.n_min) {
+        llama_tokens stage_tokens;
+        {
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->draft(impl_params, prompt_tgt, id_last, draft_base_pos, draft_seq_id, stage_tokens);
+            impl->n_call_draft++;
+        }
+
+        if (stage_tokens.empty()) {
+            continue;
+        }
+
+        if (common_speculative_type_is_self_spec(impl->type) && impl_params.n_min > 0 && (int)stage_tokens.size() < impl_params.n_min) {
             LOG_DBG("%s: impl %s drafted %zu tokens, below fallback threshold %d - trying next implementation\n",
-                    __func__, common_speculative_type_to_str(impl->type).c_str(), result.size(), impl_params.n_min);
-            result.clear();
+                    __func__, common_speculative_type_to_str(impl->type).c_str(), stage_tokens.size(), impl_params.n_min);
             continue;
         }
         LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
                 common_speculative_type_to_str(impl.get()->type).c_str(), prompt_tgt.size(),
-                impl.get()->n_call_draft, result.size());
+                impl.get()->n_call_draft, stage_tokens.size());
 
-        spec->curr_impl = impl.get();
+        const bool is_lexical = common_speculative_type_is_self_spec(impl->type);
+        if (!is_lexical && neural_branch.empty()) {
+            neural_branch = std::move(stage_tokens);
+            neural_impl = impl.get();
+        } else if (is_lexical && ngram_branch.empty()) {
+            ngram_branch = std::move(stage_tokens);
+            ngram_impl = impl.get();
+        } else if (result.empty()) {
+            result = std::move(stage_tokens);
+            spec->curr_impl = impl.get();
+        }
+
+        // If single-stage, or if we have collected both a neural and lexical branch for TreeGraft fusion, stop
+        if (spec->impls.size() == 1 || (!neural_branch.empty() && !ngram_branch.empty())) {
+            break;
+        }
+    }
+
+    if (!neural_branch.empty() || !ngram_branch.empty()) {
+        if (!neural_branch.empty() && !ngram_branch.empty()) {
+            // TreeGraft fusion (spec-arbiter): consolidate the shared trunk and
+            // keep both divergence chains with their scores. The flat fused
+            // token array is not verifiable in a single pass without
+            // tree-attention masks, so the fused tree is CONSUMED by adaptive
+            // divergence arbitration: the branch with the better acceptance EMA
+            // provides the post-trunk continuation (linearized). Neural wins
+            // ties/uncertainty (drafter depth beats n-gram depth when unknown).
+            size_t common_len = 0;
+            const size_t min_len = std::min(ngram_branch.size(), neural_branch.size());
+            while (common_len < min_len && ngram_branch[common_len] == neural_branch[common_len]) {
+                common_len++;
+            }
+            result = neural_branch;
+            spec->curr_impl = neural_impl;
+            if (common_len == neural_branch.size() && ngram_branch.size() > neural_branch.size()) {
+                // full neural prefix matched: graft the lexical suffix directly;
+                // acceptance beyond the trunk attributes to the ngram branch
+                for (size_t k = common_len; k < ngram_branch.size() && (int)result.size() < max_total_tokens; ++k) {
+                    result.push_back(ngram_branch[k]);
+                }
+                spec->last_fused_source = 2;
+                spec->last_fused_trunk_len = (int32_t) common_len;
+            } else if (common_len < ngram_branch.size() && common_len < neural_branch.size()) {
+                // both branches diverge at common_len: fused tree is consumed by
+                // adaptive divergence arbitration (EMA-driven branch choice)
+                spec->last_fused = spec_arbiter::fuse_treegraft(ngram_branch, neural_branch, max_total_tokens);
+                spec->last_fused_trunk_len = (int32_t) common_len;
+                spec->n_treegraft_fusions++;
+                if (spec->ngram_branch_ema > spec->neural_branch_ema + 0.05f) {
+                    result.assign(ngram_branch.begin(),
+                                  ngram_branch.begin() + std::min(ngram_branch.size(), (size_t) max_total_tokens));
+                    spec->last_fused_source = 2;
+                    spec->n_treegraft_ngram_wins++;
+                    spec->curr_impl = ngram_impl;
+                } else {
+                    spec->last_fused_source = 1;
+                    spec->n_treegraft_neural_wins++;
+                }
+                LOG_DBG("%s: TreeGraft fusion (%zu trunk + divergence, %s continuation, ema ngram=%.3f neural=%.3f)\n",
+                        __func__, common_len, spec->last_fused_source == 2 ? "ngram" : "neural",
+                        spec->ngram_branch_ema, spec->neural_branch_ema);
+            } else if (common_len < neural_branch.size()) {
+                // ngram branch is a strict prefix of neural: neural continuation
+                spec->last_fused_source = 1;
+                spec->last_fused_trunk_len = (int32_t) common_len;
+            }
+        } else if (!neural_branch.empty()) {
+            result = std::move(neural_branch);
+            spec->curr_impl = neural_impl;
+        } else {
+            result = std::move(ngram_branch);
+            spec->curr_impl = ngram_impl;
+        }
+    }
+
+    if (spec->curr_impl != nullptr && !result.empty()) {
+        common_speculative_state * impl = spec->curr_impl;
         impl->n_gen_drafts++;
         impl->n_gen_tokens += result.size();
         impl->drafted_by_position.resize(std::max(impl->drafted_by_position.size(), result.size()));
@@ -1682,8 +1799,6 @@ llama_tokens common_speculative_draft(
         for (size_t i = 0; i < result.size(); ++i) {
             impl->drafted_by_position[i]++;
         }
-
-        break; // We have a draft, so break out of the loop and return it.
     }
 
     // store draft count for tuner feedback
@@ -1695,6 +1810,20 @@ llama_tokens common_speculative_draft(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+    if (spec != nullptr && spec->last_fused_source != 0 && spec->last_n_drafted >= 0) {
+        // TreeGraft divergence feedback: attribute the accepted tokens beyond
+        // the fused trunk to the branch that provided the continuation and
+        // update its acceptance EMA (alpha = 0.2). This is what makes the
+        // arbiter's fused tree drive future divergence decisions.
+        const int cont_len = spec->last_n_drafted - spec->last_fused_trunk_len;
+        if (cont_len > 0) {
+            const int cont_acc = std::max(0, std::min((int) n_accepted - spec->last_fused_trunk_len, cont_len));
+            const float acc_rate = (float) cont_acc / (float) cont_len;
+            float & ema = spec->last_fused_source == 2 ? spec->ngram_branch_ema : spec->neural_branch_ema;
+            ema = 0.8f * ema + 0.2f * acc_rate;
+        }
+        spec->last_fused_source = 0;
+    }
     if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
         const bool is_tuned_impl = (spec->curr_impl && spec->curr_impl->type == spec->tuner->spec_type) ||
                                    spec->last_step_target_only;

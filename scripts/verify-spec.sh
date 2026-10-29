@@ -17,7 +17,7 @@ for t in "${TESTS[@]}"; do
         status=1
         continue
     fi
-    if "${bin}" > "/tmp/${t}.log" 2>&1; then
+    if "${bin}" >"/tmp/${t}.log" 2>&1; then
         echo "VERIFY OK: ${t}"
     else
         rc=$?

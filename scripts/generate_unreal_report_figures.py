@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-out_dir = "/home/radu/code/ik_llama.cpp/docs/reports/figures"
+out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "reports", "figures")
 os.makedirs(out_dir, exist_ok=True)
 
 # Set high-quality styling

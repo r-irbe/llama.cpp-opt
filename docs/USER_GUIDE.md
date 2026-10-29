@@ -63,7 +63,7 @@ Zero-Suppressed Decision Diagram (ZDD) sparse KV pruning (`src/llama-kv-zdd.h`) 
 
 - **Canonical CLI Flags**: `--evidence-filter` (`-ef`), `--evidence-chunk-tokens` (`-ect`, default `140`), `--evidence-top-k` (`-etk`, default `10`), `--evidence-min-tokens` (default `4096`), `--evidence-strategy` (`adaptive_default`, `code_pinpoint`, `narrative_recall`, `analytic_aggregate`, `temporal_window`, `custom_weights`), `--evidence-symbol-boost`, `--evidence-chunk-expansion`, `--evidence-maxsim-threshold`, and `--evidence-symbol-regex`.
 - **Pre-Pruning Global Aggregation Summary (`unreal::global_aggregation_summary`)**: `selector::compute_global_summary` scans all chunks prior to top-$k$ pruning to record exact corpus-wide query-token occurrence counts and chunk document frequencies, ensuring global counting queries remain 100% accurate even when >80% of chunks are pruned.
-- **Binary Fuse8 Context Capsules (`common/kv-capsule-filter.h`)**: Spilled KV blocks are indexed by an 8-bit Graf & Lemire Binary Fuse Filter (`~9.0 bits/entry`, `0.39%` FPR, 3 XOR lookups) paired with a 64-bit Charikar `SimHash64` sketch (`< 15 ns` negative-lookup rejection).
+- **Binary Fuse8 Context Capsules (`common/kv-capsule-filter.h`) — PLANNED, not yet engine-wired (truth fix 2026-10-28)**: the Graf & Lemire 8-bit Binary Fuse Filter (`~9.0 bits/entry`, `0.39%` FPR, 3 XOR lookups) paired with a 64-bit Charikar `SimHash64` sketch is implemented and unit-exercised, but spilled KV blocks are **not indexed by it yet**; the planned wiring indexes `--ctx-ckpt-spill-dir` evicted blocks at spill time and gates lookups behind the `X-Capsule-Filter` request header (not yet parsed by the server).
 
 ```bash
 ./build-pto/bin/llama-cli \

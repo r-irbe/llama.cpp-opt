@@ -1,6 +1,6 @@
 # `ik_llama.cpp` Architecture & Empirical Benchmark Synthesis (`feat/numa-split`)
 
-This document synthesizes the systems architecture, memory-hierarchy invariants, defect closures (`D1`--`D26`), and live hardware benchmarks executed across Phase 1 and Phase 2 on the reference Dual AMD EPYC 7643 (96 cores / 192 threads, 8 NUMA nodes in NPS4, 16 CCXs with 32 MB L3 each, 503 GiB DDR4) + NVIDIA RTX 4090 (24 GB VRAM, Ada Lovelace `sm_89`, 72 MB L2) + 4x NVMe PCIe Gen4 workstation.
+This document synthesizes the systems architecture, memory-hierarchy invariants, defect closures (`D1`--`D26`), and live hardware benchmarks executed across Phase 1 and Phase 2 on the reference Dual AMD EPYC 7453 (48 cores / 112 threads, 8 NUMA nodes in NPS4, 991.9 GiB DDR4) + NVIDIA RTX 4090 (24 GB VRAM, Ada Lovelace `sm_89`, 72 MB L2) + 4x NVMe PCIe Gen4 workstation.
 
 ---
 

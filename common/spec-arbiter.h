@@ -23,11 +23,15 @@
  * 3. Hides drafting latency behind target verification by asynchronously pre-computing
  *    candidate proposals on secondary CCXs (e.g. Node 0 / CCX 0 for N-gram, Node 2 / CCX 2 for Neural).
  *
- * STATUS: the arbiter rings and fuse_treegraft are wired into the speculative decoding
- * path (common/speculative.cpp) and unit-tested in tests/test-spec-arbiter.cpp and
- * tests/test-spec-integration.cpp. The dedicated per-CCX worker-thread pool that would
- * asynchronously feed ring_ngram / ring_neural is planned but not yet connected; producers
- * currently push packets synchronously from the decoding thread.
+ * STATUS (honest, 2026-10-28): fuse_treegraft and the ring types are unit-tested
+ * in tests/test-spec-arbiter.cpp and tests/test-spec-integration.cpp, but the
+ * fused output is NOT consumed by the speculative decoding path — the previous
+ * `last_fused` store in common/speculative.cpp was dead (no reader) and has been
+ * removed; the spec_arbiter instance member was likewise never touched. The
+ * dedicated per-CCX worker-thread pool that would asynchronously feed
+ * ring_ngram / ring_neural is planned but not connected; nothing currently
+ * pushes packets into the rings. Wire (a) an async producer, (b) a fused-output
+ * consumer (tree-mask verify pass) before treating TreeGraft fusion as active.
  */
 
 enum spec_drafter_source {
