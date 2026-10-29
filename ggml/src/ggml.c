@@ -20511,7 +20511,7 @@ static void ggml_compute_forward_get_rows_i8(
     }
 }
 
-||||||| 2959611ea
+||||||| base
 static void ggml_compute_forward_get_rows(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {

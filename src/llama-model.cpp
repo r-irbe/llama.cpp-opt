@@ -2902,7 +2902,7 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         const uint32_t raw_pad = llama_kv_cache::get_padding(flash_attn);
         const uint32_t k_rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress, n_ubatch, raw_pad, n_seq_max);
         size_t size = ggml_row_size(type_k, n_embd_head) * n_head_kv * k_rows;
-||||||| 2959611ea
+||||||| base
         const uint32_t k_rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress, n_ubatch, raw_pad);
         size_t size = ggml_row_size(type_k, n_embd_head) * hparams.n_head_kv(il) * k_rows;
         if (hparams.dsv4_shared_streams) {
