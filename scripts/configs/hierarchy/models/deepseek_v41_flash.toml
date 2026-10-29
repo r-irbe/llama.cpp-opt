@@ -8,12 +8,12 @@ architecture = "deepseek4 (MLA + 256 RoE + Engram PLE)"
 parameter_scale = "1000B Total / 32B Active"
 quantization = "Q2_K_Protected + Engram Q8_0"
 disk_size_gib = 386.37
-vram_footprint_gib = 13.70
+vram_footprint_gib = 0.00
 ram_footprint_gib = 185.64
-path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
-fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf", "unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+path = "models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+fallback_paths = ["ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"]
 default_template = "ds41-1017-np1-512k-max-speed"
-notes = "512K..1M context fits in 24 GiB VRAM with --swa-compress, -ictk q8_0, MLA -mla 2, and --defer-ple (22.88 tok/s decode)."
+notes = "512K context fits in 24 GiB VRAM with --swa-compress, -ictk q8_0, MLA -mla 2, and --defer-ple; live-validated on 2026-10-28 (composite ngram-mod+dspark chain, see ik_llama.cpp scratch/logs/engramq8_spec_session_c.log). Throughput figures are measured per run, not baked here."
 
 [models.deepseek_v41_flash.recommended]
 ctx_size = "524288"
@@ -28,8 +28,8 @@ override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = "on"
 defer_experts = "off"
 parallel_slots = "1"
-draft_model_path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
-spec_type = "dspark_plus_ngram_mod"
+draft_model_path = "DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+spec_type = "ngram-mod_plus_dspark"
 spec_ckpt_mode = "per-step"
 thinking_effort = "max_deep_think"
 evidence_strategy = "code_pinpoint"

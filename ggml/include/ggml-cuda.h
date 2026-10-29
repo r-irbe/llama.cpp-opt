@@ -42,6 +42,15 @@ GGML_API GGML_CALL int  ggml_backend_cuda_get_device_numa_node(int device);
 GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// CUDA host (pinned) memory policy. Pinning helps only tensors the GPU streams
+// over PCIe; it breaks the NUMA expert page-binding (mbind(MPOL_MF_MOVE)
+// cannot migrate page-locked pages) and THP compaction of the affected region.
+// ggml_backend_cuda_set_host_pinning(false) turns the pinning path off for this
+// process (GGML_CUDA_NO_PINNED still wins); GGML_CUDA_PINNED_FORCE=1 restores
+// pinning even after a NUMA-automatic disable.
+GGML_API GGML_CALL void ggml_backend_cuda_set_host_pinning(bool enable);
+GGML_API GGML_CALL bool ggml_backend_cuda_host_pinning_enabled(void);
+
 GGML_API GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
 
 GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);

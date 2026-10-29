@@ -1,3 +1,4 @@
+#include <filesystem>
 #include "llama-model-loader.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -453,7 +454,22 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     // deferred engram_embd tensors resolve like any other weight.
     {
         std::string engram_file;
-        if (get_key("deepseek41.engram.file", engram_file, false)) {
+        const bool has_engram_key = get_key("deepseek41.engram.file", engram_file, false);
+        if (const char * env_engram = std::getenv("IK_ENGRAM_FILE")) {
+            if (env_engram[0] != '\0') {
+                engram_file = env_engram;
+            }
+        }
+        bool is_dsv4_with_engram = has_engram_key || !engram_file.empty();
+        if (!is_dsv4_with_engram && arch_name == "deepseek4") {
+            for (const auto & w : weights) {
+                if (strstr(w.tensor->name, "engram_") != nullptr) {
+                    is_dsv4_with_engram = true;
+                    break;
+                }
+            }
+        }
+        if (is_dsv4_with_engram) {
             bool have_embd = false;
             for (const auto & w : weights) {
                 if (strstr(w.tensor->name, "engram_embd") != nullptr) {
@@ -463,28 +479,85 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             }
             if (!have_embd) {
                 const size_t slash = fname.find_last_of("/\\");
-                const std::string sidecar_path =
-                    (slash == std::string::npos ? std::string(".") : fname.substr(0, slash)) + "/" + engram_file;
-                struct gguf_init_params side_params = {
-                    /*.no_alloc = */ true,
-                    /*.ctx      = */ &ctx,
-                };
-                struct gguf_context * side_gguf = gguf_init_from_file(sidecar_path.c_str(), side_params);
-                if (side_gguf) {
-                    files.emplace_back(new llama_file(sidecar_path.c_str(), "rb"));
-                    contexts.emplace_back(ctx);
-                    const uint16_t side_idx = (uint16_t) (files.size() - 1);
-                    int n_engram_tables = 0;
-                    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-                        if (strstr(cur->name, "engram_embd") != nullptr) {
-                            weights.emplace_back(files.back().get(), side_idx, cur->name, side_gguf, cur);
-                            n_engram_tables++;
+                const std::string base_dir = (slash == std::string::npos ? std::string(".") : fname.substr(0, slash));
+                std::vector<std::string> candidates;
+                if (!engram_file.empty()) {
+                    if (engram_file[0] == '/') {
+                        candidates.push_back(engram_file);
+                    }
+                    candidates.push_back(base_dir + "/" + engram_file);
+                    candidates.push_back(base_dir + "/engram/" + engram_file);
+                    candidates.push_back(base_dir + "/../engram/" + engram_file);
+                    candidates.push_back(base_dir + "/../" + engram_file);
+                    candidates.push_back(base_dir + "/" + engram_file + "_file");
+                    candidates.push_back(base_dir + "/engram/" + engram_file + "_file");
+                    candidates.push_back(base_dir + "/../engram/" + engram_file + "_file");
+                }
+                for (const std::string & probe_dir : { base_dir + "/engram", base_dir + "/../engram", base_dir, base_dir + "/.." }) {
+                    std::error_code ec;
+                    if (std::filesystem::is_directory(probe_dir, ec)) {
+                        for (const auto & entry : std::filesystem::directory_iterator(probe_dir, ec)) {
+                            if (!entry.is_regular_file(ec) && !entry.is_symlink(ec)) {
+                                continue;
+                            }
+                            const std::string fn = entry.path().filename().string();
+                            std::string fn_lower = fn;
+                            for (char & ch : fn_lower) {
+                                ch = (char) std::tolower((unsigned char) ch);
+                            }
+                            if (fn_lower.find("engram") != std::string::npos &&
+                                ((fn_lower.size() > 5 && fn_lower.rfind(".gguf") == fn_lower.size() - 5) ||
+                                 (fn_lower.size() > 10 && fn_lower.rfind(".gguf_file") == fn_lower.size() - 10))) {
+                                candidates.push_back(entry.path().string());
+                            }
                         }
                     }
-                    gguf_free(side_gguf);
-                    LLAMA_LOG_INFO("%s: attached engram sidecar from %s (%d engram_embd tables)\n", __func__, sidecar_path.c_str(), n_engram_tables);
-                } else {
-                    LLAMA_LOG_WARN("%s: deepseek41.engram.file points at '%s' which failed to load; continuing without the engram tables\n", __func__, sidecar_path.c_str());
+                }
+                std::string sidecar_path;
+                for (const auto & cand : candidates) {
+                    std::error_code ec;
+                    if (std::filesystem::exists(cand, ec) && !std::filesystem::is_directory(cand, ec)) {
+                        sidecar_path = cand;
+                        break;
+                    }
+                }
+                if (sidecar_path.empty() && !engram_file.empty()) {
+                    sidecar_path = base_dir + "/" + engram_file;
+                }
+                if (!sidecar_path.empty()) {
+                    struct ggml_context * ctx = nullptr;
+                    struct gguf_init_params side_params = {
+                        /*.no_alloc = */ true,
+                        /*.ctx      = */ &ctx,
+                    };
+                    struct gguf_context * side_gguf = gguf_init_from_file(sidecar_path.c_str(), side_params);
+                    if (side_gguf) {
+                        files.emplace_back(new llama_file(sidecar_path.c_str(), "rb"));
+                        contexts.emplace_back(ctx);
+                        const uint16_t side_idx = (uint16_t) (files.size() - 1);
+                        int n_engram_tables = 0;
+                        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                            if (strstr(cur->name, "engram_embd") != nullptr) {
+                                weights.emplace_back(files.back().get(), side_idx, cur->name, side_gguf, cur);
+                                n_engram_tables++;
+                            } else if (strstr(cur->name, "engram_") != nullptr) {
+                                bool already_have = false;
+                                for (const auto & w : weights) {
+                                    if (strcmp(w.tensor->name, cur->name) == 0) {
+                                        already_have = true;
+                                        break;
+                                    }
+                                }
+                                if (!already_have) {
+                                    weights.emplace_back(files.back().get(), side_idx, cur->name, side_gguf, cur);
+                                }
+                            }
+                        }
+                        gguf_free(side_gguf);
+                        LLAMA_LOG_INFO("%s: attached engram sidecar from %s (%d engram_embd tables)\n", __func__, sidecar_path.c_str(), n_engram_tables);
+                    } else {
+                        LLAMA_LOG_WARN("%s: deepseek41.engram.file points at '%s' which failed to load; continuing without the engram tables\n", __func__, sidecar_path.c_str());
+                    }
                 }
             }
         }

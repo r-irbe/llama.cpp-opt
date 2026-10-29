@@ -1564,8 +1564,27 @@ GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buf
     munmap(buffer->context, buffer->size);
 }
 
+// process-level pinning policy (GGML_CUDA_NO_PINNED remains the master user
+// switch; this flag lets the runner auto-disable pinning when a NUMA strategy
+// conflicts with it, see llama_numa_init_ex)
+static std::atomic<bool> g_cuda_host_pin_enabled{true};
+
+GGML_CALL void ggml_backend_cuda_set_host_pinning(bool enable) {
+    g_cuda_host_pin_enabled.store(enable, std::memory_order_relaxed);
+}
+
+GGML_CALL bool ggml_backend_cuda_host_pinning_enabled() {
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) { // user's master off switch
+        return false;
+    }
+    if (getenv("GGML_CUDA_PINNED_FORCE") != nullptr) { // user opted back in
+        return true;
+    }
+    return g_cuda_host_pin_enabled.load(std::memory_order_relaxed);
+}
+
 static void * ggml_cuda_host_malloc(size_t size) {
-    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+    if (!ggml_backend_cuda_host_pinning_enabled()) {
         return nullptr;
     }
 
@@ -1641,7 +1660,7 @@ static size_t ggml_cuda_pinned_cap() {
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
-    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+    if (!ggml_backend_cuda_host_pinning_enabled()) {
         return nullptr;
     }
     if (size > ggml_cuda_pinned_cap() - g_cuda_pinned_bytes) {
@@ -5193,6 +5212,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_MXFP8:
                         return true;
                     case GGML_TYPE_I32:
                         return op->src[0]->type == op->type;

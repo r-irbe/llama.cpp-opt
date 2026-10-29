@@ -426,6 +426,7 @@ extern "C" {
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
+        GGML_TYPE_MXFP8     = 43,  // MXFP8 (E4M3, E8M0 scale), gather-only (mainline PR #30817: Engram tables)
         GGML_TYPE_Q1_0      = 66,  // Unsloth 1-bit quants
         //
         //

@@ -15808,6 +15808,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_MXFP4: break;
         case GGML_TYPE_MXFP4_R8: break;
+        case GGML_TYPE_MXFP8: break;
         case GGML_TYPE_Q6_0: break;
         case GGML_TYPE_IQ2_K: break;
         case GGML_TYPE_IQ2_KS: break;

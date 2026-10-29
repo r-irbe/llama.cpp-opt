@@ -3531,6 +3531,12 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
     model.hc_head_fn    = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_fn.weight", "output_hc_fn.weight"}), hc_head_flags);
     model.hc_head_scale = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_scale.weight", "output_hc_scale.weight"}), hc_head_flags);
 
+    // 1017 GGUFs may store Engram metadata tables as tensors in the backbone or sidecar
+    create_tensor_from_meta(ctx_input, "engram_multipliers.weight", llama_model_loader::TENSOR_NOT_REQUIRED | llama_model_loader::TENSOR_SKIP);
+    create_tensor_from_meta(ctx_input, "engram_primes.weight",      llama_model_loader::TENSOR_NOT_REQUIRED | llama_model_loader::TENSOR_SKIP);
+    create_tensor_from_meta(ctx_input, "engram_offsets.weight",     llama_model_loader::TENSOR_NOT_REQUIRED | llama_model_loader::TENSOR_SKIP);
+    create_tensor_from_meta(ctx_input, "engram_token_map.weight",   llama_model_loader::TENSOR_NOT_REQUIRED | llama_model_loader::TENSOR_SKIP);
+
     // Standalone companions declare the full block count but contain only predictor tensors.
     if (is_standalone_mtp) {
         const int i = mtp_layer;
@@ -3575,10 +3581,16 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
         return use_mmap_buffer;
     }
 
+    // mainline DSv4.1 packaging: every engram layer gathers through get_rows from one
+    // shared per_layer_token_embd; the per-layer blk.N.engram_embd table below is the
+    // 1017 sidecar layout. Created in ctx_input (host) either way so -ngl never moves
+    // the tens-of-GB table off the file mapping.
+    ggml_tensor * shared_engram_tbl = create_tensor_from_meta(ctx_input, "per_layer_token_embd.weight",
+            llama_model_loader::TENSOR_NOT_REQUIRED);
+
     for (int i = 0; i < n_layer; ++i) {
         ggml_context * ctx_split = ctx_for_layer_split(i);
         auto & layer = model.layers[i];
-
         layer.attn_norm      = create_tensor_from_meta(ctx_split, layer_weight_name(i, "attn_norm"));
         layer.attn_sinks     = create_tensor_from_meta(ctx_split, format("blk.%d.attn_sinks.weight", i), llama_model_loader::TENSOR_NOT_REQUIRED);
         layer.wq_a           = create_tensor_from_meta(ctx_split, layer_weight_name(i, "attn_q_a"));
@@ -3662,13 +3674,31 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
         // vision variant: image tokens route through this bias instead of the hash path
         layer.ffn_exp_probs_b_vl = create_tensor_from_meta(ctx_split, format("blk.%d.exp_probs_b_vl.bias", i), llama_model_loader::TENSOR_NOT_REQUIRED);
 
+        if (shared_engram_tbl != nullptr) {
+            for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+                if (hparams.engram_layer_ids[e] == (uint32_t) i) {
+                    layer.engram_embd = shared_engram_tbl;
+                    break;
+                }
+            }
+        }
         // the engram table is hash-indexed and tens of GB: keep it in the input (host) context
         // so -ngl never moves it off the file mapping
-        layer.engram_embd = create_tensor_from_meta(ctx_input, format("blk.%d.engram_embd.weight", i), llama_model_loader::TENSOR_NOT_REQUIRED);
+        layer.engram_embd = layer.engram_embd ? layer.engram_embd
+            : create_tensor_from_meta(ctx_input, format("blk.%d.engram_embd.weight", i), llama_model_loader::TENSOR_NOT_REQUIRED);
         if (layer.engram_embd) {
-            layer.engram_wkv = create_tensor_from_meta(ctx_split, format("blk.%d.engram_wkv.weight", i));
-            layer.engram_k   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_k.weight", i));
-            layer.engram_q   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_q.weight", i));
+            // mainline naming: engram_kv is the key/value projection, engram_gate is the
+            // (n_embd, hc) scale with engram_k folded to ones at the graph level;
+            // 1017 sidecar naming: engram_wkv + separate engram_k / engram_q scales
+            layer.engram_wkv = create_tensor_from_meta(ctx_split, pick_tensor_name({
+                format("blk.%d.engram_wkv.weight", i),
+                format("blk.%d.engram_kv.weight", i),
+            }));
+            layer.engram_k   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_k.weight", i), llama_model_loader::TENSOR_NOT_REQUIRED);
+            layer.engram_q   = create_tensor_from_meta(ctx_split, pick_tensor_name({
+                format("blk.%d.engram_q.weight", i),
+                format("blk.%d.engram_gate.weight", i),
+            }));
         }
 
     }

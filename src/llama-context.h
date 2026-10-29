@@ -120,6 +120,8 @@ struct llama_kv_cache {
     uint32_t  window_swa   = 0;
     uint32_t  head_swa     = 0;
     llama_pos pos_base_swa = 0;
+    uint32_t  n_seq_max_swa = 1;
+    std::vector<llama_kv_cell> cells_swa;
 
     uint32_t live_swa() const { return head_swa - sink_rows; }
 

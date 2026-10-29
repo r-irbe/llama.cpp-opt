@@ -3,14 +3,14 @@
 # =============================================================================
 
 [models.kimi_k3]
-display_name = "Kimi-K3-Instruct-IQ4_XS (Long-Horizon Agentic MoE)"
-architecture = "kimi_k3 (MLA + 128-Expert MoE)"
+display_name = "Kimi-K3 UD-IQ1_S (Long-Horizon Agentic MoE; upstream llama.cpp required)"
+architecture = "kimi-k3 (Gated MLA + KDA; NOT loadable by this fork)"
 parameter_scale = "1024B Total / 32B Active"
 quantization = "IQ4_XS"
 disk_size_gib = 412.00
 vram_footprint_gib = 15.40
 ram_footprint_gib = 210.00
-path = "models/Kimi-K3-Instruct-IQ4_XS-00001-of-00009.gguf"
+path = "models/Kimi-K3-GGUF/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf"
 fallback_paths = []
 default_template = "low_vram_1m"
 notes = "Designed for 1M..10M token repository trajectories with Fuse8 KV capsules."

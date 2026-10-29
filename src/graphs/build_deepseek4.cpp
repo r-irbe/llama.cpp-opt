@@ -1123,6 +1123,9 @@ static ggml_tensor * ds4_build_engram(ggml_context * ctx0, llm_build_context & l
 
     // the gate scales reach ggml_mul, which takes f32; the file may carry them quantized
     auto as_f32 = [&](ggml_tensor * w, const char * name) -> ggml_tensor * {
+        if (w == nullptr) {
+            return nullptr;
+        }
         if (w->type == GGML_TYPE_F32) return ggml_reshape_2d(ctx0, w, hc_dim, 1);
         ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, w->ne[1]);
         ggml_set_input(ids);
@@ -1130,12 +1133,16 @@ static ggml_tensor * ds4_build_engram(ggml_context * ctx0, llm_build_context & l
         lctx.inp_engram_gate_ids.push_back(ids);
         return ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, w, ids), hc_dim, 1);
     };
-    // normalized per (token, hc copy) over n_embd
+    // normalized per (token, hc copy) over n_embd; the per-stream scale is optional
+    // (mainline containers fold the k/q scales into one engram_gate, mapped to
+    // engram_q with engram_k absent)
     auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
         t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
         t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
         t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
-        t = ggml_mul(ctx0, t, w);
+        if (w != nullptr) {
+            t = ggml_mul(ctx0, t, w);
+        }
         return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
     };
     ggml_tensor * k = grouped_norm(key, as_f32(layer.engram_k, "engram_k"));
@@ -1415,6 +1422,13 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
         const int64_t target_stream = std::max({raw_mask->ne[3], extra_mask->ne[3], raw_k->ne[3], extra_k->ne[3]});
+        if (raw_compacted && target_stream > 1 && raw_mask->ne[3] == 1 && n_tokens % target_stream == 0) {
+            ggml_tensor * unpadded = ggml_view_2d(ctx0, raw_mask, raw_mask->ne[0], n_tokens, raw_mask->nb[1], 0);
+            raw_mask = dsv4_build_mask_stream_view(ctx0, unpadded, target_stream, n_tokens);
+            if (cparams.flash_attn) {
+                raw_mask = dsv4_pad_mask_tokens(ctx0, raw_mask, n_tokens);
+            }
+        }
         raw_k      = dsv4_repeat_streams(ctx0, raw_k,      target_stream);
         extra_k    = dsv4_repeat_streams(ctx0, extra_k,    target_stream);
         raw_mask   = dsv4_repeat_streams(ctx0, raw_mask,   target_stream);
@@ -2354,6 +2368,13 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
             extra_mask = dsv4_pad_mask_tokens(ctx0, extra_mask, n_tokens);
         }
         const int64_t target_stream = std::max({raw_mask->ne[3], extra_mask->ne[3], raw_k->ne[3], extra_k->ne[3]});
+        if (raw_compacted && target_stream > 1 && raw_mask->ne[3] == 1 && n_tokens % target_stream == 0) {
+            ggml_tensor * unpadded = ggml_view_2d(ctx0, raw_mask, raw_mask->ne[0], n_tokens, raw_mask->nb[1], 0);
+            raw_mask = dsv4_build_mask_stream_view(ctx0, unpadded, target_stream, n_tokens);
+            if (cparams.flash_attn) {
+                raw_mask = dsv4_pad_mask_tokens(ctx0, raw_mask, n_tokens);
+            }
+        }
         raw_k      = dsv4_repeat_streams(ctx0, raw_k,      target_stream);
         extra_k    = dsv4_repeat_streams(ctx0, extra_k,    target_stream);
         raw_mask   = dsv4_repeat_streams(ctx0, raw_mask,   target_stream);

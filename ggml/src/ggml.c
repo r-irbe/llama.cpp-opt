@@ -1320,6 +1320,22 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    // MXFP8 (OCP MX, E4M3 + E8M0 scale): gather-only — consumed exclusively via
+    // GGML_OP_GET_ROWS (Engram tables). No vec_dot/quantize kernels by design;
+    // see mainline PR #30817. CPU supports_op gate in ggml-backend.cpp enforces it.
+    [GGML_TYPE_MXFP8] = {
+        .type_name                = "mxfp8",
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
+        .from_float               = NULL,
+        .from_float_ref           = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_COUNT,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_MXFP4_R8] = {
         .type_name                = "mxfp4_r8",
         .blck_size                = QK_MXFP4,
@@ -20553,6 +20569,7 @@ static void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q8_0_R8:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_MXFP4_R8:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_KS:
         case GGML_TYPE_IQ4_KS_R4:

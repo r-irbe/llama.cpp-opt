@@ -5939,7 +5939,9 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
     const uint64_t * mult   = model.engram_multipliers.data() + (size_t) eg*n_gram;
     const uint64_t * prime  = model.engram_primes.data()      + (size_t) eg*n_cols;
     const uint64_t * offset = model.engram_offsets.data()     + (size_t) eg*n_cols;
-    const uint64_t pad = model.engram_pad_id;
+    const uint64_t pad = model.engram_pad_mapped
+        ? model.engram_token_map[model.engram_pad_id]   // mainline storage: tokenizer id -> compressed id
+        : (uint64_t) model.engram_pad_id;               // sidecar storage: already a compressed bucket id
     auto map_of = [&](llama_token t) -> uint64_t {
         if (t < 0 || (size_t) t >= model.engram_token_map.size()) return pad;
         return model.engram_token_map[t];
@@ -9214,10 +9216,51 @@ void llama_backend_init(void) {
     }
 }
 
+// Pinning a device-accessible host region page-locks its pages. The NUMA
+// expert strategy re-binds routed expert pages with mbind(MPOL_MF_MOVE), and
+// mirror-with-replication re-folds the shared-expert base pages after copying
+// replicas: neither can migrate page-locked memory, so a pinned buffer set
+// silently defeats both. Split is only an alias of distribute (thread-block
+// binding only) and conflicts with nothing -- see common.cpp --numa parsing.
+static void llama_numa_cuda_pinning_gate(enum ggml_numa_strategy numa) {
+#ifdef GGML_USE_CUDA
+    if (numa != GGML_NUMA_STRATEGY_EXPERT && numa != GGML_NUMA_STRATEGY_MIRROR) {
+        return; // distribute/split/isolate/numactl: no page migration, no conflict
+    }
+    const bool rep_bind_required = numa == GGML_NUMA_STRATEGY_EXPERT ||
+        (numa == GGML_NUMA_STRATEGY_MIRROR && getenv("GGML_NUMA_REPLICATE_SHARED") != nullptr);
+    if (!rep_bind_required) {
+        // mirror-as-thread-binding only: pinning is legal, but the operator
+        // should know the trade they walked into on the co-tenant box
+        return;
+    }
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return; // user already chose the correct mode
+    }
+    if (getenv("GGML_CUDA_PINNED_FORCE") != nullptr) {
+        LLAMA_LOG_WARN("%s: GGML_CUDA_PINNED_FORCE keeps CUDA host pinning under --numa %s: "
+                "mbind(MPOL_MF_MOVE) cannot migrate page-locked pages, so expert tensor "
+                "binding and THP compaction are disabled for those buffers "
+                "(reasonable only when the GPU actively streams them)\n", __func__,
+                numa == GGML_NUMA_STRATEGY_EXPERT ? "expert" : "mirror+replicate");
+        return;
+    }
+    // automatic, flag-driven decision: disable pinning for this process
+    ggml_backend_cuda_set_host_pinning(false);
+    LLAMA_LOG_WARN("%s: --numa %s binds tensor pages across NUMA nodes (mbind(MPOL_MF_MOVE)), "
+            "which cannot migrate page-locked memory -- auto-disabling CUDA host pinning "
+            "for this process (set GGML_CUDA_NO_PINNED=1 yourself, or GGML_CUDA_PINNED_FORCE=1 "
+            "to keep pinning when the GPU streams the affected host tensors)\n", __func__,
+            numa == GGML_NUMA_STRATEGY_EXPERT ? "expert" : "mirror+replicate");
+#endif
+}
+
 enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
     if (numa == GGML_NUMA_STRATEGY_DISABLED) {
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
+
+    llama_numa_cuda_pinning_gate(numa);
 
     if (numa == GGML_NUMA_STRATEGY_EXPERT) {
         const auto & topo = ggml::cpu::numa::topology();

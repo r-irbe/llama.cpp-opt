@@ -579,6 +579,10 @@ struct llama_model {
     std::vector<uint64_t> engram_offsets;
     std::vector<uint32_t> engram_token_map;
     uint32_t              engram_pad_id = 0;
+    // true when engram_pad_id arrived as a mainline "engram.pad_token_id" (a
+    // tokenizer id that must go through token_map before hashing); the 1017
+    // sidecar "engram.pad_id" stores the already-compressed bucket id
+    bool                  engram_pad_mapped = false;
 
     // qwen4exp: final low-rank hyper-connection mix, plus the n-gram embedding table
     struct ggml_tensor * hc_head_norm = nullptr;

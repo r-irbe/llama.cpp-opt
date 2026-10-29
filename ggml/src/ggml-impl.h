@@ -47,6 +47,23 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// E4M3 (fn): signed, 4 exp bits (bias=7), 3 mantissa bits, no inf, 0x7F/0xFF = NaN.
+// Used by GGML_TYPE_MXFP8 (mainline PR #30817); exact in fp32 for every code.
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = x & 0x80;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    float v;
+    if (exp == 0xF && man == 0x7) {
+        v = NAN;
+    } else if (exp == 0) {
+        v = ldexpf((float) man, -9);
+    } else {
+        v = ldexpf((float) (8 + man), exp - 10);
+    }
+    return sign ? -v : v;
+}
+
 /**
  * Converts brain16 to float32.
  *

@@ -4,18 +4,25 @@
 # =============================================================================
 
 [defaults]
-binary = "build/bin/llama-server"
+binary = "build-pto/bin/llama-server"
 host = "127.0.0.1"
 port = 8080
 active_model = "deepseek_v41_flash"
 active_template = "coding_pinpoint"
 hardware_profile = "epyc_milan_rtx4090"
 threads = 56
+threads_batch = 56
 gpu_layers = 99
 flash_attn = "on"
 numa = "distribute"
 ctk = "q8_0"
 ctv = "q8_0"
+ictk = "q8_0"
+swa_compress = true
+fused_indexer = true
+dsa_attention = true
+defer_ple = true
+thinking_effort = "max_deep_think"
 evidence_strategy = "maxsim_exact_cover"
 evidence_chunk_tokens = 64
 evidence_keep_ratio = "20%"
@@ -34,72 +41,107 @@ merged_profdata = ".pi/pto-profiles/merged.profdata"
 optimized_binary = "build-pto/bin/llama-server"
 shared_libs = ["build-pto/ggml/src/libggml.so", "build-pto/src/libllama.so"]
 
-[models.deepseek-v4.1-1017-ud-q4kxl]
+[models."deepseek-v4.1-1017-ud-q4kxl"]
 description = "DeepSeek-V4.1-Flash-1017 (UD-Q4_K_XL + Engram + DSpark Q8_0)"
-path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
-fallback_paths = ["models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"]
+path = "DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf"
+fallback_paths = ["DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf"]
 ctx_size = 524288
 ctk = "q8_0"
 ctv = "q8_0"
+ictk = "q8_0"
+swa_compress = true
+fidx = true
+dsa = true
+dsatk = 1024
 parallel = 1
 mla = 2
 override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = true
+draft_model = "DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+ngld = 99
+spec_type = ["ngram-mod:n_max=6,n_min=2", "dspark:n_max=6,n_min=1"]
+spec_ckpt_mode = "per-step"
+spec_autotune = true
 default_template = "ds41-1017-np1-512k-max-speed"
 
-[models.deepseek-v4.1-1017-iq2xxs]
+[models."deepseek-v4.1-1017-iq2xxs"]
 description = "DeepSeek-V4.1-Flash-1017 (GSQ-RCO-IQ2_XXS + Engram + DSpark Q8_0)"
-path = "/home/radu/vm/llm/ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"
-fallback_paths = ["models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"]
+path = "ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"
+fallback_paths = ["ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"]
 ctx_size = 524288
 ctk = "q8_0"
 ctv = "q8_0"
+ictk = "q8_0"
+swa_compress = true
+fidx = true
+dsa = true
+dsatk = 1024
 parallel = 1
 mla = 2
 override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = true
+draft_model = "DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+ngld = 99
+spec_type = ["ngram-mod:n_max=6,n_min=2", "dspark:n_max=6,n_min=1"]
+spec_ckpt_mode = "per-step"
+spec_autotune = true
 default_template = "ds41-1017-np1-512k-max-speed"
 
-[models.deepseek_v41_flash]
+[models."deepseek_v41_flash"]
 description = "DeepSeek-V4.1-Flash (EngramQ8 Q2_K_Protected, 1T MoE)"
-path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
-fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf", "unsloth/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+path = "models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"
+fallback_paths = ["ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"]
 ctx_size = 524288
 ctk = "q8_0"
 ctv = "q8_0"
+ictk = "q8_0"
+swa_compress = true
+fidx = true
+dsa = true
+dsatk = 1024
 parallel = 1
 mla = 2
 override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = true
+draft_model = "DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+ngld = 99
+spec_type = ["ngram-mod:n_max=6,n_min=2", "dspark:n_max=6,n_min=1"]
+spec_ckpt_mode = "per-step"
+spec_autotune = true
 default_template = "ds41-1017-np1-512k-max-speed"
 
-[models.deepseek_v41_fastest_np8]
+[models."deepseek_v41_fastest_np8"]
 description = "DeepSeek-V4.1-Fastest-NP8 (High-Concurrency Multi-Slot Server)"
-path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
-fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+path = "ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"
+fallback_paths = ["models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
 ctx_size = 1048576
 ctk = "q4_0"
 ctv = "q4_0"
+ictk = "q4_0"
+swa_compress = true
+fidx = true
+dsa = true
+dsatk = 1024
 parallel = 8
 mla = 2
 override_tensor = "^blk\\..*\\.ffn_.*_exps.*=CPU"
 defer_ple = true
 default_template = "ds41-1017-np8-1m-swarm"
 
-[models.qwen38_27b]
+[models."qwen38_27b"]
 description = "Qwen3.8-27B-UD-Q4_K_XL (100% GPU VRAM Dense Flagship)"
-path = "models/Qwen3.8-27B-UD-Q4_K_XL.gguf"
-fallback_paths = ["unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"]
+path = "models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+fallback_paths = ["models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf"]
 ctx_size = 262144
 ctk = "q4_0"
 ctv = "q4_0"
 parallel = 8
 default_template = "coding_pinpoint"
 
-[models.qwen38_2_4t]
+[models."qwen38_2_4t"]
 description = "Qwen3.8-2.4T-A95B-UD-Q1_0 (2.4T Ultra-Scale MoE, GGUF-X NPMC)"
-path = "models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"
-fallback_paths = ["unsloth/Qwen3.8-2.4T-A95B-GGUF/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"]
+path = "models/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"
+fallback_paths = ["models/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"]
 ctx_size = 65536
 ctk = "q8_0"
 ctv = "q8_0"
@@ -107,10 +149,10 @@ parallel = 1
 override_tensor = "exps=CPU"
 default_template = "deep_formal_audit"
 
-[models.glm_53_flash]
+[models."glm_53_flash"]
 description = "GLM-5.3-Flash-UD-IQ4_XS (Fast Hybrid MoE Reasoner)"
-path = "models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
-fallback_paths = ["unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"]
+path = "models/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+fallback_paths = ["models/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"]
 ctx_size = 262144
 ctk = "q8_0"
 ctv = "q8_0"
@@ -118,9 +160,9 @@ parallel = 8
 override_tensor = "exps=CPU"
 default_template = "coding_pinpoint"
 
-[models.kimi_k3]
-description = "Kimi-K3-Instruct-IQ4_XS (Long-Horizon Agentic MoE)"
-path = "models/Kimi-K3-Instruct-IQ4_XS-00001-of-00009.gguf"
+[models."kimi_k3"]
+description = "Kimi-K3 UD-IQ1_S (Long-Horizon Agentic MoE; upstream llama.cpp required)"
+path = "models/Kimi-K3-GGUF/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf"
 fallback_paths = []
 ctx_size = 1048576
 ctk = "q4_0"
@@ -130,29 +172,9 @@ mla = 2
 override_tensor = "exps=CPU"
 default_template = "low_vram_1m"
 
-[models.recursive_flint]
-description = "Recursive-Flint-32B-Q6_K (Fast Speculative & Code Synthesis)"
-path = "models/Recursive-Flint-32B-Q6_K.gguf"
-fallback_paths = []
-ctx_size = 131072
-ctk = "q8_0"
-ctv = "q8_0"
-parallel = 1
-default_template = "max_throughput_np8"
-
-[models.diffusion_gemma]
-description = "DiffusionGemma-27B-IT-Q8_0 (Block-Diffusion Parallel Decoder)"
-path = "models/DiffusionGemma-27B-IT-Q8_0.gguf"
-fallback_paths = []
-ctx_size = 65536
-ctk = "q8_0"
-ctv = "q8_0"
-parallel = 1
-default_template = "coding_pinpoint"
-
-[models.leanstral_119b]
-description = "Leanstral-1.5-119B-A22B-Q4_K_M (Formal Theorem Proving MoE)"
-path = "models/Leanstral-1.5-119B-A22B-Q4_K_M.gguf"
+[models."leanstral_119b"]
+description = "Leanstral-1.5-119B-A6B-Q4_K_M (Formal Theorem Proving MoE)"
+path = "leanstral-1.5/Leanstral-1.5-119B-A6B-Q4_K_M.gguf"
 fallback_paths = []
 ctx_size = 131072
 ctk = "q8_0"
@@ -160,3 +182,161 @@ ctv = "q8_0"
 parallel = 1
 override_tensor = "exps=CPU"
 default_template = "deep_formal_audit"
+
+[profiles."ds41-1017-np1-512k-max-speed"]
+display_name = "DS4.1-1017 NP1 512K Max-Speed (Q8_0 KV + SWA Compress + DSpark + Pinpoint)"
+description = "Single-slot 512K max-speed & deep-reasoning preset: -np 1 -c 524288 --swa-compress -ctk q8_0 -ctv q8_0 -ictk q8_0 -fidx -dsa -dsatk 1024 -mla 2 --defer-ple + DSpark + ngram-mod."
+target_use_case = "Primary single-agent interactive coding & deep mathematical reasoning at 512K context"
+parallel_slots = "1"
+ctx_size = "524288"
+swa_compress = "on"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+indexer_cache_type_k = "q8_0"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+defer_ple = "on"
+defer_experts = "off"
+zdd_sparse_kv = "on"
+thp_hugepages = "on"
+threads = "56"
+numa_strategy = "distribute"
+spec_type = "ngram-mod_plus_dspark"
+spec_ckpt_mode = "per-step"
+spec_bandit = "thompson_counterfactual"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"
+evidence_keep_ratio = "20%"
+capsule_filter = "fuse8_simhash64"
+thinking_effort = "max_deep_think"
+
+[profiles."ds41-1017-np1-1m-extreme"]
+display_name = "DS4.1-1017 NP1 1M Extreme Context (Q4_0 KV + Q8_0 Indexer + SWA Compress)"
+description = "Single-slot 1M token extreme context preset: -np 1 -c 1048576 --swa-compress -ctk q4_0 -ctv q4_0 -ictk q8_0 -fidx -dsa -dsatk 1024 -mla 2 --defer-ple + Fuse16 capsules."
+target_use_case = "1M-token full-repository synthesis, trace forensics, and multi-paper citation walks"
+parallel_slots = "1"
+ctx_size = "1048576"
+swa_compress = "on"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+indexer_cache_type_k = "q8_0"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+defer_ple = "on"
+defer_experts = "off"
+zdd_sparse_kv = "on"
+thp_hugepages = "on"
+threads = "56"
+numa_strategy = "distribute"
+spec_type = "ngram-mod_plus_dspark"
+spec_ckpt_mode = "per-step"
+spec_bandit = "thompson_counterfactual"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"
+evidence_keep_ratio = "15%"
+capsule_filter = "fuse16_simhash64"
+thinking_effort = "max_deep_think"
+
+[profiles."ds41-1017-np4-512k-swarm"]
+display_name = "DS4.1-1017 NP4 512K Agent Swarm (4 Slots x 128K + Cohort KV Clone)"
+description = "4-slot parallel agent swarm preset: -np 4 -c 524288 --swa-compress -cb -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -ictk q8_0 --cohort-prefix-sharing --cohort-min-prefix 64 --zdd-sparse-kv."
+target_use_case = "4-worker subagent coding & verification fleet with zero-copy prefix cloning"
+parallel_slots = "4"
+ctx_size = "524288"
+swa_compress = "on"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+indexer_cache_type_k = "q8_0"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+defer_ple = "on"
+defer_experts = "off"
+cohort_sharing = "on"
+zdd_sparse_kv = "on"
+thp_hugepages = "on"
+threads = "56"
+numa_strategy = "distribute"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"
+thinking_effort = "high_analytical"
+
+[profiles."ds41-1017-np8-1m-swarm"]
+display_name = "DS4.1-1017 NP8 1M High-Concurrency Swarm (8 Slots x 128K + Q4_0 Indexer)"
+description = "8-slot high-concurrency 1M aggregate preset: -np 8 -c 1048576 --swa-compress -cb -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -ictk q4_0 --cohort-prefix-sharing --cohort-min-prefix 64 --zdd-sparse-kv."
+target_use_case = "8-agent parallel council & multi-track fleet under 24 GiB VRAM ceiling"
+parallel_slots = "8"
+ctx_size = "1048576"
+swa_compress = "on"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+indexer_cache_type_k = "q4_0"
+fused_indexer = "on"
+dsa_attention = "on"
+mla_mode = "2"
+defer_ple = "on"
+defer_experts = "off"
+cohort_sharing = "on"
+zdd_sparse_kv = "on"
+thp_hugepages = "on"
+threads = "56"
+numa_strategy = "distribute"
+concurrency_knee_guard = "on"
+evidence_strategy = "code_pinpoint"
+evidence_chunk_tokens = "140"
+thinking_effort = "high_analytical"
+
+[profiles."coding_pinpoint"]
+display_name = "Coding Agent Pinpoint (Zero-Decompaction + Fuse8 Capsules)"
+description = "Balanced low-TTFT coding agent preset with MaxSim+Exact-Cover pruning and Binary Fuse8 capsules."
+target_use_case = "Interactive coding agents (Pi, Antigravity, OpenCode, Claude Code)"
+evidence_strategy = "maxsim_exact_cover"
+evidence_chunk_tokens = "64"
+evidence_keep_ratio = "20%"
+global_summary_header = "on"
+capsule_filter = "fuse8_simhash64"
+wake_min_hamming_sim = "0.60"
+max_wake_per_turn = "4"
+zdd_sparse_kv = "on"
+cohort_sharing = "on"
+spec_bandit = "thompson_counterfactual"
+
+[profiles."low_vram_1m"]
+display_name = "1M..10M Ultra-Long Context (Q4_0 KV + Tiered Host DMA + Fuse16)"
+description = "Maximizes context window up to 1M-10M tokens inside 24 GiB VRAM via Q4_0 KV and Fuse16 capsules."
+target_use_case = "Whole-repository audits, 10M-token logs, long-horizon agent sessions"
+ctx_size = "1048576"
+kv_type_k = "q4_0"
+kv_type_v = "q4_0"
+tiered_kv_dma = "auto_hot_window"
+zdd_sparse_kv = "on"
+capsule_filter = "fuse16_simhash64"
+evidence_keep_ratio = "15%"
+wake_min_hamming_sim = "0.65"
+
+[profiles."max_throughput_np8"]
+display_name = "Multi-Agent Swarm Throughput (-np 8..32 + Cross-Slot KV Clone)"
+description = "Optimizes multi-slot parallel throughput for concurrent subagent councils using cohort KV cloning."
+target_use_case = "RALPH 5-agent review councils, parallel subagent fleets"
+parallel_slots = "8"
+cohort_sharing = "on"
+cohort_min_prefix = "64"
+cross_slot_kv_clone = "on"
+batch_size = "4096"
+ubatch_size = "1024"
+concurrency_knee_guard = "on"
+
+[profiles."deep_formal_audit"]
+display_name = "Deterministic Formal Proof & Perplexity Audit (Greedy + Q8_0 KV)"
+description = "Zero-temperature deterministic evaluation with high-precision Q8_0 KV and global occurrence counts."
+target_use_case = "Lean 4 formal verification, mathematical theorem proving, benchmark verification"
+kv_type_k = "q8_0"
+kv_type_v = "q8_0"
+temp = "0.0"
+top_p = "1.00"
+min_p = "0.00"
+evidence_keep_ratio = "35%"
+global_summary_header = "on"
+capsule_filter = "fuse16_simhash64"

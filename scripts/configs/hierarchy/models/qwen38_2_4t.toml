@@ -10,8 +10,8 @@ quantization = "UD-Q1_0_G128 (Type 66)"
 disk_size_gib = 354.24
 vram_footprint_gib = 14.80
 ram_footprint_gib = 356.00
-path = "models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"
-fallback_paths = ["unsloth/Qwen3.8-2.4T-A95B-GGUF/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"]
+path = "models/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"
+fallback_paths = ["models/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf"]
 default_template = "deep_formal_audit"
 notes = "Repacked GGUF-X v3 eliminates 277 LINT005 shard jumps (-89.7% prefill jitter, 3.82 tok/s decode)."
 

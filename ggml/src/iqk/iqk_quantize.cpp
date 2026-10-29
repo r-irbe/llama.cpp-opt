@@ -4810,6 +4810,20 @@ void dequantize_row_mxfp4(const block_mxfp4 * x, float * y, int64_t k) {
     }
 }
 
+void dequantize_row_mxfp8(const block_mxfp8 * x, float * y, int64_t k) {
+    constexpr int kBlockSize = QK_MXFP8;
+    GGML_ASSERT(k%kBlockSize == 0);
+    int nblock = k/kBlockSize;
+    for (int ib = 0; ib < nblock; ++ib) {
+        // exact: e4m3 * 2^(e-127) is representable in fp32 for every code and scale
+        const float d = x[ib].e == 0xFF ? std::numeric_limits<float>::quiet_NaN() : GGML_E8M0_TO_FP32(x[ib].e);
+        for (int j = 0; j < kBlockSize; ++j) {
+            y[j] = ggml_e4m3_to_fp32(x[ib].qs[j]) * d;
+        }
+        y += kBlockSize;
+    }
+}
+
 void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
     if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_K, vy, 0, s, 0, 0, 1)) {

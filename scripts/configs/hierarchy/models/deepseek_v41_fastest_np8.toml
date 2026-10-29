@@ -10,8 +10,8 @@ quantization = "UD-Q4_K_XL / Q2_K_Protected"
 disk_size_gib = 386.37
 vram_footprint_gib = 18.20
 ram_footprint_gib = 186.10
-path = "/home/radu/vm/llm/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00008.gguf"
-fallback_paths = ["models/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
+path = "ista-deepseek-v4.1-1017/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf"
+fallback_paths = ["models/Smalinin-Deepseek-v41-flash/Q2_K_Protected-Q8/DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected-00001-of-00010.gguf"]
 default_template = "ds41-1017-np8-1m-swarm"
 notes = "Tuned for 8-slot 1M-context parallel agent swarm serving with --swa-compress and cross-slot donor KV cloning."
 

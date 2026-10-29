@@ -10,8 +10,8 @@ quantization = "UD-IQ4_XS"
 disk_size_gib = 147.95
 vram_footprint_gib = 11.67
 ram_footprint_gib = 135.53
-path = "models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
-fallback_paths = ["unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"]
+path = "models/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+fallback_paths = ["models/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"]
 default_template = "coding_pinpoint"
 notes = "1M context fits in 18.17 GiB VRAM with Q4_0 KV; 8-slot cohort cloning delivers 3.48x speedup."
 

@@ -633,8 +633,9 @@ ggml_tensor * llm_build_context::build_swa_mask_for_graph(uint32_t window, bool 
     const uint32_t pad = llama_kv_cache::get_padding(cparams.flash_attn);
     const int64_t live = !compacted ? 0 : kv ? (int64_t) kv->live_swa()
         : (int64_t) swa_head - (int64_t) kv_self.sink_rows + n_tokens;
+    const uint32_t eff_window = compacted ? window * std::max<uint32_t>(1, cache.n_seq_max_swa) : window;
     const llama_swa_window_view view = compacted
-        ? llama_swa_calc_window_view_compact(live, cache.sink_rows, n_tokens, window, pad)
+        ? llama_swa_calc_window_view_compact(live, cache.sink_rows, n_tokens, eff_window, pad)
         : llama_swa_calc_window_view(cache_n_kv, n_tokens, window, pad);
 
     if (!view.engaged) {

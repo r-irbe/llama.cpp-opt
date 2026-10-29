@@ -2188,10 +2188,16 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
                 ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,        hparams.n_expert_shared);
 
-                // DSA parameters
-                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
-                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
-                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+                // DSA parameters. Strict for target archs; a dflash DRAFTER
+                // (DSpark block drafter, e.g. unsloth packaging) has no DSA
+                // indexer module and no indexer tensors, so the KVs must be
+                // optional there (the drafter graph never reads indexer).
+                {
+                    const bool need_indexer = model.arch != LLM_ARCH_DFLASH;
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    need_indexer);
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, need_indexer);
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     need_indexer);
+                }
 
                 if (is_dsv4) {
                     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
@@ -2241,25 +2247,52 @@ void llm_load_hparams(
                     ml.get_key(LLM_KV_HASH_LAYER_COUNT, hparams.dsv4_hash_layer_count, false);
 
                     if (model.arch == LLM_ARCH_DEEPSEEK41) {
-                        ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_n_layer);
+                        // Two engram packagings: the 1017 sidecar layout stores
+                        // everything under deepseek41.engram.*; the mainline
+                        // (unsloth/mxfp8) packaging carries the ids as ple.layers
+                        // and the hash tables as ple.* arrays (deepseek41.ple.*,
+                        // exactly the qwen4exp key family).
+                        uint32_t n_engram_layers = 0;
+                        if (!ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, n_engram_layers, false)) {
+                            if (!ml.get_arr_n(LLM_KV_PLE_LAYERS, n_engram_layers, false)) {
+                                throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS).c_str()));
+                            }
+                        }
+                        hparams.engram_n_layer = n_engram_layers;
                         if (hparams.engram_n_layer == 0 || hparams.engram_n_layer > LLAMA_MAX_LAYERS) {
                             throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", hparams.engram_n_layer));
                         }
                         {
                             std::vector<uint32_t> ids;
-                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), ids);
+                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), ids, false);
+                            if (ids.empty()) {
+                                ml.get_arr(ml.llm_kv(LLM_KV_PLE_LAYERS), ids);
+                            }
                             std::copy_n(ids.begin(), std::min<size_t>(ids.size(), LLAMA_MAX_LAYERS), hparams.engram_layer_ids.begin());
                         }
+                        // geometry: engram.* keys first (sidecar naming), then the
+                        // mainline ple.* equivalents, then the historical defaults
                         if (!ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT, hparams.engram_n_head, false)) {
-                            hparams.engram_n_head = 8;
+                            ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.engram_n_head, false);
+                            if (hparams.engram_n_head == 0) {
+                                hparams.engram_n_head = 8;
+                            }
                         }
                         if (!ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH, hparams.engram_key_length, false)) {
-                            hparams.engram_key_length = 256;
+                            if (!ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.engram_key_length, false)) {
+                                hparams.engram_key_length = 256;
+                            }
                         }
                         if (!ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size, false)) {
-                            hparams.engram_max_ngram_size = 4;
+                            if (!ml.get_key(LLM_KV_PLE_NGRAM_SIZE, hparams.engram_max_ngram_size, false)) {
+                                hparams.engram_max_ngram_size = 4;
+                            }
                         }
-                        ml.get_key(LLM_KV_ENGRAM_PAD_ID, model.engram_pad_id, false);
+                        if (!ml.get_key(LLM_KV_ENGRAM_PAD_ID, model.engram_pad_id, false)) {
+                            if (ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID, model.engram_pad_id, false)) {
+                                model.engram_pad_mapped = true;
+                            }
+                        }
                         if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
                             throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
                         }
@@ -2268,20 +2301,22 @@ void llm_load_hparams(
                                 throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
                             }
                         }
-                        // RCO/DASLab GSQ packagings store the engram hash
-                        // tables as raw I64/I32 tensors (engram_multipliers.weight
-                        // etc.) with the KV arrays absent; source them from the
-                        // tensors when the KV keys are missing.
+                        // hash bookkeeping sources, in order: engram.* KV arrays,
+                        // raw I64/I32 tensors (engram_multipliers.weight etc. from
+                        // RCO/DASLab GSQ packagings), or the mainline ple.* KV arrays
                         if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers, false) &&
-                                !ml.get_arr_tensor("engram_multipliers.weight", model.engram_multipliers)) {
+                                !ml.get_arr_tensor("engram_multipliers.weight", model.engram_multipliers) &&
+                                !ml.get_arr(ml.llm_kv(LLM_KV_PLE_LAYER_MULTIPLIERS), model.engram_multipliers, false)) {
                             throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str()));
                         }
                         if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES), model.engram_primes, false) &&
-                                !ml.get_arr_tensor("engram_primes.weight", model.engram_primes)) {
+                                !ml.get_arr_tensor("engram_primes.weight", model.engram_primes) &&
+                                !ml.get_arr(ml.llm_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES), model.engram_primes, false)) {
                             throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_PRIMES).c_str()));
                         }
                         if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS), model.engram_offsets, false) &&
-                                !ml.get_arr_tensor("engram_offsets.weight", model.engram_offsets)) {
+                                !ml.get_arr_tensor("engram_offsets.weight", model.engram_offsets) &&
+                                !ml.get_arr(ml.llm_kv(LLM_KV_PLE_HEAD_OFFSETS), model.engram_offsets, false)) {
                             const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                             model.engram_offsets.resize(model.engram_primes.size());
                             for (uint32_t l = 0; l < hparams.engram_n_layer; ++l) {
@@ -2298,6 +2333,9 @@ void llm_load_hparams(
                         if (!ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP), model.engram_token_map, false) &&
                                 !ml.get_arr_tensor("engram_token_map.weight", model.engram_token_map)) {
                             throw std::runtime_error(format("array key not found in model: %s", ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str()));
+                        }
+                        if (model.engram_pad_mapped && model.engram_pad_id >= model.engram_token_map.size()) {
+                            throw std::runtime_error("engram pad token id is outside the token map");
                         }
                         const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                         if (model.engram_multipliers.size() != (size_t) hparams.engram_n_layer * hparams.engram_max_ngram_size) {

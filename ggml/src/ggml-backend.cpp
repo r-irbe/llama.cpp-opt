@@ -1070,6 +1070,16 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
 }
 
 GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
+    // MXFP8 is a gather-only type: GET_ROWS reads it, nothing else does (and
+    // nothing writes it). Mirrors mainline PR #30817.
+    if (op->type == GGML_TYPE_MXFP8) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP8 && !(op->op == GGML_OP_GET_ROWS && i == 0)) {
+            return false;
+        }
+    }
     switch (op->op) {
         case GGML_OP_CPY:
             return

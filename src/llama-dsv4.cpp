@@ -398,7 +398,7 @@ static bool dsv4_build_raw_context(
                     __func__, kv.head_swa, kv.head_swa + (uint32_t) batch.n_tokens, kv.size_swa);
             return false;
         }
-        if (batch.pos != nullptr && batch.n_tokens > 0 &&
+        if (kv.n_seq_max_swa <= 1 && batch.pos != nullptr && batch.n_tokens > 0 &&
             kv.pos_base_swa + (llama_pos) (kv.head_swa - kv.sink_rows) != batch.pos[0]) {
             LLAMA_LOG_ERROR("%s: DSV4 compacted write row %u disagrees with batch position %d (base %d)\n",
                     __func__, kv.head_swa, batch.pos[0], kv.pos_base_swa);
@@ -435,12 +435,18 @@ static bool dsv4_build_raw_context(
             if (!cell.has_seq_id(seq_id)) {
                 continue;
             }
-            if (compacted && cell.pos < kv.pos_base_swa) {
+            if (compacted && kv.n_seq_max_swa <= 1 && cell.pos < kv.pos_base_swa) {
                 // rows before the window base were overwritten by compaction
                 continue;
             }
-            const uint32_t row = compacted
-                ? kv.sink_rows + (uint32_t) (cell.pos - kv.pos_base_swa) : slot;
+            uint32_t row = slot;
+            if (compacted) {
+                if (kv.n_seq_max_swa <= 1) {
+                    row = kv.sink_rows + (uint32_t) (cell.pos - kv.pos_base_swa);
+                } else {
+                    continue;
+                }
+            }
             raw.sinfo_read.idxs[s].push_back(row);
             raw.read_dst_idxs.push_back((int32_t) row);
             ++count;
@@ -460,7 +466,7 @@ static bool dsv4_build_raw_context(
             if (!dsv4_token_has_seq(batch, i, seq_id)) {
                 continue;
             }
-            raw.sinfo_write.idxs[s].push_back((uint32_t) (kv.head + i));
+            raw.sinfo_write.idxs[s].push_back(compacted ? (uint32_t) (kv.head_swa + i) : (uint32_t) (kv.head + i));
         }
     }
 
