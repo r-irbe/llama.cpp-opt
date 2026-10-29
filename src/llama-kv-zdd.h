@@ -18,7 +18,6 @@
 #include <cstddef>
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
 #include <algorithm>
 
 namespace llama::kv::zdd {
@@ -35,26 +34,22 @@ struct alignas(16) ZddNode {
     uint32_t ref_count;
 };
 
-/// 64-bit hash key for (var, low, high) unique table hash-consing
-struct ZddKey {
-    uint32_t var;
-    uint32_t low;
-    uint32_t high;
+/// SWAR packed unique-table key: var:21 | low:21 | high:21 (63 bits used).
+/// Bounds: supports up to 2,097,152 blocks (~134M tokens of 64-token blocks)
+/// and 2M nodes per manager — far beyond the 10M-token target. One packed
+/// word gives single-compare interning and AVX-512-batchable key ops.
+static constexpr uint64_t zdd_key_pack(uint32_t var, uint32_t low, uint32_t high) {
+    return ((uint64_t)(var & 0x1FFFFFu) << 42) |
+           ((uint64_t)(low & 0x1FFFFFu) << 21) |
+            (uint64_t)(high & 0x1FFFFFu);
+}
 
-    bool operator==(const ZddKey & other) const {
-        return var == other.var && low == other.low && high == other.high;
-    }
-};
-
-struct ZddKeyHash {
-    size_t operator()(const ZddKey & k) const noexcept {
-        uint64_t h = (uint64_t)k.var ^ ((uint64_t)k.low << 21) ^ ((uint64_t)k.high << 42);
-        h ^= h >> 33;
-        h *= 0xff51afd7ed558ccdULL;
-        h ^= h >> 33;
-        return (size_t)h;
-    }
-};
+static inline size_t zdd_key_hash(uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    return (size_t) k;
+}
 
 /// High-performance ZDD Manager for sparse KV block selection
 class ZddKvManager {
@@ -84,7 +79,13 @@ public:
             return low;
         }
 
-        ZddKey key{ var, low, high };
+        // Block ids beyond the manager capacity would silently alias under
+        // the packed 21-bit key — guard the capacity explicitly.
+        if (var >= n_max_blocks) {
+            return ZDD_EMPTY;
+        }
+
+        const uint64_t key = zdd_key_pack(var, low, high);
         auto it = unique_table.find(key);
         if (it != unique_table.end()) {
             return it->second;
@@ -194,7 +195,7 @@ public:
 private:
     uint32_t n_max_blocks;
     std::vector<ZddNode> nodes;
-    std::unordered_map<ZddKey, uint32_t, ZddKeyHash> unique_table;
+    std::unordered_map<uint64_t, uint32_t> unique_table;
 };
 
 /// Exact Cover Matrix representation for Knuth Algorithm X / DLX
@@ -261,7 +262,7 @@ public:
             return low;
         }
 
-        ZddKey key{ var, low, high };
+        const uint64_t key = zdd_key_pack(var, low, high);
         auto it = unique_table_.find(key);
         if (it != unique_table_.end()) {
             return it->second;
@@ -347,7 +348,7 @@ public:
 
 private:
     std::vector<ZddNode> nodes_;
-    std::unordered_map<ZddKey, uint32_t, ZddKeyHash> unique_table_;
+    std::unordered_map<uint64_t, uint32_t> unique_table_;
     std::unordered_map<uint64_t, uint32_t> memo_cache_;
 };
 

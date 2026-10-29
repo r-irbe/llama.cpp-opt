@@ -244,6 +244,8 @@ add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>
 add_executable(test-kv-zdd test-kv-zdd.cpp)
 target_include_directories(test-kv-zdd PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-kv-zdd COMMAND $<TARGET_FILE:test-kv-zdd>)
+add_executable(test-kv-zdd-bench test-kv-zdd-bench.cpp)
+target_include_directories(test-kv-zdd-bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (GGML_CUDA)
     llama_build_and_test(test-cuda-l2-persistence.cpp)
@@ -324,5 +326,13 @@ add_executable(test-polygraph-plan test-polygraph-plan.cpp)
 target_include_directories(test-polygraph-plan PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-polygraph-plan PRIVATE common)
 add_test(NAME test-polygraph-plan COMMAND $<TARGET_FILE:test-polygraph-plan>)
+
+option(POLYGRAPH_MICROBENCH "Build test-cuda-graph-pinned (model-free CUDA backend is broken in this fork; see the .cpp header)" OFF)
+if (GGML_CUDA AND POLYGRAPH_MICROBENCH)
+    add_executable(test-cuda-graph-pinned test-cuda-graph-pinned.cpp)
+    target_include_directories(test-cuda-graph-pinned PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-cuda-graph-pinned PRIVATE ggml)
+    add_test(NAME test-cuda-graph-pinned COMMAND $<TARGET_FILE:test-cuda-graph-pinned>)
+endif()
 
 
