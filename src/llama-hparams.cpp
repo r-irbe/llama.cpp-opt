@@ -2293,7 +2293,6 @@ void llm_load_hparams(
                                 model.engram_pad_mapped = true;
                             }
                         }
-||||||| base
                         ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
                         ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
                         ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
@@ -2342,7 +2341,6 @@ void llm_load_hparams(
                         if (model.engram_pad_mapped && model.engram_pad_id >= model.engram_token_map.size()) {
                             throw std::runtime_error("engram pad token id is outside the token map");
                         }
-||||||| base
                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS),     model.engram_offsets);

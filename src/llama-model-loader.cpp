@@ -613,7 +613,6 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         }
     }
 
-||||||| base
     std::set<std::string> tensor_names;
     for (auto & w : weights) {
         n_elements += ggml_nelements(w.tensor);
@@ -1113,22 +1112,6 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
 
     return true;
 }
-||||||| base
-    switch (arr_info.gt) {
-        case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T, float>::value)); break;
-        case GGUF_TYPE_UINT32:
-        case GGUF_TYPE_BOOL:
-        case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
-        case GGUF_TYPE_UINT64:
-        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>) || (std::is_same_v<T, uint64_t>));  break;
-        default:
-            throw std::runtime_error(format("%s is not a float32, int32, uint32, int64, uint64 or bool array", key.c_str()));
-    }
-
-    result.resize(arr_info.length);
-    if (arr_info.gt == GGUF_TYPE_BOOL) {
-        std::transform((const int8_t *)arr_info.data, (const int8_t *)arr_info.data + arr_info.length, result.begin(),
-                [] (int8_t x) { return static_cast<T>(x != 0); });
 
 template<typename T>
 bool llama_model_loader::get_arr_tensor(const std::string & name, std::vector<T> & result) {
@@ -1150,10 +1133,8 @@ bool llama_model_loader::get_arr_tensor(const std::string & name, std::vector<T>
         files[w.idx]->seek(w.offs, SEEK_SET);
         files[w.idx]->read_raw(result.data(), nbytes);
         return true;
-||||||| base
-    } else {
-        result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
     }
+
     return false;
 }
 
