@@ -131,7 +131,6 @@ struct llama_model_loader {
         out_map = npmc_superblock_tensors;
     }
 
-||||||| base
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
             const llama_model_kv_override * param_overrides_p,

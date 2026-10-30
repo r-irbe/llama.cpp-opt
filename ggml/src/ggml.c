@@ -20511,7 +20511,6 @@ static void ggml_compute_forward_get_rows_i8(
     }
 }
 
-||||||| base
 static void ggml_compute_forward_get_rows(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
@@ -23282,7 +23281,7 @@ static void ggml_compute_forward_pad_f32(
         for (int ib = ith; ib < nblocks; ib += nth) {
             int first = ib*k_block_size;
             int last  = MIN(first + k_block_size, nelem);
-            // 
+            //
             //int ii = first;
             //int i3 = ii/(ne0*ne1*ne2); ii -= i3*ne0*ne1*ne2;
             //int i2 = ii/(ne0*ne1    ); ii -= i2*ne0*ne1;
