@@ -617,4 +617,39 @@ def test_launch_py_all_models_and_profiles_dry_run_and_idempotent_export():
     assert "--spec-verify-pinned" in combo.stdout
 
 
+def test_playwright_tui_devtools_screencast_and_inline_graphics_audit():
+    """Verify ctx_capsule_tui.ts --screencast audits all 7 tabs, all 44 options, all 165 variants, Help modal, and Kitty/iTerm2 PNG graphics."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cast_path = Path(tmpdir) / "ctx_capsule_audit.cast"
+        html_path = Path(tmpdir) / "ctx_capsule_audit.html"
+        json_path = Path(tmpdir) / "ctx_capsule_audit.audit.json"
+
+        res = run_ts_tui("--screencast", str(cast_path), "--dry-run")
+        assert res.returncode == 0, f"--screencast failed: {res.stderr}"
+
+        report = json.loads(res.stdout)
+        assert report["categoriesAudited"] == 7
+        assert report["totalSettingsAudited"] == 44
+        assert report["totalVariantsCycledAndVerified"] >= 160
+        assert report["helpModalVerified"] is True
+        assert report["responsive88ColVerified"] is True
+        assert report["geometryViolations"] == []
+        assert report["explanationViolations"] == []
+        assert len(report["inlineGraphicsAudit"]) == 7
+        for item in report["inlineGraphicsAudit"]:
+            assert item["kittyValidApc"] is True
+            assert item["iterm2ValidOsc"] is True
+            assert item["pngBase64Length"] > 500
+
+        assert cast_path.exists()
+        assert html_path.exists()
+        assert json_path.exists()
+        cast_lines = cast_path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(cast_lines) > 150
+        header = json.loads(cast_lines[0])
+        assert header["version"] == 2
+        assert header["width"] == 136
+
+
+
 
