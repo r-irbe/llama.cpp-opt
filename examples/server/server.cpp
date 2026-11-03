@@ -1040,6 +1040,7 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
             // need to store the reader as a pointer, so that it won't be destroyed when the handle returns
             // use shared_ptr as it's shared between the chunked_content_provider() and on_complete()
             const auto rd = std::make_shared<server_response_reader>(ctx_server);
+            std::string capsule_filter_mode = "fuse8_simhash64";
 
             try {
                 std::vector<server_task> tasks;
@@ -1063,7 +1064,12 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
                     ? data["evidence_capsule"] : json::object();
                 if (!ev_capsule.empty()) {
                     enable_evidence = json_value(ev_capsule, "enabled", json_value(ev_capsule, "evidence_filter", true));
+                    if (ev_capsule.contains("capsule_filter") && ev_capsule["capsule_filter"].is_string() && !data.contains("capsule_filter")) {
+                        data["capsule_filter"] = ev_capsule["capsule_filter"];
+                    }
                 }
+                capsule_filter_mode = json_value(data, "capsule_filter", std::string("fuse8_simhash64"));
+                res.set_header("X-Capsule-Filter", capsule_filter_mode);
                 unreal::filter_telemetry ev_telemetry;
                 if (enable_evidence) {
                     gpt_params unreal_params = ctx_server.params_base;
@@ -1170,6 +1176,8 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
                     task.tokens = std::move(inputs[i]);
                     task.data = data;
                     task.cohort_id = json_value(data, "cohort_id", std::string());
+                    task.capsule_filter = capsule_filter_mode;
+                    task.params.capsule_filter = capsule_filter_mode;
                     //task.params = server_task::params_from_json_cmpl(
                     //    ctx_server.ctx,
                     //    ctx_server.params,
@@ -1214,6 +1222,16 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
                         if (data.contains("__evidence_telemetry")) {
                             r_json["evidence_telemetry"] = data["__evidence_telemetry"];
                         }
+                        if (!capsule_filter_mode.empty() || !ctx_server.checkpoint_spill_session_dir.empty()) {
+                            r_json["capsule_filter_mode"]  = r_item->timings.capsule_filter_mode.empty() ? capsule_filter_mode : r_item->timings.capsule_filter_mode;
+                            r_json["capsule_filter_hits"]  = r_item->timings.capsule_filter_hits;
+                            r_json["capsule_filter_skips"] = r_item->timings.capsule_filter_skips;
+                            if (r_json.contains("timings") && r_json["timings"].is_object()) {
+                                r_json["timings"]["capsule_filter_mode"]  = r_json["capsule_filter_mode"];
+                                r_json["timings"]["capsule_filter_hits"]  = r_item->timings.capsule_filter_hits;
+                                r_json["timings"]["capsule_filter_skips"] = r_item->timings.capsule_filter_skips;
+                            }
+                        }
                         arr.push_back(std::move(r_json));
                         SERVER_CAL_SNAPSHOT("aggregate_json_transfer", &arr, nullptr, &arr);
                     }
@@ -1256,6 +1274,11 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
     const auto inject_request_headers = [](const httplib::Request & req, json & data) {
         if (req.has_header("X-Cohort-ID") && !data.contains("cohort_id")) {
             data["cohort_id"] = req.get_header_value("X-Cohort-ID");
+        }
+        if (req.has_header("X-Capsule-Filter") && !data.contains("capsule_filter")) {
+            data["capsule_filter"] = req.get_header_value("X-Capsule-Filter");
+        } else if (req.has_header("X-Evidence-Capsule-Filter") && !data.contains("capsule_filter")) {
+            data["capsule_filter"] = req.get_header_value("X-Evidence-Capsule-Filter");
         }
         if (req.has_header("X-Evidence-Filter") && !data.contains("evidence_filter")) {
             std::string val = req.get_header_value("X-Evidence-Filter");
@@ -1320,10 +1343,17 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
             "evidence_keep_tail",
             "keep_tail",
             "cohort_id",
+            "capsule_filter",
         };
         for (const char * key : k_ev_fields) {
             if (body.contains(key) && !data.contains(key)) {
                 data[key] = body[key];
+            }
+        }
+        if (body.contains("evidence_capsule") && body["evidence_capsule"].is_object()) {
+            const auto & evc = body["evidence_capsule"];
+            if (evc.contains("capsule_filter") && !data.contains("capsule_filter")) {
+                data["capsule_filter"] = evc["capsule_filter"];
             }
         }
     };

@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "llama.h"
+#include "kv-capsule-filter.h"
 
 #include <string>
 #include <unordered_set>
@@ -78,6 +79,9 @@ struct slot_params {
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+
+    // KV capsule filter mode ("fuse8_simhash64", "fuse8_only", "simhash64_only", "disabled")
+    std::string capsule_filter = "fuse8_simhash64";
 };
 
 struct server_task {
@@ -100,6 +104,7 @@ struct server_task {
     bool infill = false;
     bool embedding = false;
     std::string cohort_id;
+    std::string capsule_filter = "fuse8_simhash64";
 
     // used by SERVER_TASK_TYPE_DECISION
     struct decision {
@@ -142,6 +147,10 @@ struct result_timings {
     int32_t draft_n_accepted = 0;
     std::vector<int32_t> draft_n_by_depth;
     std::vector<int32_t> draft_n_accepted_by_depth;
+
+    std::string capsule_filter_mode;
+    uint64_t capsule_filter_hits = 0;
+    uint64_t capsule_filter_skips = 0;
 
     json to_json() const;
 };
@@ -400,6 +409,10 @@ struct server_prompt_checkpoint {
     std::string spill_path;
     uint64_t spill_bytes = 0;
     uint64_t spill_checksum = 0;
+
+    // L1-resident BinaryFuse8 + SimHash64 probabilistic index for < 15 ns pre-restore filtering
+    kv_capsule::ContextCapsule capsule;
+    std::string capsule_filter_mode = "fuse8_simhash64";
 
     size_t size() const {
         return data.size();

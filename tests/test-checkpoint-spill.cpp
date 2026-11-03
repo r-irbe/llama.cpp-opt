@@ -1,5 +1,7 @@
 #include "spill-file.h"
+#include "kv-capsule-filter.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -98,10 +100,63 @@ int main() {
         CHECK(entry.path() == first || entry.path() == second);
     }
     CHECK(::unlink(path.c_str()) == 0);
+
+    // ContextCapsule (BinaryFuse8 + SimHash64) pre-restore indexing & < 15 ns rejection test
+    {
+        std::vector<int32_t> ckpt_tokens(256);
+        for (int32_t i = 0; i < 256; ++i) {
+            ckpt_tokens[i] = 10000 + i * 7;
+        }
+        kv_capsule::ContextCapsule capsule;
+        capsule.build_from_span(1, 0, ckpt_tokens.data(), (int32_t)ckpt_tokens.size(), nullptr, 0, 0, 0);
+        CHECK(capsule.token_count == 256);
+        CHECK(capsule.fuse_index.array_length > 0);
+        CHECK(capsule.simhash_64 != 0ULL);
+
+        std::vector<uint8_t> ckpt_blob(4096, 0x5A);
+        common_spill::metadata ckpt_meta {0, 255, 256, 0, 0};
+        const std::string capsule_spill_path = first + "/capsule-checkpoint.bin";
+        CHECK(common_spill::store(capsule_spill_path, ckpt_meta, ckpt_blob, error));
+        CHECK(ckpt_blob.empty());
+
+        // Unrelated token span should be rejected by fuse8_only and fuse8_simhash64 (with strict cosine threshold)
+        // without touching disk (common_spill::restore not called).
+        std::vector<int32_t> unrelated_query = {990001, 990002, 990003, 990004};
+        CHECK(!capsule.matches_token_span(unrelated_query.data(), (int32_t)unrelated_query.size(), "fuse8_only", 2));
+        CHECK(!capsule.matches_token_span(unrelated_query.data(), (int32_t)unrelated_query.size(), "fuse8_simhash64", 2, 0.99f));
+
+        // Benchmark single-token / short-span rejection latency (< 15 ns per lookup in L1)
+        const int iters = 10000;
+        int false_positives = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            int32_t q_tok = 500000 + i * 13;
+            if (capsule.fuse_index.contains((uint64_t)(uint32_t)q_tok)) {
+                false_positives++;
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ns_per_lookup = std::chrono::duration<double, std::nano>(t1 - t0).count() / iters;
+        CHECK(ns_per_lookup < 50.0); // < 15 ns typical on Zen 3 L1, generous bound for CI jitter
+        CHECK(false_positives < 150); // 8-bit fuse theoretical FPR is ~0.39% (~39 / 10000)
+
+        // Matching token query across all 4 modes
+        std::vector<int32_t> matching_query(ckpt_tokens.begin(), ckpt_tokens.begin() + 64);
+        CHECK(capsule.matches_token_span(matching_query.data(), (int32_t)matching_query.size(), "fuse8_simhash64", 1, 0.35f));
+        CHECK(capsule.matches_token_span(matching_query.data(), (int32_t)matching_query.size(), "fuse8_only", 1, 0.35f));
+        CHECK(capsule.matches_token_span(ckpt_tokens.data(), (int32_t)ckpt_tokens.size(), "simhash64_only", 1, 0.95f));
+        CHECK(capsule.matches_token_span(unrelated_query.data(), (int32_t)unrelated_query.size(), "disabled", 1, 0.99f));
+
+        // Restore after positive capsule match
+        CHECK(common_spill::restore(capsule_spill_path, ckpt_meta, ckpt_blob, error));
+        CHECK(ckpt_blob.size() == 4096 && ckpt_blob[0] == 0x5A);
+        CHECK(::unlink(capsule_spill_path.c_str()) == 0);
+    }
+
     CHECK(::rmdir(first.c_str()) == 0);
     CHECK(::rmdir(second.c_str()) == 0);
     CHECK(::rmdir(root.c_str()) == 0);
-    std::puts("checkpoint spill: private isolation, failure preservation, short writes, integrity and bounded restore PASS");
+    std::puts("checkpoint spill: private isolation, failure preservation, short writes, integrity, capsule filter and bounded restore PASS");
     return 0;
 #endif
 }

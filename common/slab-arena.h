@@ -24,6 +24,14 @@
 //    io_uring prefetching, and direct GPUDirect / cuFile transfers.
 // =========================================================================================
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string>
+#endif
+
 namespace llama {
 namespace memory {
 
@@ -31,6 +39,25 @@ static constexpr uint32_t SLAB_MAGIC = 0x534C4142; // "SLAB"
 static constexpr uint16_t INVALID_SLAB_ID = 0xFFFF;
 static constexpr size_t   DEFAULT_SLAB_SIZE = 2 * 1024 * 1024; // 2 MiB Superblock
 static constexpr size_t   MAX_SLABS = 4096; // Supports up to 8 GiB in 2 MiB slabs per arena
+
+// Pointer-free 48-bit relocatable handle (slab_id + slot_offset + generation)
+struct SlabHandle {
+    uint16_t slab_id     = INVALID_SLAB_ID;
+    uint16_t slot_offset = 0;
+    uint16_t generation  = 0;
+
+    constexpr bool is_valid() const noexcept {
+        return slab_id != INVALID_SLAB_ID;
+    }
+
+    constexpr bool operator==(const SlabHandle & o) const noexcept {
+        return slab_id == o.slab_id && slot_offset == o.slot_offset && generation == o.generation;
+    }
+
+    constexpr bool operator!=(const SlabHandle & o) const noexcept {
+        return !(*this == o);
+    }
+};
 
 // Slab memory tier classification for heterogeneous multi-model inference
 enum class SlabMemoryTier : uint8_t {
@@ -176,10 +203,34 @@ public:
         }
     }
 
+    // Cooperative yield: Borrower returns all preempted slabs back to their original owner
+    size_t yield_borrowed_slabs(uint32_t borrower_model_id) {
+        size_t yielded = 0;
+        for (size_t s = 0; s < TotalSlabs; ++s) {
+            if (m_descriptors[s].borrower_model_id == borrower_model_id) {
+                size_t w = s / 64;
+                int bit = s % 64;
+                uint64_t mask = 1ULL << bit;
+                if ((m_preemption_bitmask[w].load(std::memory_order_acquire) & mask) != 0) {
+                    m_descriptors[s].borrower_model_id = 0;
+                    m_preemption_bitmask[w].fetch_and(~mask, std::memory_order_release);
+                    ++yielded;
+                }
+            }
+        }
+        return yielded;
+    }
+
     // Translate slab_id + relative offset to zero-copy data pointer (pure mathematical indexing)
     inline void * get_slab_address(uint16_t slab_id, size_t offset_bytes = 0) const {
         if (slab_id >= TotalSlabs || !m_raw_storage) return nullptr;
         return reinterpret_cast<void *>(m_raw_storage + (static_cast<size_t>(slab_id) * SlabSizeBytes) + offset_bytes);
+    }
+
+    // Resolve a pointer-free SlabHandle to its live memory address
+    inline void * resolve_handle(const SlabHandle & h, size_t slot_stride = 64) const {
+        if (!h.is_valid()) return nullptr;
+        return get_slab_address(h.slab_id, static_cast<size_t>(h.slot_offset) * slot_stride);
     }
 
     // Get descriptor for bounds & metadata queries without pointer dereferences
@@ -210,5 +261,89 @@ private:
     alignas(64) SlabDescriptor             m_descriptors[TotalSlabs];
 };
 
+#ifndef _WIN32
+// Cross-process shared-memory (MAP_SHARED) Multi-Model Fleet Slab Arbiter
+template <size_t TotalSlabs = 64, size_t SlabSizeBytes = 64 * 1024>
+class SharedFleetSlabArbiter {
+public:
+    struct SharedLayout {
+        ModelLeaseHeader                             lease;
+        UniversalSlabArena<TotalSlabs, SlabSizeBytes> arena;
+        alignas(64) uint8_t                          payload[TotalSlabs * SlabSizeBytes];
+    };
+
+    SharedFleetSlabArbiter() = default;
+    ~SharedFleetSlabArbiter() { close_mapping(); }
+
+    SharedFleetSlabArbiter(const SharedFleetSlabArbiter &) = delete;
+    SharedFleetSlabArbiter & operator=(const SharedFleetSlabArbiter &) = delete;
+
+    bool open_or_create(const std::string & path, bool initialize_new = false) {
+        close_mapping();
+        const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd < 0) return false;
+        const size_t total_bytes = sizeof(SharedLayout);
+        if (initialize_new) {
+            if (::ftruncate(fd, static_cast<off_t>(total_bytes)) != 0) {
+                ::close(fd);
+                return false;
+            }
+        } else {
+            struct stat st {};
+            if (::fstat(fd, &st) != 0 || static_cast<size_t>(st.st_size) < total_bytes) {
+                ::close(fd);
+                return false;
+            }
+        }
+        void * mapped = ::mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (mapped == MAP_FAILED) return false;
+        m_mapped = mapped;
+        m_mapped_bytes = total_bytes;
+        if (initialize_new) {
+            m_layout = new (mapped) SharedLayout();
+        } else {
+            m_layout = reinterpret_cast<SharedLayout *>(mapped);
+        }
+        // Attach process-local view of payload base
+        m_layout->arena.attach_storage(m_layout->payload, sizeof(m_layout->payload));
+        return true;
+    }
+
+    void close_mapping() {
+        if (m_mapped && m_mapped != MAP_FAILED) {
+            ::munmap(m_mapped, m_mapped_bytes);
+        }
+        m_mapped = nullptr;
+        m_mapped_bytes = 0;
+        m_layout = nullptr;
+    }
+
+    UniversalSlabArena<TotalSlabs, SlabSizeBytes> * arena() noexcept {
+        return m_layout ? &m_layout->arena : nullptr;
+    }
+
+    ModelLeaseHeader * lease() noexcept {
+        return m_layout ? &m_layout->lease : nullptr;
+    }
+
+private:
+    void *         m_mapped       = nullptr;
+    size_t         m_mapped_bytes = 0;
+    SharedLayout * m_layout       = nullptr;
+};
+#endif
+
 } // namespace memory
 } // namespace llama
+
+namespace common {
+using llama::memory::SlabMemoryTier;
+using llama::memory::SlabDescriptor;
+using llama::memory::SlabHandle;
+using llama::memory::ModelLeaseHeader;
+using llama::memory::UniversalSlabArena;
+#ifndef _WIN32
+using llama::memory::SharedFleetSlabArbiter;
+#endif
+} // namespace common

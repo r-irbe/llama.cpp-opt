@@ -15,7 +15,13 @@
 // ============================================================================
 
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
+
+#ifdef GGML_USE_CUDA
+extern "C" void ggml_cuda_polygraph_set_active_plan(const uint32_t * plan_words) __attribute__((weak));
+extern "C" void ggml_cuda_polygraph_clear_active_plan() __attribute__((weak));
+#endif
 
 namespace polygraph {
 
@@ -78,6 +84,56 @@ inline Plan sanitize(const Limits & g, const Plan & p) {
     Plan q = p;
     q.active_len = std::min(p.active_len, g.gamma_max);
     return q;
+}
+
+/// Select the padding scratch sequence ID for a context with capacity n_seq_max.
+/// When n_seq_max > slot_seq + 1, assigns a dedicated disjoint sequence (slot_seq + 1)
+/// matching Lean `Limits.scratchSeq != Limits.slotSeq`; falls back to same-seq causal
+/// isolation when n_seq_max <= slot_seq + 1 (e.g. single-tenant n_seq_max == 1).
+inline uint32_t choose_scratch_seq(uint32_t slot_seq, uint32_t n_seq_max) {
+    return (slot_seq + 1 < n_seq_max) ? (slot_seq + 1) : slot_seq;
+}
+
+namespace detail {
+inline Plan & tls_active_plan() {
+    static thread_local Plan plan = {0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    return plan;
+}
+inline bool & tls_plan_is_active() {
+    static thread_local bool active = false;
+    return active;
+}
+} // namespace detail
+
+/// Stage an active 28-byte PolyGraph plan on the calling thread (and forward to
+/// the CUDA backend staging hook when present) before verification decode.
+inline void set_active_plan(const Plan & p) {
+    detail::tls_active_plan() = p;
+    detail::tls_plan_is_active() = true;
+#ifdef GGML_USE_CUDA
+    if (ggml_cuda_polygraph_set_active_plan != nullptr) {
+        uint32_t words[7];
+        std::memcpy(words, &p, sizeof(words));
+        ggml_cuda_polygraph_set_active_plan(words);
+    }
+#endif
+}
+
+/// Return a pointer to the currently active thread-local PolyGraph plan, or
+/// nullptr when no pinned verification plan is active.
+inline const Plan * get_active_plan() {
+    return detail::tls_plan_is_active() ? &detail::tls_active_plan() : nullptr;
+}
+
+/// Clear the active thread-local PolyGraph plan after verification decode.
+inline void clear_active_plan() {
+    detail::tls_plan_is_active() = false;
+    detail::tls_active_plan() = {0u, 0u, 0u, 0u, 0u, 0u, 0u};
+#ifdef GGML_USE_CUDA
+    if (ggml_cuda_polygraph_clear_active_plan != nullptr) {
+        ggml_cuda_polygraph_clear_active_plan();
+    }
+#endif
 }
 
 } // namespace polygraph

@@ -74,4 +74,3 @@ status = "starting"
 pid = 0
 active_slots = 8
 last_replaced_from_binary = "none"
-"ik_llama_rust_ffi:build/bin/llama-server"

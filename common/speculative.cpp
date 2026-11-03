@@ -3785,19 +3785,36 @@ common_speculative_round_result common_speculative_run_round(
     // Lean-certified row map (PolyGraph.Basic): row r carries position
     // pos_base + r; rows 0..active_len are real (root + drafts), the rest are
     // causally-hidden padding whose outputs are discarded.
-    const polygraph::Plan plan{(uint32_t) draft.size(), (uint32_t) n_past, 0u, 0u, 0u, 0u, 0u};
-    common_batch_add(verify_batch, result.sampled_before, (llama_pos) polygraph::row_pos(plan, 0), { seq_id }, true);
+    const uint32_t gamma_max = (uint32_t) std::max(params.get_max_stage_n_max(), (int) draft.size());
+    const uint32_t slot_u32  = (uint32_t) std::max<llama_seq_id>(0, seq_id);
+    const uint32_t scratch_u32 = polygraph::choose_scratch_seq(slot_u32, llama_n_seq_max(ctx));
+    const polygraph::Limits limits{gamma_max, slot_u32, scratch_u32};
+    const polygraph::Plan plan = polygraph::sanitize(
+        limits,
+        polygraph::Plan{(uint32_t) draft.size(), (uint32_t) n_past, draft_result.target_only ? 1u : 0u, 0u, 0u, 0u, 0u});
+    common_batch_add(verify_batch, result.sampled_before, (llama_pos) polygraph::row_pos(plan, 0), { (llama_seq_id) polygraph::row_seq(plan, limits, 0) }, true);
     verify_indices.push_back(0);
     for (size_t i = 0; i < draft.size(); ++i) {
-        common_batch_add(verify_batch, draft[i], (llama_pos) polygraph::row_pos(plan, (uint32_t) i + 1), { seq_id }, true);
-        verify_indices.push_back((int) i + 1);
+        const uint32_t row = (uint32_t) i + 1;
+        common_batch_add(verify_batch, draft[i], (llama_pos) polygraph::row_pos(plan, row), { (llama_seq_id) polygraph::row_seq(plan, limits, row) }, true);
+        verify_indices.push_back((int) row);
     }
     for (int32_t p = 0; p < n_pad; ++p) {
         const uint32_t row = (uint32_t) draft.size() + 1 + (uint32_t) p;
-        common_batch_add(verify_batch, draft.back(), (llama_pos) polygraph::row_pos(plan, row), { seq_id }, true);
+        common_batch_add(verify_batch, draft.back(), (llama_pos) polygraph::row_pos(plan, row), { (llama_seq_id) polygraph::row_seq(plan, limits, row) }, true);
     }
 
-    if (llama_decode(ctx, verify_batch) != 0) {
+    if (pin_batch) {
+        polygraph::set_active_plan(plan);
+    }
+    const int decode_rc = llama_decode(ctx, verify_batch);
+    if (pin_batch) {
+        polygraph::clear_active_plan();
+        if (scratch_u32 != slot_u32 && n_pad > 0) {
+            llama_kv_cache_seq_rm(ctx, (llama_seq_id) scratch_u32, (llama_pos) polygraph::row_pos(plan, (uint32_t) draft.size() + 1), -1);
+        }
+    }
+    if (decode_rc != 0) {
         llama_batch_free(verify_batch);
         result.failed = true;
         result.error = "speculative verify decode failed";

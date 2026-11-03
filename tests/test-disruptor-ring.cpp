@@ -1,7 +1,9 @@
 #include "disruptor-ring.h"
+#include "slab-arena.h"
 
 #include <cstdio>
 #include <cassert>
+#include <filesystem>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -215,6 +217,56 @@ int main() {
         TEST_ASSERT(consumer_ok.load(), "Task hash sequence mismatch in consumer");
         printf("  Dispatched %zu batched prefill tasks across slots PASSED OK.\n", TOTAL_BATCHES * BATCH_SIZE);
     }
+
+#ifndef _WIN32
+    // 8. Cross-Process Shared-Memory Multi-Model Fleet Slab Arbiter
+    printf("\n[8] Verifying UniversalSlabArena & SharedFleetSlabArbiter cooperative lending...\n");
+    {
+        const std::string shm_path = (std::filesystem::temp_directory_path() / ("test-fleet-slab-" + std::to_string(::getpid()) + ".shm")).string();
+        common::SharedFleetSlabArbiter<64, 4096> host_arbiter;
+        common::SharedFleetSlabArbiter<64, 4096> peer_arbiter;
+        TEST_ASSERT(host_arbiter.open_or_create(shm_path, true), "host_arbiter open_or_create failed");
+        TEST_ASSERT(peer_arbiter.open_or_create(shm_path, false), "peer_arbiter attach failed");
+
+        auto * a1 = host_arbiter.arena();
+        auto * a2 = peer_arbiter.arena();
+        TEST_ASSERT(a1 != nullptr && a2 != nullptr, "arena pointers must be valid");
+        TEST_ASSERT(a1->count_free_slabs() == 64, "initial free slabs must be 64");
+
+        // Model 101 allocates 2 slabs in host view
+        uint16_t s0 = a1->allocate_slab(101, common::SlabMemoryTier::HBM_GPU);
+        uint16_t s1 = a1->allocate_slab(101, common::SlabMemoryTier::NUMA_FAST_CPU);
+        TEST_ASSERT(s0 == 0 && s1 == 1, "expected slab ids 0 and 1");
+        TEST_ASSERT(a2->count_allocated_slabs() == 2, "peer view must see 2 allocated slabs");
+
+        // Write via SlabHandle on host, read via SlabHandle on peer
+        common::SlabHandle h0{s0, 3, 1};
+        uint64_t * p_host = reinterpret_cast<uint64_t *>(a1->resolve_handle(h0, 64));
+        uint64_t * p_peer = reinterpret_cast<uint64_t *>(a2->resolve_handle(h0, 64));
+        TEST_ASSERT(p_host != nullptr && p_peer != nullptr, "handle resolution must succeed");
+        *p_host = 0xCAFEBABE12345678ULL;
+        TEST_ASSERT(*p_peer == 0xCAFEBABE12345678ULL, "MAP_SHARED zero-copy payload visibility failed");
+
+        // Model 202 cooperatively borrows idle Model 101's slab from peer view
+        uint16_t borrowed = a2->borrow_slab(202, 101);
+        TEST_ASSERT(borrowed == s0, "Model 202 should borrow slab 0 from Model 101");
+        TEST_ASSERT(a1->get_descriptor(s0).borrower_model_id == 202, "borrower_model_id must be 202");
+
+        // Model 101 wakes up and signals preemption recall; Model 202 yields borrowed slabs
+        a1->signal_preemption_recall(101);
+        size_t yielded = a2->yield_borrowed_slabs(202);
+        TEST_ASSERT(yielded == 1, "Model 202 must yield 1 preempted slab");
+        TEST_ASSERT(a1->get_descriptor(s0).borrower_model_id == 0, "borrower_model_id must be cleared after yield");
+
+        TEST_ASSERT(a1->free_slab(s0) && a1->free_slab(s1), "free_slab must succeed");
+        TEST_ASSERT(a2->count_allocated_slabs() == 0, "all slabs must be free");
+
+        peer_arbiter.close_mapping();
+        host_arbiter.close_mapping();
+        ::unlink(shm_path.c_str());
+        printf("  SharedFleetSlabArbiter cooperative lending & preemption recall PASSED OK.\n");
+    }
+#endif
 
     printf("\n=================================================================\n");
     printf("  ALL DISRUPTOR RING BUFFER TESTS PASSED WITH 100%% SUCCESS       \n");

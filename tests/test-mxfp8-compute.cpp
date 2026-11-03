@@ -114,6 +114,60 @@ static int graph_check(bool compute_enabled, const ggml_type_traits_t & mx, cons
         printf("ok      graph MUL_MAT with MXFP8 weights matches the decoded reference (3 rows)\n");
     }
     ggml_free(ctx);
+
+    // Optional GPU backend check (gracefully skipped if no GPU backend is registered/available).
+    ggml_backend_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
+        const char * bname = ggml_backend_reg_get_name(i);
+        if (bname && std::strncmp(bname, "CUDA", 4) == 0) {
+            gpu = ggml_backend_reg_init_backend(i, nullptr);
+            break;
+        }
+    }
+    if (gpu != nullptr) {
+        struct ggml_init_params gparams = { /* .mem_size = */ 4u*1024*1024, /* .mem_buffer = */ nullptr, /* .no_alloc = */ true };
+        struct ggml_context * gctx = ggml_init(gparams);
+        assert(gctx != nullptr);
+        struct ggml_tensor * gw = ggml_new_tensor_2d(gctx, GGML_TYPE_MXFP8, n, rows);
+        struct ggml_tensor * ga = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, 1);
+        struct ggml_tensor * gout = ggml_mul_mat(gctx, gw, ga);
+        if (ggml_backend_supports_op(gpu, gout)) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(gctx, gpu);
+            assert(buf != nullptr);
+            ggml_backend_tensor_set(gw, wq.data(), 0, wq.size());
+            ggml_backend_tensor_set(ga, af.data(), 0, af.size() * sizeof(float));
+            struct ggml_cgraph * ggf = ggml_new_graph(gctx);
+            ggml_build_forward_expand(ggf, gout);
+            const enum ggml_status gst = ggml_backend_graph_compute(gpu, ggf);
+            if (gst != GGML_STATUS_SUCCESS) {
+                printf("FAILED  GPU graph compute status %d\n", (int) gst);
+                ++fails;
+            } else {
+                std::vector<float> got_gpu(rows, 0.0f);
+                ggml_backend_tensor_get(gout, got_gpu.data(), 0, rows * sizeof(float));
+                int gfails = 0;
+                for (int b = 0; b < rows; ++b) {
+                    std::vector<float> wd(n);
+                    mx.to_float(wq.data() + b*ggml_row_size(GGML_TYPE_MXFP8, n), wd.data(), n);
+                    const double want = dot_ref(wd, af);
+                    const double err = std::fabs(double(got_gpu[b]) - want) / (std::fabs(want) + 1e-30);
+                    // CUDA MUL_MAT dequantizes weights to FP16 for cuBLAS GEMV (~3e-3 FP16 rounding tolerance).
+                    if (err >= 5e-3) {
+                        printf("FAILED  GPU graph row %d: got %.9g want %.9g (rel err %.3g)\n", b, (double) got_gpu[b], want, err);
+                        ++gfails;
+                        ++fails;
+                    }
+                }
+                if (gfails == 0) {
+                    printf("ok      GPU graph MUL_MAT with MXFP8 weights matches reference (3 rows)\n");
+                }
+            }
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(gctx);
+        ggml_backend_free(gpu);
+    }
+
     return fails;
 }
 

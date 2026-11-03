@@ -138,20 +138,26 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 #endif // GGML_CUDA_F16
 }
 
-// E4M3 (fn) decode, exact in fp32; 0x7F/0xFF are NaN. Used by MXFP8 (gather-only,
+// E4M3 (fn) decode, exact in fp32; 0x7F/0xFF are NaN. Used by MXFP8 (gather & compute,
 // mainline PR #30817).
 static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(const uint8_t x) {
-    const int exp = (x >> 3) & 0xF;
-    const int man = x & 0x7;
-    float v = exp == 0 ? ldexpf((float) man, -9) : ldexpf((float) (8 + man), exp - 10);
-    v = (exp == 0xF && man == 0x7) ? __int_as_float(0x7FC00000) : v;
-    return (x & 0x80) ? -v : v;
+    const uint32_t sign = (uint32_t) (x & 0x80) << 24;
+    const uint32_t exp  = (x >> 3) & 0xF;
+    const uint32_t man  = x & 0x7;
+    if ((x & 0x7F) == 0x7F) {
+        return __int_as_float(sign | 0x7FC00000u);
+    }
+    if (exp == 0) {
+        return __int_as_float(__float_as_int((float) man * 0x1p-9f) | sign);
+    }
+    return __int_as_float(sign | ((exp + 120u) << 23) | (man << 20));
 }
 
 static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
     const block_mxfp8 * x = (const block_mxfp8 *) vx;
 
-    const float d = x[ib].e == 0xFF ? __int_as_float(0x7FC00000) : ldexpf(1.0f, (int) x[ib].e - 127);
+    const uint8_t e = x[ib].e;
+    const float d = e == 0xFF ? __int_as_float(0x7FC00000) : (e == 0 ? 0x1p-127f : __int_as_float((uint32_t) e << 23));
 
     v.x = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 0]) * d;
     v.y = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 1]) * d;

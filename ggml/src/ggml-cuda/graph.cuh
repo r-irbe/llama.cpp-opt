@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <cstring>
 #include "ggml.h"
 
 struct ggml_graph_node_properties {
@@ -33,6 +35,11 @@ struct ggml_cuda_graph {
             CUDA_CHECK(cudaFree(dest_ptrs_d));
             dest_ptrs_d = nullptr;
         }
+        if (polygraph_plan_d != nullptr) {
+            CUDA_CHECK(cudaFree(polygraph_plan_d));
+            polygraph_plan_d = nullptr;
+        }
+        std::memset(polygraph_plan_h, 0, sizeof(polygraph_plan_h));
         dest_ptrs_size = 0;
         use_cpy_indirection = false;
     }
@@ -58,6 +65,9 @@ struct ggml_cuda_graph {
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;
+    // 28-byte device-resident PolyGraph plan buffer and host shadow words
+    uint32_t * polygraph_plan_d = nullptr;
+    uint32_t polygraph_plan_h[7] = {0};
 #endif
 };
 

@@ -1,8 +1,8 @@
 # Spec: PolyGraph Plan-Buffer — Shape-Pinned Speculative Verification
 
-Status: DRAFT → implementation in progress (Lean-first track)
+Status: COMPLETED (Lean-certified planner + v2 multi-seq scratch isolation + device plan buffer staging)
 Branch: `feat/numa-split`
-Owner: radu / spec stream (Pi session 2026-10-27)
+Owner: spec stream
 Formal spec: `rust-mmap-engine/formalization/PolyGraph/Basic.lean`
 Related: ROADMAP Pillar 8 (speculative autotuning), Pillar 9 (Lean 4 SafeVerify FFI)
 
@@ -40,27 +40,16 @@ Row layout for every verification step (`rows = γ_max + 1`):
 ```
 row 0                : root token (last accepted)        seq = slot
 rows 1..γ_act        : drafted tokens (real)             seq = slot
-rows γ_act+1..γ_max  : padding tokens (any value)        seq = slot (v1)
+rows γ_act+1..γ_max  : padding tokens (any value)        seq = scratch_seq (v2: slot+1 when n_seq_max > slot+1, else slot)
 ```
 
-**As-built v1 mechanism (same-seq, causality-isolated):** padding rows ride
-the SAME slot sequence at higher positions. Causal attention masking already
-prevents real rows from attending them (a real row at position p attends only
-positions ≤ p; padding sits at p+1..γ_max), padding outputs are discarded, and
-the post-accept commit trim (`llama_kv_cache_seq_rm(seq, accepted_tail, -1)`)
-removes the padding cells together with rejected draft rows. This keeps the
-feature working on caches with `n_seq_max = 1` (single-tenant spec runs).
-The scratch-sequence variant below remains the v2 upgrade for multi-seq caches
-and is what the Lean model's `rowSeq` encodes; both satisfy the certified
-contract (distinct `(seq, pos)` per row via `kv_cells_disjoint`, padding never
-flows into real outputs via `mask_closure`).
+**As-built v1 + v2 mechanism (multi-seq scratch isolation with same-seq fallback):**
+`polygraph::choose_scratch_seq(slot_seq, n_seq_max)` selects `slot_seq + 1` whenever the context's `n_seq_max > slot_seq + 1`, routing padding rows onto a disjoint scratch sequence that is trimmed immediately after `llama_decode` (`llama_kv_cache_seq_rm(ctx, scratch_seq, pos_pad_start, -1)`). On single-sequence caches (`n_seq_max == 1` or when `slot_seq` is the last slot), it falls back to same-sequence causal isolation where padding rows sit at higher positions (`pos_base + r`) and are trimmed together with rejected draft rows by the post-accept commit trim (`llama_kv_cache_seq_rm(seq, accepted_tail, -1)`). Both regimes satisfy the certified Lean contract (`kv_cells_disjoint` and `mask_closure`).
 
-Legacy scratch-sequence design (v2, planned):
-
-### 3.2 Plan buffer (28 bytes, host-authored)
+### 3.2 Plan buffer (28 bytes, host-authored, device-staged)
 
 ```c
-struct spec_polygraph_plan {        // 28 bytes, packed, alignas(4)
+struct alignas(4) Plan {            // 28 bytes, packed, alignas(4)
     uint32_t active_len;            // γ_act ∈ [0, γ_max]; real rows = γ_act+1
     uint32_t pos_base;              // KV position of row 0
     uint32_t flags;                 // bit0: target-only baseline (γ_act = 0 forced)
@@ -68,7 +57,7 @@ struct spec_polygraph_plan {        // 28 bytes, packed, alignas(4)
 };
 ```
 
-Host writes it into pinned staging memory; an async H2D copy precedes replay.
+Before `llama_decode(ctx, verify_batch)` under `--spec-verify-pinned`, the host stages the active `polygraph::Plan` via `polygraph::set_active_plan(plan)` and clears it via `polygraph::clear_active_plan()` after decode completes. Inside `ggml-cuda.cu`, `ggml_cuda_polygraph_plan_copy` lazily allocates the 28-byte device buffer `ggml_cuda_graph::polygraph_plan_d` (freed in `ggml_cuda_graph::release()` alongside `dest_ptrs_d`), performs an asynchronous `cudaMemcpyAsync(..., cudaMemcpyHostToDevice, stream)` prior to `cudaGraphLaunch`, and increments the `polygraph_plan_uploads` telemetry counter.
 The sampler/acceptance logic reads the host copy: logits are scored only for
 rows `r ≤ γ_act` (Lean: `readable_rows_are_real`).
 

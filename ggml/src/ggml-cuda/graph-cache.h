@@ -2,7 +2,40 @@
 
 #include <charconv>
 #include <cstddef>
+#include <cstring>
 #include <system_error>
+
+enum class ggml_cuda_pressure_policy {
+    adaptive,
+    latency_first,
+};
+
+inline bool ggml_cuda_parse_pressure_policy(const char * env_val, ggml_cuda_pressure_policy & out) {
+    out = ggml_cuda_pressure_policy::adaptive;
+    if (env_val == nullptr || *env_val == '\0') {
+        return true;
+    }
+    if (std::strcmp(env_val, "adaptive") == 0) {
+        out = ggml_cuda_pressure_policy::adaptive;
+        return true;
+    }
+    if (std::strcmp(env_val, "latency-first") == 0 || std::strcmp(env_val, "latency_first") == 0) {
+        out = ggml_cuda_pressure_policy::latency_first;
+        return true;
+    }
+    return false;
+}
+
+struct ggml_cuda_memory_headroom {
+    size_t free_bytes    = 0;
+    size_t total_bytes   = 0;
+    size_t reserve_bytes = 512ULL * 1024 * 1024;
+    bool   valid         = false;
+};
+
+inline bool ggml_cuda_graph_under_pressure(const ggml_cuda_memory_headroom & h) {
+    return h.valid && h.free_bytes < h.reserve_bytes;
+}
 
 // No universal count-based working-set assumption. Zero means no count limit;
 // pressure-based admission is a separate policy, not inferred from this value.
@@ -58,4 +91,42 @@ template <typename Cache>
 auto ggml_cuda_graph_cache_lru(Cache & cache, decltype(nullptr)) -> decltype(cache.begin()) {
     using Graph = typename Cache::mapped_type::element_type;
     return ggml_cuda_graph_cache_lru(cache, static_cast<const Graph *>(nullptr));
+}
+
+// Reclaim up to max_evict LRU entries (excluding keep) under memory pressure.
+// Under adaptive policy, reclaims up to max_evict victims to recover headroom.
+// Under latency_first policy, caps single-step reclamation to at most 1 victim
+// to bound eviction latency while preserving forward progress.
+template <typename Cache, typename Graph>
+size_t ggml_cuda_graph_pressure_reclaim(
+        Cache & cache,
+        const Graph * keep,
+        ggml_cuda_pressure_policy policy,
+        size_t max_evict) {
+    if (max_evict == 0) {
+        return 0;
+    }
+    const size_t budget = (policy == ggml_cuda_pressure_policy::latency_first)
+        ? 1
+        : max_evict;
+    size_t evicted = 0;
+    while (evicted < budget) {
+        auto victim = ggml_cuda_graph_cache_lru(cache, keep);
+        if (victim == cache.end()) {
+            break;
+        }
+        cache.erase(victim);
+        ++evicted;
+    }
+    return evicted;
+}
+
+template <typename Cache>
+size_t ggml_cuda_graph_pressure_reclaim(
+        Cache & cache,
+        decltype(nullptr),
+        ggml_cuda_pressure_policy policy,
+        size_t max_evict) {
+    using Graph = typename Cache::mapped_type::element_type;
+    return ggml_cuda_graph_pressure_reclaim(cache, static_cast<const Graph *>(nullptr), policy, max_evict);
 }

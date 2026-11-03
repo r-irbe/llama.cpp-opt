@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <string>
 #include <algorithm>
 
 // =========================================================================================
@@ -205,6 +206,33 @@ inline float simhash64_cosine_estimate(uint64_t a, uint64_t b) noexcept {
     return std::cos(theta);
 }
 
+inline uint64_t compute_token_span_simhash64(const int32_t * tokens, int32_t count) noexcept {
+    if (!tokens || count <= 0) return 0ULL;
+    int32_t acc[64] = {0};
+    const uint64_t unigram_seed = 0x517cc1b727220a95ULL;
+    const uint64_t bigram_seed  = 0x9e3779b97f4a7c15ULL;
+    for (int32_t i = 0; i < count; ++i) {
+        const uint64_t hu = mix64((uint64_t)(uint32_t)tokens[i], unigram_seed);
+        for (int b = 0; b < 64; ++b) {
+            acc[b] += ((hu >> b) & 1ULL) ? 1 : -1;
+        }
+        if (i + 1 < count) {
+            const uint64_t bigram = ((uint64_t)(uint32_t)tokens[i] << 32) | (uint64_t)(uint32_t)tokens[i + 1];
+            const uint64_t hb = mix64(bigram, bigram_seed);
+            for (int b = 0; b < 64; ++b) {
+                acc[b] += ((hb >> b) & 1ULL) ? 2 : -2;
+            }
+        }
+    }
+    uint64_t sig = 0ULL;
+    for (int b = 0; b < 64; ++b) {
+        if (acc[b] >= 0) {
+            sig |= (1ULL << b);
+        }
+    }
+    return sig != 0ULL ? sig : 0x1ULL;
+}
+
 struct ContextCapsule {
     int32_t capsule_id = -1;
     int32_t token_start = 0;
@@ -265,6 +293,8 @@ struct ContextCapsule {
                 }
             }
             simhash_64 = compute_simhash64(mean_vec.data(), d);
+        } else if (tokens && count > 0) {
+            simhash_64 = compute_token_span_simhash64(tokens, count);
         }
     }
 
@@ -288,6 +318,39 @@ struct ContextCapsule {
             }
         }
         return false;
+    }
+
+    bool matches_token_span(
+        const int32_t * query_tokens,
+        int32_t query_len,
+        const std::string & mode = "fuse8_simhash64",
+        int min_token_hits = 1,
+        float min_cosine = 0.35f) const noexcept
+    {
+        if (mode == "disabled" || mode == "none" || mode == "off" || mode.empty()) {
+            return true;
+        }
+        if (token_count <= 0 || fuse_index.array_length == 0 || !query_tokens || query_len <= 0) {
+            return true;
+        }
+        if (mode == "simhash64_only") {
+            const uint64_t q_simhash = compute_token_span_simhash64(query_tokens, query_len);
+            return simhash64_cosine_estimate(q_simhash, simhash_64) >= min_cosine;
+        }
+        int hits = 0;
+        for (int32_t i = 0; i < query_len; ++i) {
+            if (fuse_index.contains((uint64_t)(uint32_t)query_tokens[i])) {
+                if (++hits >= min_token_hits) return true;
+            }
+            if (i + 1 < query_len && fuse_index.contains(make_bigram_key(query_tokens[i], query_tokens[i + 1]))) {
+                if (++hits >= min_token_hits) return true;
+            }
+        }
+        if (mode == "fuse8_only") {
+            return false;
+        }
+        const uint64_t q_simhash = compute_token_span_simhash64(query_tokens, query_len);
+        return simhash64_cosine_estimate(q_simhash, simhash_64) >= min_cosine;
     }
 };
 

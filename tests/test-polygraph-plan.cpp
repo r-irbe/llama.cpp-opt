@@ -120,6 +120,35 @@ int main() {
         printf("  sanitize_within_limits + real_rows_fit conformance PASSED OK.\n");
     }
 
+    {
+        printf("\n[5] Scratch-sequence selector & thread-local plan staging...\n");
+        // Single-sequence context (n_seq_max == 1) falls back to same-seq causal isolation.
+        TEST_ASSERT(polygraph::choose_scratch_seq(0, 1) == 0,
+            "n_seq_max=1 must keep scratch_seq == slot_seq (same-seq causal isolation)");
+        // Multi-sequence context assigns dedicated disjoint scratch sequence (slot_seq + 1).
+        TEST_ASSERT(polygraph::choose_scratch_seq(0, 2) == 1,
+            "n_seq_max=2 must assign scratch_seq = slot_seq + 1");
+        TEST_ASSERT(polygraph::choose_scratch_seq(3, 8) == 4,
+            "n_seq_max=8 with slot=3 must assign scratch_seq = 4");
+        TEST_ASSERT(polygraph::choose_scratch_seq(7, 8) == 7,
+            "last sequence slot must fall back to same-seq isolation");
+
+        // Verify thread-local plan staging lifecycle.
+        polygraph::clear_active_plan();
+        TEST_ASSERT(polygraph::get_active_plan() == nullptr,
+            "plan must be inactive after clear_active_plan()");
+        const polygraph::Plan staged{7, 1024, 1, 0, 0, 0, 0};
+        polygraph::set_active_plan(staged);
+        const polygraph::Plan * active = polygraph::get_active_plan();
+        TEST_ASSERT(active != nullptr, "get_active_plan() must return staged plan");
+        TEST_ASSERT(active->active_len == 7 && active->pos_base == 1024 && active->flags == 1,
+            "staged plan fields must round-trip intact");
+        polygraph::clear_active_plan();
+        TEST_ASSERT(polygraph::get_active_plan() == nullptr,
+            "clear_active_plan() must reset active state");
+        printf("  scratch-sequence selector + plan staging PASSED OK.\n");
+    }
+
     printf("\nAll test-polygraph-plan assertions PASSED cleanly (%ld plans x geometry).\n",
         plans_checked);
     return 0;

@@ -343,6 +343,50 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 static ggml_cuda_graph_lifecycle ggml_cuda_graph_access;
 
 #ifdef USE_CUDA_GRAPH
+static uint64_t g_cuda_polygraph_plan_uploads   = 0;
+static uint64_t g_cuda_graph_pressure_evictions = 0;
+
+static thread_local bool     g_tls_polygraph_plan_active = false;
+static thread_local uint32_t g_tls_polygraph_plan_words[7] = {0};
+
+extern "C" void ggml_cuda_polygraph_set_active_plan(const uint32_t * plan_words) {
+    if (plan_words == nullptr) {
+        g_tls_polygraph_plan_active = false;
+        std::memset(g_tls_polygraph_plan_words, 0, sizeof(g_tls_polygraph_plan_words));
+        return;
+    }
+    std::memcpy(g_tls_polygraph_plan_words, plan_words, sizeof(g_tls_polygraph_plan_words));
+    g_tls_polygraph_plan_active = true;
+}
+
+extern "C" void ggml_cuda_polygraph_clear_active_plan() {
+    g_tls_polygraph_plan_active = false;
+    std::memset(g_tls_polygraph_plan_words, 0, sizeof(g_tls_polygraph_plan_words));
+}
+
+static inline void ggml_cuda_polygraph_plan_copy(
+        ggml_cuda_graph * graph,
+        const uint32_t * plan_words,
+        cudaStream_t stream) {
+    if (graph == nullptr || plan_words == nullptr) {
+        return;
+    }
+    if (graph->polygraph_plan_d == nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMalloc(&graph->polygraph_plan_d, 28));
+    }
+    std::memcpy(graph->polygraph_plan_h, plan_words, 28);
+    CUDA_CHECK(cudaMemcpyAsync(graph->polygraph_plan_d, plan_words, 28, cudaMemcpyHostToDevice, stream));
+    ++g_cuda_polygraph_plan_uploads;
+}
+#else
+extern "C" void ggml_cuda_polygraph_set_active_plan(const uint32_t * plan_words) {
+    GGML_UNUSED(plan_words);
+}
+extern "C" void ggml_cuda_polygraph_clear_active_plan() {}
+#endif
+
+#ifdef USE_CUDA_GRAPH
 template <typename Fn>
 static void ggml_cuda_with_graph_fence(int device, Fn && fn) {
     ggml_cuda_graph_access.without_capture([&] {
@@ -622,7 +666,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         return env != nullptr && env[0] != '\0';
     }();
     if (graph_stats_enabled) {
-        GGML_CUDA_LOG_INFO("cuda graph stats: instances=%llu captures=%llu updates_ok=%llu updates_failed=%llu reinstantiations=%llu disable_events=%llu hits=%llu misses=%llu evictions=%llu peak_entries=%llu\n",
+        GGML_CUDA_LOG_INFO("cuda graph stats: instances=%llu captures=%llu updates_ok=%llu updates_failed=%llu reinstantiations=%llu disable_events=%llu hits=%llu misses=%llu evictions=%llu peak_entries=%llu pressure_evictions=%llu polygraph_plan_uploads=%llu\n",
                 (unsigned long long) graph_stats.graph_instances,
                 (unsigned long long) graph_stats.graph_captures,
                 (unsigned long long) graph_stats.graph_updates_ok,
@@ -632,7 +676,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 (unsigned long long) graph_stats.cache_hits,
                 (unsigned long long) graph_stats.cache_misses,
                 (unsigned long long) graph_stats.cache_evictions,
-                (unsigned long long) graph_stats.cache_peak_entries);
+                (unsigned long long) graph_stats.cache_peak_entries,
+                (unsigned long long) g_cuda_graph_pressure_evictions,
+                (unsigned long long) g_cuda_polygraph_plan_uploads);
     }
 #endif
 
@@ -4793,6 +4839,26 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
         }
         return result;
     }();
+    static const ggml_cuda_pressure_policy pressure_policy = []() -> ggml_cuda_pressure_policy {
+        ggml_cuda_pressure_policy policy = ggml_cuda_pressure_policy::adaptive;
+        if (!ggml_cuda_parse_pressure_policy(getenv("GGML_CUDA_PRESSURE_POLICY"), policy)) {
+            GGML_CUDA_LOG_WARN("invalid GGML_CUDA_PRESSURE_POLICY; defaulting to adaptive\n");
+        }
+        return policy;
+    }();
+    static const size_t pressure_reserve_bytes = []() -> size_t {
+        size_t mib = 512;
+        const char * env = getenv("GGML_CUDA_PRESSURE_RESERVE_MIB");
+        if (env != nullptr && *env != '\0') {
+            size_t parsed = 0;
+            if (ggml_cuda_graph_cache_limit(env, parsed)) {
+                mib = parsed;
+            } else {
+                GGML_CUDA_LOG_WARN("invalid GGML_CUDA_PRESSURE_RESERVE_MIB; defaulting to 512 MiB\n");
+            }
+        }
+        return mib * 1024ULL * 1024ULL;
+    }();
     auto found = ctx.cuda_graphs.find(key);
     if (found != ctx.cuda_graphs.end()) {
         ++ctx.graph_stats.cache_hits;
@@ -4807,6 +4873,23 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
             ctx.cuda_graphs.erase(victim);
             ++ctx.graph_stats.cache_evictions;
         });
+    } else if (ctx.cuda_graphs.size() > 1 && pressure_reserve_bytes > 0) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            const ggml_cuda_memory_headroom headroom{free_b, total_b, pressure_reserve_bytes, true};
+            if (ggml_cuda_graph_under_pressure(headroom)) {
+                const size_t max_evict = std::max<size_t>(1, ctx.cuda_graphs.size() / 2);
+                ggml_cuda_with_graph_fence(ctx.device, [&] {
+                    const size_t reclaimed = ggml_cuda_graph_pressure_reclaim(
+                        ctx.cuda_graphs, ctx.cur_graph, pressure_policy, max_evict);
+                    ctx.graph_stats.cache_evictions += reclaimed;
+                    g_cuda_graph_pressure_evictions += reclaimed;
+                });
+            }
+        } else {
+            (void)cudaGetLastError();
+        }
     }
     auto graph = std::make_unique<ggml_cuda_graph>();
     graph->last_used = ggml_time_us();
@@ -5092,6 +5175,9 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
             return;
         }
         CUDA_CHECK(stat);
+        if (g_tls_polygraph_plan_active) {
+            ggml_cuda_polygraph_plan_copy(graph, g_tls_polygraph_plan_words, cuda_ctx->stream());
+        }
         // Never replay after a failed launch: it may report an asynchronous
         // error and a partial execution may already have modified KV state.
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
@@ -5203,6 +5289,11 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
 GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, const ggml_tensor * op) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    static const bool mxfp8_compute = []() {
+        const char * e = getenv("GGML_MXFP8_COMPUTE");
+        return e != nullptr && *e != '\0' && atoi(e) != 0;
+    }();
 
     // Non-mul_mat ops can't read a split-buffer parent (no data ptr); let the scheduler fall back to CPU.
     if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
@@ -5330,6 +5421,8 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ3_KS_R16:
                     case GGML_TYPE_IQ4_KS_R16:
                         return true;
+                    case GGML_TYPE_MXFP8:
+                        return mxfp8_compute && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID);
                     default:
                         return false;
                 }
@@ -5367,6 +5460,21 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+                if (src0_type == GGML_TYPE_MXFP8 || src1_type == GGML_TYPE_MXFP8) {
+                    if (!mxfp8_compute) {
+                        return false;
+                    }
+                    if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_MXFP8) {
+                        return true;
+                    }
+                    if (src0_type == GGML_TYPE_MXFP8 && (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) {
+                        return true;
+                    }
+                    if (ggml_are_same_shape(op->src[0], op->src[1]) && src0_type == GGML_TYPE_MXFP8 && src1_type == GGML_TYPE_MXFP8) {
+                        return true;
+                    }
+                    return false;
+                }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }

@@ -43,18 +43,22 @@ int main() {
     {
         ggml_cuda_graph g;
         CHECK(g.dest_ptrs_d == nullptr);
+        CHECK(g.polygraph_plan_d == nullptr);
         g.release();
         CHECK(graphs_freed == 0 && execs_freed == 0 && tables_freed == 0);
         g.graph = reinterpret_cast<void *>(1);
         g.instance = reinterpret_cast<void *>(2);
         g.dest_ptrs_d = reinterpret_cast<char **>(3);
+        g.polygraph_plan_d = reinterpret_cast<uint32_t *>(5);
+        g.polygraph_plan_h[0] = 7;
         g.dest_ptrs_size = 4;
         g.release();
-        CHECK(g.graph == nullptr && g.instance == nullptr && g.dest_ptrs_d == nullptr);
+        CHECK(g.graph == nullptr && g.instance == nullptr && g.dest_ptrs_d == nullptr && g.polygraph_plan_d == nullptr);
+        CHECK(g.polygraph_plan_h[0] == 0);
         CHECK(g.dest_ptrs_size == 0);
         g.release();
     }
-    CHECK(graphs_freed == 1 && execs_freed == 1 && tables_freed == 1);
+    CHECK(graphs_freed == 1 && execs_freed == 1 && tables_freed == 2);
 
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cache;
     const void * hot = reinterpret_cast<void *>(1);
@@ -83,9 +87,9 @@ int main() {
         cache.erase(victim);
     }
     CHECK(ggml_cuda_graph_cache_lru(cache, cache.at(hot).get()) == cache.end());
-    CHECK(tables_freed == 256);
-    cache.clear();
     CHECK(tables_freed == 257);
+    cache.clear();
+    CHECK(tables_freed == 258);
     size_t limit = 123;
     CHECK(ggml_cuda_graph_cache_limit(nullptr, limit) && limit == 0);
     CHECK(ggml_cuda_graph_cache_limit("0", limit) && limit == 0);
@@ -209,6 +213,44 @@ int main() {
     catch (const std::runtime_error &) { threw = true; }
     CHECK(threw && lifecycle.try_begin_capture());
     lifecycle.end_capture();
-    std::puts("CUDA graph memory: release, LRU/explicit limits, retirement and submission/capture gates PASS");
+
+    // Adaptive vs latency-first pressure policy parsing and headroom reclamation.
+    ggml_cuda_pressure_policy policy = ggml_cuda_pressure_policy::latency_first;
+    CHECK(ggml_cuda_parse_pressure_policy(nullptr, policy) && policy == ggml_cuda_pressure_policy::adaptive);
+    CHECK(ggml_cuda_parse_pressure_policy("", policy) && policy == ggml_cuda_pressure_policy::adaptive);
+    CHECK(ggml_cuda_parse_pressure_policy("adaptive", policy) && policy == ggml_cuda_pressure_policy::adaptive);
+    CHECK(ggml_cuda_parse_pressure_policy("latency-first", policy) && policy == ggml_cuda_pressure_policy::latency_first);
+    CHECK(ggml_cuda_parse_pressure_policy("latency_first", policy) && policy == ggml_cuda_pressure_policy::latency_first);
+    CHECK(!ggml_cuda_parse_pressure_policy("invalid", policy) && policy == ggml_cuda_pressure_policy::adaptive);
+
+    ggml_cuda_memory_headroom headroom;
+    CHECK(!ggml_cuda_graph_under_pressure(headroom));
+    headroom.valid = true;
+    headroom.total_bytes = 24ULL * 1024 * 1024 * 1024;
+    headroom.free_bytes = 1024ULL * 1024 * 1024;
+    CHECK(!ggml_cuda_graph_under_pressure(headroom));
+    headroom.free_bytes = 256ULL * 1024 * 1024;
+    CHECK(ggml_cuda_graph_under_pressure(headroom));
+
+    for (uintptr_t i = 1; i <= 5; ++i) {
+        auto g = std::make_unique<ggml_cuda_graph>();
+        g->last_used = (i == 1) ? 0 : (100 + i);
+        cache.emplace(reinterpret_cast<const void *>(i), std::move(g));
+    }
+    ggml_cuda_graph * keep_ptr = cache.at(hot).get();
+    // latency_first caps single-step reclamation to 1 LRU victim while preserving keep_ptr.
+    CHECK(ggml_cuda_graph_pressure_reclaim(cache, keep_ptr, ggml_cuda_pressure_policy::latency_first, 3) == 1);
+    CHECK(cache.size() == 4 && cache.find(hot) != cache.end());
+    CHECK(cache.find(reinterpret_cast<const void *>(2)) == cache.end());
+    // adaptive reclaims up to max_evict LRU victims while preserving keep_ptr even though keep_ptr has last_used == 0.
+    CHECK(ggml_cuda_graph_pressure_reclaim(cache, keep_ptr, ggml_cuda_pressure_policy::adaptive, 2) == 2);
+    CHECK(cache.size() == 2 && cache.find(hot) != cache.end());
+    CHECK(cache.find(reinterpret_cast<const void *>(5)) != cache.end());
+    CHECK(ggml_cuda_graph_pressure_reclaim(cache, keep_ptr, ggml_cuda_pressure_policy::adaptive, 8) == 1);
+    CHECK(cache.size() == 1 && cache.find(hot) != cache.end());
+    CHECK(ggml_cuda_graph_pressure_reclaim(cache, keep_ptr, ggml_cuda_pressure_policy::adaptive, 8) == 0);
+    cache.clear();
+
+    std::puts("CUDA graph memory: release, LRU/explicit limits, pressure policy, retirement and submission/capture gates PASS");
     return 0;
 }

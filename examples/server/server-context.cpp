@@ -755,6 +755,11 @@ json server_slot::get_formatted_timings() const {
             timings["draft_by_depth"] = by_depth;
         }
     }
+    if (!capsule_filter_mode.empty()) {
+        timings["capsule_filter_mode"]  = capsule_filter_mode;
+        timings["capsule_filter_hits"]  = capsule_filter_hits;
+        timings["capsule_filter_skips"] = capsule_filter_skips;
+    }
     return timings;
 }
 
@@ -772,6 +777,9 @@ result_timings server_slot::get_timings() const {
 
     timings.n_ctx = n_ctx;
     timings.n_past = n_past;
+    timings.capsule_filter_mode = capsule_filter_mode;
+    timings.capsule_filter_hits = capsule_filter_hits;
+    timings.capsule_filter_skips = capsule_filter_skips;
 
 
     // Add speculative metrics
@@ -1372,6 +1380,15 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     slot.sparams.min_keep = json_value(data, "min_keep", default_sparams.min_keep);
 
     slot.params.post_sampling_probs = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
+    slot.capsule_filter_mode = json_value(data, "capsule_filter", task.capsule_filter);
+    if (data.contains("evidence_capsule") && data["evidence_capsule"].is_object() &&
+        data["evidence_capsule"].contains("capsule_filter") && data["evidence_capsule"]["capsule_filter"].is_string()) {
+        slot.capsule_filter_mode = data["evidence_capsule"]["capsule_filter"].get<std::string>();
+    }
+    if (slot.capsule_filter_mode.empty()) {
+        slot.capsule_filter_mode = "fuse8_simhash64";
+    }
+    slot.params.capsule_filter = slot.capsule_filter_mode;
 
     // speculative decoding parameters
     try {
@@ -3214,6 +3231,8 @@ void server_context::process_single_task(server_task&& task) {
 
             { "kv_cache_tokens_count",           llama_get_kv_cache_token_count(ctx)},
             { "kv_cache_used_cells",             llama_get_kv_cache_used_cells(ctx)},
+            { "capsule_filter_hits",             capsule_filter_hits},
+            { "capsule_filter_skips",            capsule_filter_skips},
 
             { "slots",                           slots_data },
         };
@@ -3967,6 +3986,20 @@ void server_context::apply_checkpoint(server_slot & slot) {
         if (pos_min >= pos_min_thold) {
             SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
             // search for a context checkpoint
+            const bool use_capsule_filter = !slot.capsule_filter_mode.empty() &&
+                slot.capsule_filter_mode != "disabled" &&
+                slot.capsule_filter_mode != "none" &&
+                slot.capsule_filter_mode != "off";
+            std::vector<int32_t> query_token_vec;
+            if (use_capsule_filter && !slot.prompt_tokens.empty()) {
+                query_token_vec.reserve(slot.prompt_tokens.size());
+                for (size_t i = 0; i < slot.prompt_tokens.size(); ++i) {
+                    const llama_token tok = slot.prompt_tokens[i];
+                    if (tok != LLAMA_TOKEN_NULL) {
+                        query_token_vec.push_back((int32_t)tok);
+                    }
+                }
+            }
             const auto it = std::find_if(
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
@@ -3974,7 +4007,20 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     if (cur.pos_max > pos_next) {
                         return false;
                     }
-                    return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                    if (!(cur.pos_min < pos_min_thold || cur.pos_min == 0)) {
+                        return false;
+                    }
+                    if (cur.data.empty() && !cur.spill_path.empty() && use_capsule_filter && !query_token_vec.empty()) {
+                        const int32_t q_len = std::min<int32_t>((int32_t)query_token_vec.size(), std::max<int32_t>(1, (int32_t)cur.n_tokens));
+                        if (!cur.capsule.matches_token_span(query_token_vec.data(), q_len, slot.capsule_filter_mode)) {
+                            slot.capsule_filter_skips++;
+                            capsule_filter_skips++;
+                            return false;
+                        }
+                        slot.capsule_filter_hits++;
+                        capsule_filter_hits++;
+                    }
+                    return true;
                 }
             );
 
@@ -4202,6 +4248,29 @@ bool server_context::create_checkpoint(server_slot & slot, bool prompt_end) {
         auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
         server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), pos_min, pos_max);
         cur.prompt_end = prompt_end;
+        cur.capsule_filter_mode = slot.capsule_filter_mode;
+        {
+            std::vector<int32_t> token_vec;
+            const size_t n_tok = slot.cache_tokens.size_up_to_pos(pos_max);
+            token_vec.reserve(n_tok);
+            for (size_t i = 0; i < n_tok && i < slot.cache_tokens.size(); ++i) {
+                const llama_token tok = slot.cache_tokens[i];
+                if (tok != LLAMA_TOKEN_NULL) {
+                    token_vec.push_back((int32_t)tok);
+                }
+            }
+            if (!token_vec.empty()) {
+                cur.capsule.build_from_span(
+                    (int32_t)slot.server_cached_prompt.checkpoints.size(),
+                    pos_min,
+                    token_vec.data(),
+                    (int32_t)token_vec.size(),
+                    nullptr,
+                    0,
+                    0,
+                    slot.id);
+            }
+        }
 
         SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
             (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,

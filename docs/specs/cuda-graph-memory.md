@@ -1,8 +1,9 @@
 # CUDA graph memory investigation
 
-Status: host retirement/cache-policy revision implemented and built; live-driver
-pressure/long-run validation and adaptive admission remain pending. The broader
-agreed contract is
+Status: host retirement/cache-policy revision and adaptive headroom-based
+pressure reclamation implemented (`GGML_CUDA_PRESSURE_POLICY=adaptive|latency-first`,
+`GGML_CUDA_PRESSURE_RESERVE_MIB`); live-driver long-run serving validation
+continues per the broader agreed contract in
 [runtime memory pressure recovery](memory-pressure-recovery.md).
 
 ## Problem and evidence
@@ -32,8 +33,18 @@ retention defects, not proof of the precise allocation behind the reported OOM.
   eviction and preparation fallback must use this same capture/fence discipline.
   Invalidation is synchronous at its own boundary; callers must still exclude
   model-weight mutation across the invalidate/reload operation.
-- Initialize the device copy-pointer table to null. Release it with graph and
+- Initialize the device copy-pointer table (`dest_ptrs_d`) and 28-byte device
+  PolyGraph plan buffer (`polygraph_plan_d`) to null. Release both with graph and
   executable resources on eviction and context teardown, on the owning device.
+- When `GGML_CUDA_GRAPH_CACHE_SIZE` is unset/zero and `ctx.cuda_graphs.size() > 1`
+  on a cache miss, query `cudaMemGetInfo` against the configured reserve
+  (`GGML_CUDA_PRESSURE_RESERVE_MIB`, default `512` MiB). When
+  `ggml_cuda_graph_under_pressure` triggers, reclaim LRU graphs (excluding
+  `ctx.cur_graph`) inside `ggml_cuda_with_graph_fence` via
+  `ggml_cuda_graph_pressure_reclaim` according to `GGML_CUDA_PRESSURE_POLICY`
+  (`adaptive` reclaims up to half the cache per miss; `latency-first` caps
+  single-step reclamation at 1 entry) and record `pressure_evictions` in
+  `GGML_CUDA_GRAPH_STATS=1`.
 - Explicitly upload newly instantiated or updated executable graphs before
   launch. An allocation failure during preparation (instantiate/update/upload)
   may disable graph execution and use ordinary kernel submission, but only

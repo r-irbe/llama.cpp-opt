@@ -4898,20 +4898,19 @@ void quantize_row_mxfp8(const float * x, void * y, int64_t k) {
 
 #if defined __AVX2__
 // Decode 8 E4M3 (fn) codes to 8 exact floats: normals are sign|(exp+120)<<23|man<<20,
-// subnormals are man*2^-9, 0x7F/0xFF map to NaN (bit-identical to ggml_e4m3_to_fp32).
+// subnormals use the exact float32 identity ((121<<23)|(man<<20)) - 2^-6 = man*2^-9,
+// 0x7F/0xFF map to NaN (bit-identical to ggml_e4m3_to_fp32).
 static inline __m256 mxfp8_decode8(__m128i bytes) {
-    const __m256i v    = _mm256_cvtepu8_epi32(bytes);
-    const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(v, _mm256_set1_epi32(0x80)), 24);
-    const __m256i ex   = _mm256_and_si256(_mm256_srli_epi32(v, 3), _mm256_set1_epi32(0x0F));
-    const __m256i man  = _mm256_and_si256(v, _mm256_set1_epi32(0x07));
-    const __m256i norm = _mm256_or_si256(
-        _mm256_slli_epi32(_mm256_add_epi32(ex, _mm256_set1_epi32(120)), 23),
-        _mm256_slli_epi32(man, 20));
-    const __m256 sub = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(0x1p-9f));
-    __m256 r = _mm256_blendv_ps(_mm256_castsi256_ps(norm), sub,
-                                _mm256_castsi256_ps(_mm256_cmpeq_epi32(ex, _mm256_setzero_si256())));
-    const __m256i is_nan = _mm256_and_si256(_mm256_cmpeq_epi32(ex, _mm256_set1_epi32(15)),
-                                            _mm256_cmpeq_epi32(man, _mm256_set1_epi32(7)));
+    const __m256i v      = _mm256_cvtepu8_epi32(bytes);
+    const __m256i sign   = _mm256_slli_epi32(_mm256_and_si256(v, _mm256_set1_epi32(0x80)), 24);
+    const __m256i ex     = _mm256_and_si256(_mm256_srli_epi32(v, 3), _mm256_set1_epi32(0x0F));
+    const __m256i man    = _mm256_and_si256(v, _mm256_set1_epi32(0x07));
+    const __m256i is_sub = _mm256_cmpeq_epi32(ex, _mm256_setzero_si256());
+    const __m256i exp_b  = _mm256_sub_epi32(_mm256_add_epi32(ex, _mm256_set1_epi32(120)), is_sub);
+    const __m256i bits   = _mm256_or_si256(_mm256_slli_epi32(exp_b, 23), _mm256_slli_epi32(man, 20));
+    const __m256  sub_c  = _mm256_and_ps(_mm256_castsi256_ps(is_sub), _mm256_set1_ps(0x1p-6f));
+    __m256 r = _mm256_sub_ps(_mm256_castsi256_ps(bits), sub_c);
+    const __m256i is_nan = _mm256_cmpeq_epi32(_mm256_and_si256(v, _mm256_set1_epi32(0x7F)), _mm256_set1_epi32(0x7F));
     r = _mm256_blendv_ps(r, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FC00000)),
                          _mm256_castsi256_ps(is_nan));
     return _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(r), sign));
@@ -4928,17 +4927,26 @@ static inline float mxfp8_hsum8(__m256 v) {
 
 static inline float mxfp8_dot_block(const block_mxfp8 * x, const block_q8_0 * y) {
     const float d = x->e == 0xFF ? std::numeric_limits<float>::quiet_NaN() : GGML_E8M0_TO_FP32(x->e);
-    __m256 acc = _mm256_setzero_ps();
-    for (int g = 0; g < QK_MXFP8/8; ++g) {
-        const __m128i codes = _mm_loadl_epi64((const __m128i *) (x->qs + 8*g));
-        const __m256i q8    = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *) (y->qs + 8*g)));
+    const __m128i x0 = _mm_loadu_si128((const __m128i *) (x->qs +  0));
+    const __m128i x1 = _mm_loadu_si128((const __m128i *) (x->qs + 16));
+    const __m128i y0 = _mm_loadu_si128((const __m128i *) (y->qs +  0));
+    const __m128i y1 = _mm_loadu_si128((const __m128i *) (y->qs + 16));
+
+    const __m256 q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(y0));
+    const __m256 q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(y0, 8)));
+    const __m256 q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(y1));
+    const __m256 q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(y1, 8)));
+
+    __m256 acc0 = _mm256_mul_ps(mxfp8_decode8(x0), q0);
+    __m256 acc1 = _mm256_mul_ps(mxfp8_decode8(_mm_bsrli_si128(x0, 8)), q1);
 #if defined __FMA__
-        acc = _mm256_fmadd_ps(mxfp8_decode8(codes), _mm256_cvtepi32_ps(q8), acc);
+    acc0 = _mm256_fmadd_ps(mxfp8_decode8(x1), q2, acc0);
+    acc1 = _mm256_fmadd_ps(mxfp8_decode8(_mm_bsrli_si128(x1, 8)), q3, acc1);
 #else
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(mxfp8_decode8(codes), _mm256_cvtepi32_ps(q8)));
+    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(mxfp8_decode8(x1), q2));
+    acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(mxfp8_decode8(_mm_bsrli_si128(x1, 8)), q3));
 #endif
-    }
-    return mxfp8_hsum8(acc) * d * GGML_FP16_TO_FP32(y->d);
+    return mxfp8_hsum8(_mm256_add_ps(acc0, acc1)) * d * GGML_FP16_TO_FP32(y->d);
 }
 #else
 static inline float mxfp8_dot_block(const block_mxfp8 * x, const block_q8_0 * y) {
@@ -4958,11 +4966,17 @@ void vec_dot_mxfp8_q8_0(int n, float * s, size_t bs, const void * vx, size_t bx,
     for (int ir = 0; ir < nrc; ++ir) {
         const block_mxfp8 * x = (const block_mxfp8 *) ((const char *) vx + ir*bx);
         const block_q8_0  * y = (const block_q8_0  *) ((const char *) vy + ir*by);
-        float sumf = 0;
-        for (int ib = 0; ib < nbl; ++ib) {
-            sumf += mxfp8_dot_block(x + ib, y + ib);
+        float sumf0 = 0.0f;
+        float sumf1 = 0.0f;
+        int ib = 0;
+        for (; ib + 1 < nbl; ib += 2) {
+            sumf0 += mxfp8_dot_block(x + ib + 0, y + ib + 0);
+            sumf1 += mxfp8_dot_block(x + ib + 1, y + ib + 1);
         }
-        s[ir] = sumf;
+        for (; ib < nbl; ++ib) {
+            sumf0 += mxfp8_dot_block(x + ib, y + ib);
+        }
+        s[ir] = sumf0 + sumf1;
     }
 }
 

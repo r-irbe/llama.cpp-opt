@@ -45,6 +45,10 @@ struct server_slot {
     std::string cohort_id;
     int cohort_reuse_count = 0;
 
+    std::string capsule_filter_mode = "fuse8_simhash64";
+    uint64_t capsule_filter_hits = 0;
+    uint64_t capsule_filter_skips = 0;
+
     std::unique_ptr<const server_task> task;
 
     // generation props
@@ -291,6 +295,9 @@ struct server_context {
     server_metrics metrics;
 
     cohort_radix_trie cohort_trie;
+
+    uint64_t capsule_filter_hits = 0;
+    uint64_t capsule_filter_skips = 0;
 
     common_chat_templates_ptr chat_templates;
     server_chat_params  chat_params;
