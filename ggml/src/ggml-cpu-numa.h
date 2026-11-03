@@ -79,6 +79,12 @@ int  detect_path_numa_node(const char * path, const std::string & sysfs_root = "
 bool is_numa_replicate_shared();
 void set_numa_replicate_shared(bool enable);
 bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_nodes);
+
+// --engram-resident: interleave the tensor pages across NUMA nodes, advise
+// THP, then prefault the whole range with parallel MADV_POPULATE_READ so the
+// table is fully resident before the first serving request (Linux only).
+// Returns the bytes successfully touched (0 on refusal/failure).
+size_t prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes, int n_threads);
 bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes);
 void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id);
 void free_tensor_numa_replicas(const struct ggml_tensor * tensor);
@@ -102,6 +108,10 @@ bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_n
 
 // C-compatible wrapper for interleaving shared tensor pages across NUMA nodes
 bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_nodes);
+
+// C-compatible wrapper for --engram-resident: interleave + THP + parallel
+// MADV_POPULATE_READ prefault; returns bytes touched (see namespace wrapper)
+size_t ggml_cpu_numa_prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes, int n_threads);
 
 // C-compatible wrapper for replicating shared tensors across NUMA nodes
 bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes);

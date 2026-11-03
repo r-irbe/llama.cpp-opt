@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #if defined(GGML_USE_HIPBLAS)
 #define GGML_COMMON_DECL_HIP
@@ -821,8 +822,11 @@ struct ggml_cuda_device_info {
 
     std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split = {};
 
+    // The primary per-device contexts serve multi-GPU reduction. Track every
+    // context separately for graph invalidation, including duplicate devices.
+    // Mutation/lifetime is protected by the host graph submission gate.
     std::unordered_map<const void *, std::array<ggml_backend_cuda_context *, GGML_CUDA_MAX_DEVICES>> all_ctx;
-    //ggml_backend_cuda_context * all_ctx[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    std::unordered_map<const void *, std::vector<ggml_backend_cuda_context *>> graph_contexts;
 #ifdef GGML_USE_NCCL
     ncclComm_t nccl_coms[GGML_CUDA_MAX_DEVICES];
     bool have_nccl;
@@ -904,6 +908,9 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 
 struct ggml_backend_cuda_context {
+    // Serialize host submission/bookkeeping for this context. Independent
+    // contexts share the global lifetime gate and may still submit in parallel.
+    std::mutex submission_mutex;
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
@@ -934,6 +941,10 @@ struct ggml_backend_cuda_context {
         uint64_t graph_updates_failed   = 0;
         uint64_t graph_reinstantiations = 0;
         uint64_t graph_disable_events   = 0;
+        uint64_t cache_hits             = 0;
+        uint64_t cache_misses           = 0;
+        uint64_t cache_evictions        = 0;
+        uint64_t cache_peak_entries     = 0;
     } graph_stats;
 
 #endif

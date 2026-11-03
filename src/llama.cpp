@@ -5798,6 +5798,35 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             LLAMA_LOG_INFO("%s: verified per-node tensor placement and worker affinity across %d NUMA nodes (strategy distribute)\n", __func__, n_nodes);
         }
 
+        // ---- engram-resident: interleave + THP + parallel prefault of the per-layer token table ----
+        if (params.engram_resident) {
+#ifdef _WIN32
+            LLAMA_LOG_WARN("%s: --engram-resident is only supported on Linux; ignoring\n", __func__);
+#else
+            {
+                const int n_nodes = (int) ggml::cpu::numa::topology().size();
+                // n_threads sweep bounded like the loader's parallel mapping passes
+                const int n_threads = std::min<int>(std::thread::hardware_concurrency() / 4, 32);
+                size_t total = 0;
+                if (model.tok_embd_per_layer && model.tok_embd_per_layer->data &&
+                    ggml_backend_buffer_is_host(model.tok_embd_per_layer->buffer)) {
+                    total += ggml_cpu_numa_prefault_tensor_interleaved(model.tok_embd_per_layer, n_nodes, n_threads);
+                }
+                for (auto & layer : model.layers) {
+                    if (layer.engram_embd && layer.engram_embd->data && ggml_backend_buffer_is_host(layer.engram_embd->buffer)) {
+                        total += ggml_cpu_numa_prefault_tensor_interleaved(layer.engram_embd, n_nodes, n_threads);
+                    }
+                }
+                if (total) {
+                    LLAMA_LOG_INFO("%s: --engram-resident: %.2f GiB of engram/PLE table pages pulled resident (interleave across %d nodes)\n",
+                            __func__, total / (1024.0 * 1024.0 * 1024.0), n_nodes);
+                } else if (!ml.use_mmap) {
+                    LLAMA_LOG_INFO("%s: --engram-resident: engram/PLE tables live in host buffers, pages loaded resident - nothing to prefault\n", __func__);
+                }
+            }
+#endif
+        }
+
         const enum llama_mtp_package mtp_package = llama_model_mtp_package(&model);
         if (mtp_package == LLAMA_MTP_PACKAGE_INVALID) {
             throw std::runtime_error("invalid MTP package: missing target trunk and predictor tail tensors");
@@ -7449,7 +7478,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 }
 
 
-static void llama_graph_compute(
+static enum ggml_status llama_graph_compute(
         llama_context & lctx,
           ggml_cgraph * gf,
                   int   n_threads) {
@@ -7465,12 +7494,12 @@ static void llama_graph_compute(
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
     }
 
-    ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+    return ggml_backend_sched_graph_compute_async(lctx.sched, gf);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(lctx.sched));
 }
 
-static void llama_graph_compute_sched(
+static enum ggml_status llama_graph_compute_sched(
         llama_context & lctx,
         ggml_backend_sched_t sched,
           ggml_cgraph * gf,
@@ -7487,7 +7516,43 @@ static void llama_graph_compute_sched(
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
     }
 
-    ggml_backend_sched_graph_compute_async(sched, gf);
+    return ggml_backend_sched_graph_compute_async(sched, gf);
+}
+
+// Backend cancellation is positive, but public decode's positive result means
+// retryable KV-slot exhaustion. Never pass backend cancellation through as 1.
+static int32_t llama_eval_status_code(enum ggml_status status) {
+    switch (status) {
+        case GGML_STATUS_SUCCESS:      return 0;
+        case GGML_STATUS_ALLOC_FAILED: return -2;
+        case GGML_STATUS_ABORTED:      return -3;
+        default:                       return -1;
+    }
+}
+
+static void llama_clear_failed_outputs(llama_context & lctx, bool invalidate_encoder = false) {
+    // Earlier microbatches may have queued writes into these buffers. Drain
+    // them before clearing vectors or allowing their storage to be reused.
+    llama_synchronize(&lctx);
+    lctx.reset_scheduler();
+    lctx.n_outputs = lctx.n_outputs_embd = 0;
+    std::fill(lctx.output_ids.begin(), lctx.output_ids.end(), -1);
+    lctx.embd_seq.clear();
+    // Successfully encoded source is decoder input, not an output of the
+    // failed decode/maintenance operation. In particular, +1 must preserve it
+    // for a smaller decoder retry. Only failed encoding invalidates the source.
+    if (invalidate_encoder) {
+        lctx.embd_enc.clear();
+        lctx.seq_ids_enc.clear();
+    }
+    lctx.dflash.draft_tokens.clear();
+    lctx.dflash.draft_lattice.clear();
+    lctx.dflash.draft_lattice_ids.clear();
+    if (lctx.dflash.capture) {
+        lctx.dflash.capture->invalid = true;
+    }
+    // No transactional KV rollback is implied. Callers must clear/restore
+    // possibly partial state before using this context again.
 }
 
 static bool prepare_mtp_graph_inputs(
@@ -7800,7 +7865,7 @@ static int llama_decode_internal(
         if (hparams.causal_attn) {
             int32_t ret = llama_kv_cache_update(&lctx);
             if (ret != 0) {
-                return ret;
+                return ret > 0 && cur_token > 0 ? -1 : ret;
             }
 
             // if we have enough unused cells before the current head ->
@@ -7810,7 +7875,9 @@ static int llama_decode_internal(
             }
 
             if (!llama_kv_cache_find_slot(kv_self, u_batch)) {
-                return 1;
+                // Earlier microbatches may already have mutated KV/recurrent
+                // state. A positive retry hint would replay them blindly.
+                return cur_token == 0 ? 1 : -1;
             }
 
             if (!kv_self.recurrent) {
@@ -7864,7 +7931,9 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (!ggml_backend_sched_alloc_graph(lctx.sched, gf)) {
+                return -2;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -7965,7 +8034,10 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
-        llama_graph_compute(lctx, gf, n_threads);
+        const auto compute_status = llama_graph_compute(lctx, gf, n_threads);
+        if (compute_status != GGML_STATUS_SUCCESS) {
+            return llama_eval_status_code(compute_status);
+        }
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
@@ -8300,6 +8372,7 @@ static int llama_encode_internal(
 
     lctx.inp_embd_enc = NULL;
     lctx.n_outputs = n_tokens;
+    lctx.n_outputs_embd = n_tokens;
 
     const int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
     GGML_ASSERT(n_threads > 0);
@@ -8338,6 +8411,15 @@ static int llama_encode_internal(
         return -1;
     }
 
+    if (!ggml_backend_sched_alloc_graph(lctx.sched, gf)) {
+        return -2;
+    }
+    llama_set_inputs(lctx, batch);
+    const auto compute_status = llama_graph_compute(lctx, gf, n_threads);
+    if (compute_status != GGML_STATUS_SUCCESS) {
+        return llama_eval_status_code(compute_status);
+    }
+
     // the output embeddings after the final encoder normalization
     struct ggml_tensor * embd = nullptr;
 
@@ -8357,12 +8439,6 @@ static int llama_encode_internal(
             GGML_ASSERT(strcmp(embd->name, "result_embd_pooled") == 0 && "missing embeddings tensor");
         }
     }
-
-    ggml_backend_sched_alloc_graph(lctx.sched, gf);
-
-    llama_set_inputs(lctx, batch);
-
-    llama_graph_compute(lctx, gf, n_threads);
 
     // extract embeddings
     if (embd) {
@@ -8431,7 +8507,7 @@ static int llama_encode_internal(
 }
 
 // find holes from the beginning of the KV cache and fill them by moving data from the end of the cache
-static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
+static enum ggml_status llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     auto & kv_self = lctx.kv_self;
 
     const auto & hparams = lctx.model.hparams;
@@ -8565,7 +8641,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     }
 
     if (n_moves == 0) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     // blocks are keyed by cell index, so moving cells changes every touched block's membership;
@@ -8655,13 +8731,22 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     lctx.reset_scheduler();
 
     ggml_cgraph * gf = llm_build_context::llama_build_graph_defrag(lctx, ids);
-
-    llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+    if (gf == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    if (!ggml_backend_sched_alloc_graph(lctx.sched, gf)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    const auto status = llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
 #endif
 
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_INFO("(tmp log) KV defrag time: %.3f ms\n", (t_end - t_start)/1000.0);
+    return GGML_STATUS_SUCCESS;
 }
 
 static bool get_can_shift(const struct llama_context & lctx) {
@@ -8690,12 +8775,18 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
             lctx.reset_scheduler();
 
             ggml_cgraph * gf = llm_build_context::llama_build_graph_k_shift(lctx);
-
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (gf == nullptr) {
+                return -1;
+            }
+            if (!ggml_backend_sched_alloc_graph(lctx.sched, gf)) {
+                return -2;
+            }
 
             llama_set_k_shift(lctx);
-
-            llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+            const auto status = llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+            if (status != GGML_STATUS_SUCCESS) {
+                return llama_eval_status_code(status);
+            }
 
             need_reserve = true;
         }
@@ -8716,12 +8807,18 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
             lctx.reset_scheduler();
 
             ggml_cgraph * gf = llm_build_context::llama_build_graph_s_copy(lctx);
-
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (gf == nullptr) {
+                return -1;
+            }
+            if (!ggml_backend_sched_alloc_graph(lctx.sched, gf)) {
+                return -2;
+            }
 
             llama_set_s_copy(lctx);
-
-            llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+            const auto status = llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+            if (status != GGML_STATUS_SUCCESS) {
+                return llama_eval_status_code(status);
+            }
 
             need_reserve = true;
         }
@@ -8739,7 +8836,10 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
     // defragment the KV cache if needed
     if (lctx.kv_self.do_defrag) {
-        llama_kv_cache_defrag_internal(lctx);
+        const auto status = llama_kv_cache_defrag_internal(lctx);
+        if (status != GGML_STATUS_SUCCESS) {
+            return llama_eval_status_code(status);
+        }
 
         need_reserve = true;
 
@@ -8773,6 +8873,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         lctx.reset_scheduler();
         if (!ggml_backend_sched_reserve(lctx.sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return -2;
         }
     }
     return 0;
@@ -11457,7 +11558,11 @@ void llama_kv_cache_defrag(struct llama_context * ctx) {
 }
 
 int32_t llama_kv_cache_update(struct llama_context * ctx) {
-    return llama_kv_cache_update_internal(*ctx);
+    const int32_t ret = llama_kv_cache_update_internal(*ctx);
+    if (ret < 0) {
+        llama_clear_failed_outputs(*ctx);
+    }
+    return ret;
 }
 
 // deprecated
@@ -13690,6 +13795,9 @@ int32_t llama_encode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
     const int ret = llama_encode_internal(*ctx, batch);
+    if (ret != 0) {
+        llama_clear_failed_outputs(*ctx, true);
+    }
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -13701,6 +13809,9 @@ int32_t llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
     const int ret = llama_decode_internal(*ctx, batch);
+    if (ret != 0) {
+        llama_clear_failed_outputs(*ctx);
+    }
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
@@ -13749,7 +13860,7 @@ void llama_synchronize(struct llama_context * ctx) {
 float * llama_get_logits(struct llama_context * ctx) {
     llama_synchronize(ctx);
 
-    return ctx->logits;
+    return ctx->n_outputs > 0 ? ctx->logits : nullptr;
 }
 
 float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
@@ -13845,7 +13956,7 @@ bool llama_copy_dflash_draft_lattice(
 float * llama_get_embeddings(struct llama_context * ctx) {
     llama_synchronize(ctx);
 
-    return ctx->embd;
+    return ctx->n_outputs_embd > 0 ? ctx->embd : nullptr;
 }
 
 float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {

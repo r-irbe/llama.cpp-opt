@@ -492,6 +492,7 @@ struct gpt_params {
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
     bool defer_ple         = false; // if true, keep the per-layer token embedding on the file (Linux and Windows only)
+    bool engram_resident   = false; // if true, pull the engram/per-layer token table fully resident: interleave + THP + parallel prefault (Linux only)
     bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
     int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)

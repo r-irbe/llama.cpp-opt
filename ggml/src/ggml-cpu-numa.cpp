@@ -18,6 +18,8 @@ namespace fs = std::filesystem;
 #endif
 
 #if defined(__gnu_linux__)
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <sched.h>
@@ -25,6 +27,7 @@ namespace fs = std::filesystem;
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <thread>
 #include <unistd.h>
 
 #include "ggml.h"
@@ -988,6 +991,54 @@ bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_node
 #endif
 }
 
+size_t prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes, int n_threads) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data || n_numa_nodes <= 1) {
+        return 0;
+    }
+    if (!bind_tensor_shared_interleaved(tensor, n_numa_nodes)) {
+        return 0;
+    }
+
+    const uintptr_t page_mask = ~(4096ULL - 1);
+    const uintptr_t start_addr = (uintptr_t) tensor->data;
+    const size_t total = ggml_nbytes(tensor);
+    const uintptr_t page_start = start_addr & page_mask;
+    const uintptr_t page_end   = (start_addr + total + 4095ULL) & page_mask;
+    const size_t len = page_end - page_start;
+    if (len < 4096) return 0;
+
+    if (n_threads <= 0) n_threads = n_numa_nodes * 4;
+    auto t0 = ggml_time_us();
+    const size_t chunk = (len + n_threads - 1) / n_threads;
+    std::atomic<size_t> touched{0};
+    std::vector<std::thread> pool;
+    pool.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        pool.emplace_back([=, &touched] {
+            const size_t off = (size_t) t * chunk;
+            const size_t take = std::min(chunk, len - off);
+            if (take == 0) return;
+            char * base = (char *) page_start + off;
+            if (madvise(base, take, MADV_POPULATE_READ) == 0) {
+                touched.fetch_add(take, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto & th : pool) th.join();
+    auto t1 = ggml_time_us();
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "ggml_numa: engram-resident interleave+THP+prefault: %.2f GiB touched in %.1f s across %d nodes (first tensor=%s)\n",
+                touched.load() / (1024.0 * 1024.0 * 1024.0), 1e-6 * (t1 - t0), n_numa_nodes, tensor->name);
+    }
+    return touched.load();
+#else
+    (void)tensor; (void)n_numa_nodes; (void)n_threads;
+    return 0;
+#endif
+}
+
 bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes) {
 #if defined(__gnu_linux__)
     if (!tensor || !tensor->data || n_numa_nodes <= 1) {
@@ -1093,6 +1144,10 @@ bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_n
 
 bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_nodes) {
     return ggml::cpu::numa::bind_tensor_shared_interleaved(tensor, n_numa_nodes);
+}
+
+size_t ggml_cpu_numa_prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes, int n_threads) {
+    return ggml::cpu::numa::prefault_tensor_interleaved(tensor, n_numa_nodes, n_threads);
 }
 
 bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes) {

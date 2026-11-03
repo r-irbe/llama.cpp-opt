@@ -17,13 +17,29 @@ struct ggml_graph_node_properties {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
+        release();
+    }
+    // The owner synchronizes and selects the owning device before releasing.
+    void release() {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance = nullptr;
         }
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
+            graph = nullptr;
         }
+        if (dest_ptrs_d != nullptr) {
+            CUDA_CHECK(cudaFree(dest_ptrs_d));
+            dest_ptrs_d = nullptr;
+        }
+        dest_ptrs_size = 0;
+        use_cpy_indirection = false;
     }
+    ggml_cuda_graph() = default;
+    ggml_cuda_graph(const ggml_cuda_graph &) = delete;
+    ggml_cuda_graph & operator=(const ggml_cuda_graph &) = delete;
+    uint64_t last_used = 0;
     uint64_t uid = 0;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
@@ -37,7 +53,7 @@ struct ggml_cuda_graph {
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     bool use_cpy_indirection = false;
     std::vector<char *> cpy_dest_ptrs;
-    char ** dest_ptrs_d;
+    char ** dest_ptrs_d = nullptr;
     int dest_ptrs_size = 0;
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.

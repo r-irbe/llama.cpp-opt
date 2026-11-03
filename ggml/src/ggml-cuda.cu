@@ -44,6 +44,9 @@
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/graph.cuh"
+#include "ggml-cuda/graph-cache.h"
+#include "ggml-cuda/graph-lifecycle.h"
+#include "ggml-cuda/reduction-lifecycle.h"
 #include "ggml-cuda/mmq_id.cuh"
 #include "ggml-cuda/quantize_id.cuh"
 #include "ggml-cuda/topk-moe.cuh"
@@ -335,27 +338,47 @@ const ggml_cuda_device_info & ggml_cuda_info() {
     return info;
 }
 
+// Lock order: lifetime gate -> per-context submission -> capture exclusion.
+// Registry mutation/invalidation/teardown take exclusive lifetime ownership.
+static ggml_cuda_graph_lifecycle ggml_cuda_graph_access;
+
+#ifdef USE_CUDA_GRAPH
+template <typename Fn>
+static void ggml_cuda_with_graph_fence(int device, Fn && fn) {
+    ggml_cuda_graph_access.without_capture([&] {
+        int previous_device = 0;
+        CUDA_CHECK(cudaGetDevice(&previous_device));
+        struct restore_device {
+            int device;
+            ~restore_device() { ggml_cuda_set_device(device); }
+        } restore {previous_device};
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        fn(); // capture exclusion stays held through resource destruction
+    });
+}
+
+static void ggml_cuda_clear_graphs(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_with_graph_fence(ctx.device, [&] {
+        // The outer guard has fenced the owning device and excludes captures.
+        ggml_cuda_graph_retire(ctx, [](int) { return true; });
+    });
+}
+#endif
+
 /* ---------- hot-swap: invalidate all cached CUDA graphs ---------- */
 extern "C" void ggml_backend_cuda_invalidate_graphs(const void * model) {
 #ifdef USE_CUDA_GRAPH
+    auto retirement = ggml_cuda_graph_access.retirement();
     auto & info = const_cast<ggml_cuda_device_info &>(ggml_cuda_info());
-    if (auto it = info.all_ctx.find(model); it != info.all_ctx.end()) {
+    if (auto it = info.graph_contexts.find(model); it != info.graph_contexts.end()) {
         for (auto ctx : it->second) {
-            if (ctx) {
-                ctx->cuda_graphs.clear();
-            }
+            ggml_cuda_clear_graphs(*ctx);
         }
-    } else {
-        fprintf(stderr, "================================= %s: did not find entry for model at %p\n", __func__, model);
     }
 #else
     GGML_UNUSED(model);
 #endif // USE_CUDA_GRAPH
-    //for (int i = 0; i < info.device_count; ++i) {
-    //    if (info.all_ctx[i]) {
-    //        info.all_ctx[i]->cuda_graphs.clear();
-    //    }
-    //}
 }
 
 // #define DEBUG_CUDA_MALLOC
@@ -571,15 +594,14 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
 }
 
-static std::mutex ggml_cuda_lock;
-static std::condition_variable ggml_cuda_lock_cv;
-//static std::atomic<int> ggml_cuda_lock_counter;
-static int ggml_cuda_lock_counter = 0;
-
 ggml_backend_cuda_context::ggml_backend_cuda_context(int device, const void * model) :
     device(device), name(GGML_CUDA_NAME + std::to_string(device)), model(model) {
+    auto registration = ggml_cuda_graph_access.retirement();
     auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
     auto & all_ctx = info->all_ctx[model];
+    // Register before publishing the primary pointer so allocation failure
+    // cannot leave a pointer to a partially constructed context in all_ctx.
+    info->graph_contexts[model].push_back(this);
     if (all_ctx[device]) {
         GGML_CUDA_LOG_WARN("%s: a context for device %d already exists?\n", __func__, device);
     } else{
@@ -588,6 +610,7 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device, const void * mo
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    auto retirement = ggml_cuda_graph_access.retirement();
 
 #ifdef USE_CUDA_GRAPH
     // Let's leave this debug log in for now, so we have a trace in case
@@ -599,42 +622,93 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         return env != nullptr && env[0] != '\0';
     }();
     if (graph_stats_enabled) {
-        GGML_CUDA_LOG_INFO("cuda graph stats: instances=%llu captures=%llu updates_ok=%llu updates_failed=%llu reinstantiations=%llu disable_events=%llu\n",
+        GGML_CUDA_LOG_INFO("cuda graph stats: instances=%llu captures=%llu updates_ok=%llu updates_failed=%llu reinstantiations=%llu disable_events=%llu hits=%llu misses=%llu evictions=%llu peak_entries=%llu\n",
                 (unsigned long long) graph_stats.graph_instances,
                 (unsigned long long) graph_stats.graph_captures,
                 (unsigned long long) graph_stats.graph_updates_ok,
                 (unsigned long long) graph_stats.graph_updates_failed,
                 (unsigned long long) graph_stats.graph_reinstantiations,
-                (unsigned long long) graph_stats.graph_disable_events);
+                (unsigned long long) graph_stats.graph_disable_events,
+                (unsigned long long) graph_stats.cache_hits,
+                (unsigned long long) graph_stats.cache_misses,
+                (unsigned long long) graph_stats.cache_evictions,
+                (unsigned long long) graph_stats.cache_peak_entries);
     }
 #endif
 
-    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
-    ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter == 0; });
+    auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
+    auto group = info->graph_contexts.find(model);
+    const auto * members = group == info->graph_contexts.end() ? nullptr : &group->second;
+    // Peer graphs can capture this context's streams, events and raw storage.
+    // Host retirement alone does not drain queued device work. Keep capture
+    // exclusion through ALL fences, graph retirement and resource destruction,
+    // including graph-disabled builds and cross-device stream/pool ownership.
+    ggml_cuda_graph_access.without_capture([&] {
+        int previous_device = 0;
+        CUDA_CHECK(cudaGetDevice(&previous_device));
+        struct restore_device {
+            int device;
+            ~restore_device() { ggml_cuda_set_device(device); }
+        } restore {previous_device};
+        const bool retired = ggml_cuda_retire_reduction_group(*this, members, info->device_count,
+            [](int d) {
+                ggml_cuda_set_device(d);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                return true;
+            }, [](ggml_backend_cuda_context & peer) {
+#ifdef USE_CUDA_GRAPH
+                ggml_cuda_set_device(peer.device);
+                ggml_cuda_graph_retire(peer, [](int) { return true; }); // all group fences succeeded
+#else
+                GGML_UNUSED(peer);
+#endif
+            });
+        if (!retired) { GGML_ABORT("invalid CUDA context group during retirement"); }
 
-    if (copy_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(copy_event));
-    }
-    if (compute_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(compute_event));
-    }
-    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
-        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
-            if (streams[i][j] != nullptr) {
-                CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
+        ggml_cuda_set_device(device);
+        if (copy_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(copy_event));
+            copy_event = nullptr;
+        }
+        if (compute_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(compute_event));
+            compute_event = nullptr;
+        }
+        if (copy_buffer != nullptr) {
+            CUDA_CHECK(cudaFree(copy_buffer));
+            copy_buffer = nullptr;
+            copy_size = 0;
+        }
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+                if (streams[i][j] != nullptr) {
+                    ggml_cuda_set_device(i);
+                    CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
+                    streams[i][j] = nullptr;
+                }
+            }
+            if (cublas_handles[i] != nullptr) {
+                ggml_cuda_set_device(i);
+                CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+                cublas_handles[i] = nullptr;
+            }
+            if (pools[i]) {
+                ggml_cuda_set_device(i);
+                pools[i].reset(); // do not defer member frees until after retirement unlocks
             }
         }
-        if (cublas_handles[i] != nullptr) {
-            CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+        if (auto it = info->all_ctx.find(model); it != info->all_ctx.end() && it->second[device] == this) {
+            it->second[device] = nullptr; // a duplicate is not automatically interchangeable
         }
-    }
-    auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
-    if (auto it = info->all_ctx.find(model); it != info->all_ctx.end() && it->second[device] == this) {
-        it->second[device] = nullptr;
-    }
-    //if (info->all_ctx[device] == this) {
-    //    info->all_ctx[device] = nullptr;
-    //}
+        if (group != info->graph_contexts.end()) {
+            auto & contexts = group->second;
+            contexts.erase(std::remove(contexts.begin(), contexts.end(), this), contexts.end());
+            if (contexts.empty()) {
+                info->graph_contexts.erase(group);
+                info->all_ctx.erase(model);
+            }
+        }
+    });
 
 }
 
@@ -4712,12 +4786,35 @@ static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 }
 
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
-    auto & graph = ctx.cuda_graphs[key];
-    if (!graph) {
-        graph = std::make_unique<ggml_cuda_graph>();
-        ctx.graph_stats.graph_instances++;
+    static const size_t capacity = []() -> size_t {
+        size_t result = 0;
+        if (!ggml_cuda_graph_cache_limit(getenv("GGML_CUDA_GRAPH_CACHE_SIZE"), result)) {
+            GGML_CUDA_LOG_WARN("invalid GGML_CUDA_GRAPH_CACHE_SIZE; no count limit applied\n");
+        }
+        return result;
+    }();
+    auto found = ctx.cuda_graphs.find(key);
+    if (found != ctx.cuda_graphs.end()) {
+        ++ctx.graph_stats.cache_hits;
+        found->second->last_used = ggml_time_us();
+        return found->second.get();
     }
-    return graph.get();
+    ++ctx.graph_stats.cache_misses;
+    if (ggml_cuda_graph_cache_full(ctx.cuda_graphs.size(), capacity)) {
+        ggml_cuda_with_graph_fence(ctx.device, [&] {
+            auto victim = ggml_cuda_graph_cache_lru(ctx.cuda_graphs, nullptr);
+            GGML_ASSERT(victim != ctx.cuda_graphs.end());
+            ctx.cuda_graphs.erase(victim);
+            ++ctx.graph_stats.cache_evictions;
+        });
+    }
+    auto graph = std::make_unique<ggml_cuda_graph>();
+    graph->last_used = ggml_time_us();
+    auto * result = graph.get();
+    ctx.cuda_graphs.emplace(key, std::move(graph));
+    ctx.graph_stats.graph_instances++;
+    ctx.graph_stats.cache_peak_entries = std::max<uint64_t>(ctx.graph_stats.cache_peak_entries, ctx.cuda_graphs.size());
+    return result;
 }
 
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph * graph, ggml_cgraph * cgraph,
@@ -4884,7 +4981,7 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
     return cuda_graph_update_required;
 }
 
-static void update_cuda_graph_executable(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+static cudaError_t update_cuda_graph_executable(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -4906,12 +5003,14 @@ static void update_cuda_graph_executable(ggml_backend_cuda_context * cuda_ctx, g
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        cuda_ctx->graph_stats.graph_reinstantiations++;
-    } else {
-        GGML_ASSERT(stat == cudaSuccess);
+        stat = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        if (stat == cudaSuccess) {
+            cuda_ctx->graph_stats.graph_reinstantiations++;
+        }
+    } else if (stat == cudaSuccess) {
         cuda_ctx->graph_stats.graph_updates_ok++;
     }
+    return stat;
 }
 #endif
 
@@ -4922,7 +5021,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     [[maybe_unused]] const bool integrated = false; //ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
 #ifdef USE_CUDA_GRAPH
-    auto graph = use_cuda_graph ? ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph)) : nullptr;
+    auto graph = use_cuda_graph ? cuda_ctx->cur_graph : nullptr;
 #endif
 
 #if IK_PRINT_TIMING
@@ -4956,23 +5055,45 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
             cuda_ctx->graph_stats.graph_captures++;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (--ggml_cuda_lock_counter == 0) {
-                ggml_cuda_lock_cv.notify_all();
-            }
+            ggml_cuda_graph_access.end_capture();
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
     }
 
     if (use_cuda_graph) {
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        cudaError_t stat = cudaSuccess;
+        bool upload_required = cuda_graph_update_required;
+        if (graph->instance == nullptr) {
+            stat = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            upload_required = true;
+        } else if (cuda_graph_update_required) {
+            stat = update_cuda_graph_executable(cuda_ctx, graph);
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            update_cuda_graph_executable(cuda_ctx, graph);
+        if (stat == cudaSuccess && upload_required) {
+            // Move lazy executable allocation out of launch: upload does not
+            // execute captured kernels, so allocation failure here is retryable
+            // as direct submission without duplicating KV writes.
+            stat = cudaGraphUpload(graph->instance, cuda_ctx->stream());
         }
-        // Launch graph
+        if (stat == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            // These APIs can report an earlier asynchronous error. Fall back
+            // only if all prior work completed successfully; otherwise fail.
+            GGML_CUDA_LOG_WARN("CUDA%d: graph preparation ran out of memory; releasing %zu cached graphs and disabling graphs for this context\n",
+                    cuda_ctx->device, cuda_ctx->cuda_graphs.size());
+            ggml_cuda_clear_graphs(*cuda_ctx); // fence must succeed before replaying direct
+            cuda_ctx->graph_stats.graph_disable_events++;
+            cuda_ctx->use_cuda_graph = false;
+            use_cuda_graph = false;
+            cuda_graph_update_required = false;
+            graph_evaluated_or_captured = false;
+            evaluate_and_capture_cuda_graph(cuda_ctx, cgraph, graph_evaluated_or_captured, use_cuda_graph, cuda_graph_update_required);
+            return;
+        }
+        CUDA_CHECK(stat);
+        // Never replay after a failed launch: it may report an asynchronous
+        // error and a partial execution may already have modified KV state.
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         graph_evaluated_or_captured = true;
@@ -4982,6 +5103,21 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
 
 GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    auto submission = ggml_cuda_graph_access.submission(cuda_ctx->submission_mutex);
+
+    // Validate before device side effects, graph lookup/capture AND cached
+    // launch. A cached executable can contain peer-owned streams/events/buffers.
+    const auto & info = ggml_cuda_info();
+    const auto primary = info.all_ctx.find(cuda_ctx->model);
+    const auto members = info.graph_contexts.find(cuda_ctx->model);
+    if (!ggml_cuda_reduction_contexts_valid(*cuda_ctx, *cgraph,
+            primary == info.all_ctx.end() ? nullptr : &primary->second,
+            members == info.graph_contexts.end() ? nullptr : &members->second,
+            info.device_count)) {
+        GGML_CUDA_LOG_ERROR("%s: CUDA%d reduction context ownership is unavailable or invalid\n",
+                __func__, cuda_ctx->device);
+        return GGML_STATUS_FAILED;
+    }
 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->apply_l2_persistence_window(cuda_ctx->stream());
@@ -5041,11 +5177,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
-        // Why are we protecting an atomic_int with a mutex?
-        {
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            ++ggml_cuda_lock_counter;
-        }
+        ggml_cuda_graph_access.begin_capture();
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
@@ -5062,6 +5194,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     bool graph_evaluated_or_captured = false;
 
     evaluate_and_capture_cuda_graph(cuda_ctx, cgraph, graph_evaluated_or_captured, use_cuda_graph, cuda_graph_update_required);
+#ifdef USE_CUDA_GRAPH
+    cuda_ctx->cur_graph = nullptr;
+#endif
 
     return GGML_STATUS_SUCCESS;
 }

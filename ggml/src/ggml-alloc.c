@@ -768,13 +768,27 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
             fprintf(stderr, "%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
 
-            ggml_backend_buffer_free(galloc->buffers[i]);
+            ggml_backend_buffer_t old_buffer = galloc->buffers[i];
+            // Shared allocator slots alias the same backing. Clear every alias
+            // before freeing it so a failed growth cannot leave dangling slots
+            // that are inspected/released on the next attempt or at teardown.
+            for (int j = 0; j < galloc->n_buffers; ++j) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    galloc->buffers[j] = NULL;
+                }
+            }
+            ggml_backend_buffer_free(old_buffer);
             galloc->buffers[i] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], new_size);
             if (galloc->buffers[i] == NULL) {
                 fprintf(stderr, "%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                 return false;
             }
             ggml_backend_buffer_set_usage(galloc->buffers[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            for (int j = i + 1; j < galloc->n_buffers; ++j) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    galloc->buffers[j] = galloc->buffers[i];
+                }
+            }
         }
     }
 
@@ -826,6 +840,15 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    // reserve_n records the plan before allocating backing. A failed reserve
+    // can leave matching node sizes but null/undersized buffers; the plan alone
+    // must not make the next allocation look valid.
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        if (galloc->buffers[i] == NULL ||
+            ggml_backend_buffer_get_size(galloc->buffers[i]) < ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i])) {
+            return true;
+        }
+    }
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         fprintf(stderr, "%s: graph has different number of nodes\n", __func__);

@@ -2481,7 +2481,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifndef NDEBUG
         fprintf(stderr, "%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             fprintf(stderr, "%s: failed to allocate graph\n", __func__);
             return false;
@@ -2747,6 +2749,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!has_cpu_work) {
         #pragma omp parallel num_threads(sched->n_backends)
         {
+            // Backend IDs require one owner each. num_threads is a request:
+            // thread limits or nesting can supply fewer workers. Decide once,
+            // before any copy/evaluation/event, with the implicit single barrier.
+            #pragma omp single
+            {
+                work_done = omp_get_num_threads() == sched->n_backends;
+            }
+            if (work_done) {
 
             int last_reduce = first_reduce;
             int ith = omp_get_thread_num();
@@ -2781,7 +2791,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
-                    sched->statuses[ith].status = ggml_backend_sched_eval(sched, split_backend, split);
+                    const auto status = ggml_backend_sched_eval(sched, split_backend, split);
+                    // Keep each worker's first failure. Later successful splits
+                    // must not turn a partially failed evaluation into success.
+                    if (sched->statuses[ith].status == GGML_STATUS_SUCCESS) {
+                        sched->statuses[ith].status = status;
+                    }
 
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
@@ -2815,8 +2830,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+            }
         }
-        work_done = true;
         }
 #endif
         if (!work_done) {
@@ -2907,7 +2922,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
-                    sched->statuses[ith].status = ggml_backend_sched_eval(sched, split_backend, split);
+                    const auto status = ggml_backend_sched_eval(sched, split_backend, split);
+                    // Do not exit this loop on error: peers still need every
+                    // matching barrier/event. Retain the failure while draining
+                    // the established submission protocol, then fail below.
+                    if (sched->statuses[ith].status == GGML_STATUS_SUCCESS) {
+                        sched->statuses[ith].status = status;
+                    }
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
                     } else {
@@ -2979,7 +3000,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         }
         for (const auto & status : sched->statuses) {
-            if (status.status != GGML_STATUS_SUCCESS) return status.status;
+            if (status.status != GGML_STATUS_SUCCESS) {
+                // All host workers have joined their epoch/parallel region.
+                // Complete any partially submitted writes before handing a
+                // terminal error back to a caller that may retire storage.
+                ggml_backend_sched_synchronize(sched);
+                return status.status;
+            }
         }
         return GGML_STATUS_SUCCESS;
 
@@ -3250,7 +3277,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
-static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
+static bool ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
 
     for (auto & item : sched->own_cpy   ) item = false;
     for (auto & item : sched->needs_sync) item = true;
@@ -3302,6 +3329,9 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
             if (!sched->input_memory_bufs[backend_id]) {
                 sched->input_memory_bufs[backend_id] = ggml_backend_alloc_buffer(sched->backends[backend_id], max_input_size);
             }
+            if (sched->input_memory_bufs[backend_id] == nullptr) {
+                return false;
+            }
             auto ptr = (char *)ggml_backend_buffer_get_base(sched->input_memory_bufs[backend_id]);
             input_size = 0;
             for (int i = 0; i < int(sched->backend_splits[backend_id].size()); ++i) {
@@ -3334,6 +3364,7 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
             sched->own_cpy[backend_id] = true;
         }
     }
+    return true;
 }
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -3344,7 +3375,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
-    ggml_sched_prepare_graph(sched);
+    if (!ggml_sched_prepare_graph(sched)) {
+        return false;
+    }
 
     sched->is_alloc = true;
 

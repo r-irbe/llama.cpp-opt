@@ -441,6 +441,7 @@ extern "C" {
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
         bool defer_ple;        // keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux and Windows only)
+        bool engram_resident;  // force the engram/per-layer token table fully resident: interleave + THP + parallel prefault (Linux only)
         bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
     };
 
