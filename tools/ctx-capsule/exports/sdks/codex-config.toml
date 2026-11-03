@@ -1,8 +1,8 @@
 # OpenAI Codex CLI Local Provider Bridge
-model = "qwen38_27b"
+model = "deepseek-v4.1-1017-ud-q4kxl"
 model_provider = "ik_llama"
 
 [model_providers.ik_llama]
 name = "ik_llama.cpp Local Capsule Engine"
-base_url = "http://127.0.0.1:8083/v1"
-http_headers = { "X-Llama-Cohort" = "cohort-qwen38_27b-coding_pinpoint", "X-Llama-Capsule-Filter" = "fuse8_simhash64" }
+base_url = "http://127.0.0.1:8080/v1"
+http_headers = { "X-Cohort-ID" = "cohort-deepseek-v4.1-1017-ud-q4kxl-ds41-1017-np1-512k-max-speed", "X-Llama-Capsule-Filter" = "fuse8_simhash64" }

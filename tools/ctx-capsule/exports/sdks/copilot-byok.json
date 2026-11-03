@@ -2,22 +2,21 @@
   "sdk": "@github/copilot-language-server",
   "github.copilot.advanced": {
     "debug": {
-      "overrideProxyUrl": "http://127.0.0.1:8083/v1",
-      "chatOverrideProxyUrl": "http://127.0.0.1:8083/v1/chat/completions"
+      "overrideProxyUrl": "http://127.0.0.1:8080/v1",
+      "chatOverrideProxyUrl": "http://127.0.0.1:8080/v1/chat/completions"
     },
-    "byokModel": "qwen38_27b",
+    "byokModel": "deepseek-v4.1-1017-ud-q4kxl",
     "extraHeaders": {
-      "X-Llama-Cohort": "cohort-qwen38_27b-coding_pinpoint",
-      "X-Llama-Capsule-Filter": "fuse8_simhash64",
-      "X-Llama-Evidence-Strategy": "maxsim_exact_cover",
-      "X-Llama-Evidence-Keep": "20%",
-      "X-Llama-Engine-Flavor": "ik_llama_pto_lto",
+      "X-Cohort-ID": "cohort-deepseek-v4.1-1017-ud-q4kxl-ds41-1017-np1-512k-max-speed",
       "X-Evidence-Filter": "true",
       "X-Evidence-Strategy": "maxsim_exact_cover",
-      "X-Evidence-Top-K": "20",
       "X-Evidence-Chunk-Tokens": "128",
-      "X-Evidence-Symbol-Boost": "0.15",
-      "X-Evidence-Chunk-Expansion": "true",
+      "X-Evidence-Top-K": "20",
+      "X-Evidence-Symbol-Boost": "1.5",
+      "X-Evidence-Chunk-Expansion": "1",
+      "X-Llama-Capsule-Filter": "fuse8_simhash64",
+      "X-Llama-Evidence-Keep-Ratio": "20%",
+      "X-Llama-Engine-Flavor": "ik_llama_pto_lto",
       "X-Llama-Thinking-Effort": "max_deep_think"
     }
   }

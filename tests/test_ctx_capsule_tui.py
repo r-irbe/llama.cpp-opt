@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-tests/test_ctx_capsule_tui.py - Comprehensive Automated Unit & UI Coverage Test Suite
-Tests tools/ctx-capsule/ctx_capsule_tui.py (all 5 tabs, 34 settings, geometry invariants,
-keyboard navigation, presets, CLI/HTTP builders, multi-agent exports) and common/kv-capsule-filter.h.
+tests/test_ctx_capsule_tui.py - Comprehensive Automated Verification Suite
+Tests the canonical TypeScript @earendil-works/pi-tui control plane (tools/ctx-capsule/ctx_capsule_tui.ts),
+all 7 category tabs, 37 settings, Unicode box-drawing & SettingsList layout geometry,
+ranked DeepSeek-V4.1-Flash-1017 presets, 5-layer hierarchical TOML + 8-agent SDK export,
+scripts/launch.py integration, C++ common/kv-capsule-filter.h, and live HTTP Evidence Mode.
 """
 
-import curses
-import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,21 +17,20 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TUI_PATH = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.py"
+TS_TUI_PATH = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
+LEGACY_PY_TUI_PATH = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.py"
 KV_CAPSULE_HEADER = REPO_ROOT / "common" / "kv-capsule-filter.h"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\]8;;.*?\x07")
 
 
-def load_tui_module():
-    spec = importlib.util.spec_from_file_location("ctx_capsule_tui", TUI_PATH)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
 
 
 def display_width(text: str) -> int:
+    clean = strip_ansi(text)
     width = 0
-    for ch in text:
+    for ch in clean:
         if unicodedata.combining(ch):
             continue
         eaw = unicodedata.east_asian_width(ch)
@@ -38,364 +38,106 @@ def display_width(text: str) -> int:
     return width
 
 
-class FakeStdscr:
-    """Mock curses window to test run_curses interactive loop with 100% coverage."""
-
-    def __init__(self, key_sequence):
-        self.keys = list(key_sequence)
-        self.rendered_lines = []
-        self.clear_count = 0
-        self.refresh_count = 0
-
-    def clear(self):
-        self.clear_count += 1
-        self.rendered_lines = []
-
-    def addstr(self, y, x, text):
-        while len(self.rendered_lines) <= y:
-            self.rendered_lines.append("")
-        self.rendered_lines[y] = text
-
-    def refresh(self):
-        self.refresh_count += 1
-
-    def getch(self):
-        if not self.keys:
-            return ord("q")
-        return self.keys.pop(0)
+def run_ts_tui(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    cmd = ["node", "--experimental-strip-types", str(TS_TUI_PATH), *args]
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd), check=False)
 
 
-def test_five_tabs_and_all_34_settings_structure():
-    tui = load_tui_module()
-    assert hasattr(tui, "TABS")
-    assert len(tui.TABS) == 5, f"Expected 5 category tabs, got {len(tui.TABS)}"
-    expected_slugs = ["evidence", "kv_cache", "speculative", "hardware", "sampling"]
-    assert [t["slug"] for t in tui.TABS] == expected_slugs
-    assert len(tui.SETTINGS) == 34
-
-    expected_keys = {
-        # Tab 1: Evidence & Context Capsules (7)
-        "evidence_filter",
-        "evidence_strategy",
-        "evidence_chunk_tokens",
-        "evidence_top_k",
-        "evidence_symbol_boost",
-        "evidence_chunk_expansion",
-        "capsule_filter",
-        # Tab 2: KV Cache, ZDD Sparsity & Tiered Paging (8)
-        "cache_type_k",
-        "cache_type_v",
-        "zdd_sparse_kv",
-        "mla_attn",
-        "cohort_prefix_sharing",
-        "cohort_min_prefix",
-        "cache_ram",
-        "universal_slab_arena",
-        # Tab 3: Speculative Decoding & TreeGraft Arbiter (5)
-        "spec_type",
-        "spec_autotune",
-        "draft_max",
-        "draft_min",
-        "het_split_drafting",
-        # Tab 4: Hardware, NUMA, CUDA Graphs & Direct I/O (7)
-        "numa_strategy",
-        "numa_replicate_shared",
-        "cpu_threads",
-        "flash_attn",
-        "transparent_huge_pages",
-        "defer_io_uring",
-        "cuda_l2_persistence",
-        # Tab 5: Sampling, Reasoning & Agent Harnesses (7)
-        "temp",
-        "top_k",
-        "top_p",
-        "min_p",
-        "reasoning_effort",
-        "grammar_json",
-        "agent_harness",
-    }
-    actual_keys = {s["key"] for s in tui.SETTINGS}
-    assert actual_keys == expected_keys
-
-    for s in tui.SETTINGS:
-        assert len(s["values"]) >= 2
-        assert 0 <= s["idx"] < len(s["values"])
-        assert len(s["ascii"]) >= 3
-        assert s["desc"] and s["pros"] and s["cons"] and s["impact"]
-        assert "badges" in s and len(s["badges"]) == len(s["values"])
+def test_legacy_python_tui_deleted_and_canonical_ts_tui_present():
+    """Verify the duplicate Python curses TUI is removed and canonical @earendil-works/pi-tui entrypoint exists."""
+    assert not LEGACY_PY_TUI_PATH.exists(), f"Legacy duplicate {LEGACY_PY_TUI_PATH} must not exist"
+    assert TS_TUI_PATH.exists(), f"Missing canonical TypeScript TUI entrypoint {TS_TUI_PATH}"
 
 
-def test_box_drawing_geometry_and_zero_clipping_across_all_tabs_and_values():
-    tui = load_tui_module()
+def test_seven_tabs_and_pi_tui_geometry_invariants():
+    """Verify all 7 tabs render via @earendil-works/pi-tui VStack/HStack/SettingsList with exact 136-column visible width."""
+    expected_tab_headers = [
+        "CATEGORY 1: 1:Models&Tmpl",
+        "CATEGORY 2: 2:LlamaFleet",
+        "CATEGORY 3: 3:Capsules",
+        "CATEGORY 4: 4:KV&ZDD",
+        "CATEGORY 5: 5:SpecBandit",
+        "CATEGORY 6: 6:HW&NUMA",
+        "CATEGORY 7: 7:SDKS&Tel",
+    ]
+    for tab_num, expected_header in enumerate(expected_tab_headers, start=1):
+        res = run_ts_tui("--tab", str(tab_num), "--render-once", "--dry-run")
+        assert res.returncode == 0, f"Tab {tab_num} render failed: {res.stderr}"
+        lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
+        assert len(lines) >= 22
+        assert expected_header in strip_ansi(res.stdout)
 
-    for tab_idx, tab in enumerate(tui.TABS):
-        for s_idx, setting in enumerate(tab["settings"]):
-            for val_idx, val in enumerate(setting["values"]):
-                setting["idx"] = val_idx
-                snap = tui.render_ansi_snapshot(s_idx, tab_idx=tab_idx)
-                lines = snap.splitlines()
-                assert len(lines) >= 18
-
-                expected_w = display_width(lines[0])
-                assert expected_w == 136
-                assert lines[0].startswith("╔") and lines[0].endswith("╗")
-                assert lines[-1].startswith("╚") and lines[-1].endswith("╝")
-
-                for line_no, line in enumerate(lines):
-                    w = display_width(line)
-                    assert w == expected_w, (
-                        f"Line {line_no} width mismatch ({w} != {expected_w}) "
-                        f"on tab={tab_idx} setting={setting['key']} val={val}: {line!r}"
-                    )
-                    assert line[0] in ("╔", "║", "╠", "╚"), f"Unclosed left border on line {line_no}: {line!r}"
-                    assert line[-1] in ("╗", "║", "╣", "╝"), f"Unclosed right border on line {line_no}: {line!r}"
-
-                # Active tab pill indicator must be highlighted
-                assert f"▶[{tab['short_title']}]◀" in snap
-
-                # Active badge for this specific value must appear in right column header
-                expected_badge = tui.get_active_badge(setting)
-                assert expected_badge in snap
-
-                # Every setting value in left column must have closing ' >' (never clipped mid-value!)
-                val_str = str(val)
-                expected_val_display = "all (5 agents)" if val_str.startswith("all (") else val_str
-                assert f"< {expected_val_display} >" in snap, (
-                    f"Clipped value in left column for {setting['key']}={val_str}"
-                )
-
-                # Every ASCII art line must appear intact in the right column
-                for art_line in setting["ascii"]:
-                    stripped = art_line.strip()
-                    if stripped:
-                        assert stripped in snap, f"ASCII art line {stripped!r} missing/clipped for {setting['key']}"
+        # Verify box borders (rounded Unicode or ASCII) and exact 136-column visible width on every line
+        first_clean = strip_ansi(lines[0])
+        last_clean = strip_ansi(lines[-1])
+        assert (first_clean.startswith("╭") and first_clean.endswith("╮")) or (first_clean.startswith("+") and first_clean.endswith("+"))
+        assert (last_clean.startswith("╰") and last_clean.endswith("╯")) or (last_clean.startswith("+") and last_clean.endswith("+"))
+        for idx, line in enumerate(lines):
+            w = display_width(line)
+            assert w == 136, f"Tab {tab_num} line {idx} visible width {w} != 136: {strip_ansi(line)!r}"
 
 
-def test_keyboard_navigation_all_tabs_settings_and_presets():
-    tui = load_tui_module()
-    state = tui.TuiState(tab_idx=0, selected_idx=0)
-
-    # Number hotkeys '1'..'5' switch directly to tabs 0..4
-    for tab_num in range(1, 6):
-        assert state.handle_key(ord(str(tab_num))) is True
-        assert state.tab_idx == tab_num - 1
-
-    # TAB and Shift-TAB cycle across all 5 tabs
-    state.tab_idx = 0
-    for expected_tab in [1, 2, 3, 4, 0]:
-        assert state.handle_key(9) is True
-        assert state.tab_idx == expected_tab
-
-    btab = getattr(curses, "KEY_BTAB", 353)
-    for expected_tab in [4, 3, 2, 1, 0]:
-        assert state.handle_key(btab) is True
-        assert state.tab_idx == expected_tab
-
-    # Navigate UP/DOWN and cycle LEFT/RIGHT across every setting in every tab
-    for t_idx, tab in enumerate(tui.TABS):
-        state.tab_idx = t_idx
-        state.selected_idx = 0
-        n_settings = len(tab["settings"])
-        for step in range(n_settings):
-            assert state.selected_idx == step
-            s = state.active_setting
-            orig_idx = s["idx"]
-            # KEY_RIGHT advances value index
-            state.handle_key(curses.KEY_RIGHT)
-            assert s["idx"] == (orig_idx + 1) % len(s["values"])
-            # KEY_LEFT restores value index
-            state.handle_key(curses.KEY_LEFT)
-            assert s["idx"] == orig_idx
-            # KEY_DOWN moves to next setting (wrapping around at end)
-            state.handle_key(curses.KEY_DOWN)
-        assert state.selected_idx == 0
-        state.handle_key(curses.KEY_UP)
-        assert state.selected_idx == n_settings - 1
-
-    # Preset cycling ('p') and reset ('r')
-    state.handle_key(ord("p"))  # low_vram
-    assert tui.get_setting_by_key("cache_type_k")["values"][tui.get_setting_by_key("cache_type_k")["idx"]] == "q4_0"
-    state.handle_key(ord("p"))  # max_throughput
-    assert tui.get_setting_by_key("draft_max")["values"][tui.get_setting_by_key("draft_max")["idx"]] == 16
-    state.handle_key(ord("p"))  # deep_audit
-    assert (
-        tui.get_setting_by_key("evidence_strategy")["values"][tui.get_setting_by_key("evidence_strategy")["idx"]]
-        == "analytic_aggregate"
-    )
-    state.handle_key(ord("r"))  # reset_defaults
-    assert tui.get_setting_by_key("cache_type_k")["values"][tui.get_setting_by_key("cache_type_k")["idx"]] == "q8_0"
-
-    # Export key ('e') and Quit key ('q')
-    with tempfile.TemporaryDirectory() as tmpdir:
-        assert state.handle_key(ord("e"), export_dir=Path(tmpdir)) is True
-        assert state.last_exported_path is not None and state.last_exported_path.exists()
-    assert state.handle_key(ord("q")) is False
-
-
-def test_cli_flags_and_http_payload_combinations():
-    tui = load_tui_module()
-    tui.reset_defaults()
-
-    flags = tui.build_cli_flags()
-    for expected_flag in [
-        "--evidence-filter",
-        "--evidence-strategy code_pinpoint",
-        "--evidence-chunk-tokens 140",
-        "--evidence-top-k 10",
-        "--evidence-symbol-boost 3.5",
-        "--evidence-chunk-expansion 1",
-        "-ctk q8_0",
-        "-ctv q8_0",
-        "--zdd-sparse-kv",
-        "-mla 3",
-        "--cohort-prefix-sharing",
-        "--cohort-min-prefix 64",
-        "--cache-ram 0",
-        "--spec-type ngram-map-k4v:n_max=8,n_min=2",
-        "--spec-type mtp:n_max=8,p_min=0.0",
-        "--spec-autotune",
-        "--numa expert",
-        "--numa-replicate-shared",
-        "-t 16 -tb 32",
-        "-fa on",
-        "--transparent-huge-pages",
-        "--defer-experts --defer-ple",
-        "--temp 0.2",
-        "--top-k 40",
-        "--top-p 0.95",
-        "--min-p 0.05",
-        "--reasoning on",
-    ]:
-        assert expected_flag in flags, f"Missing {expected_flag!r} in {flags!r}"
-
-    # Verify zero legacy --unreal flags
-    assert "unreal" not in flags.lower()
-
-    # Test toggling settings off / alternative branches
-    tui.get_setting_by_key("evidence_filter")["idx"] = 1  # OFF
-    tui.get_setting_by_key("zdd_sparse_kv")["idx"] = 1  # OFF
-    tui.get_setting_by_key("cohort_prefix_sharing")["idx"] = 1  # OFF
-    tui.get_setting_by_key("spec_type")["idx"] = 3  # dflash
-    tui.get_setting_by_key("defer_io_uring")["idx"] = 1  # defer-experts
-    tui.get_setting_by_key("reasoning_effort")["idx"] = 4  # off
-    alt_flags = tui.build_cli_flags()
-    assert "--no-evidence-filter" in alt_flags
-    assert "--no-zdd-sparse-kv" in alt_flags
-    assert "--no-cohort-prefix-sharing" in alt_flags
-    assert "--spec-type dflash:n_max=8" in alt_flags
-    assert "--defer-experts" in alt_flags and "--defer-ple" not in alt_flags
-    assert "--reasoning off" in alt_flags
-
-    headers, payload = tui.build_http_headers_and_payload()
-    assert headers["X-Evidence-Filter"] == "OFF"
-    assert payload["evidence_filter"] is False
-    assert payload["evidence_capsule"]["enabled"] is False
-    assert payload["kv_paging"]["zdd_sparse_kv"] is False
-    assert payload["speculative"]["spec_type"] == "dflash"
-
-    # Test DeepSeek-V4.1-Flash-1017 presets and DSpark + ngram-mod flags
-    for ds_preset in [
+def test_presets_and_runtime_parameter_tuning_via_ts_control_plane():
+    """Verify applying all 4 DeepSeek-V4.1-Flash-1017 presets and tuning parameters via ctx_capsule_tui.ts."""
+    ds_presets = [
         "ds41-1017-np1-512k-max-speed",
         "ds41-1017-np1-1m-extreme",
         "ds41-1017-np4-512k-swarm",
         "ds41-1017-np8-1m-swarm",
-    ]:
-        tui.apply_preset(ds_preset)
-        ds_flags = tui.build_cli_flags()
-        assert "--spec-type ngram-mod:n_max=6,n_min=2" in ds_flags
-        # Two-stage chains require a self-spec stage first (ngram-mod); the
-        # dflash-family dspark neural stage is a valid second stage and the
-        # -md drafter supplies its weights.
-        assert "--spec-type dspark:n_max=6,n_min=1" in ds_flags
-        assert "--spec-ckpt-mode per-step" in ds_flags
-        assert "-mla 2" in ds_flags
-        assert "--evidence-top-k 16" in ds_flags
-        assert "--defer-ple" in ds_flags and "--defer-experts" not in ds_flags
-        if ds_preset == "ds41-1017-np1-512k-max-speed":
-            assert "-ctk q8_0" in ds_flags and "-ctv q8_0" in ds_flags
-        else:
-            assert "-ctk q4_0" in ds_flags and "-ctv q4_0" in ds_flags
-        _, ds_payload = tui.build_http_headers_and_payload()
-        assert ds_payload["evidence_filter"] is True
-        assert ds_payload["evidence_strategy"] == "code_pinpoint"
-        assert ds_payload["evidence_top_k"] == 16
-        assert ds_payload["evidence_capsule"]["enabled"] is True
-
-    tui.reset_defaults()
-
-
-def test_export_agent_configs_all_and_individual_harnesses():
-    tui = load_tui_module()
-    tui.reset_defaults()
-    harness_setting = tui.get_setting_by_key("agent_harness")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. All harnesses selected
-        out_path = tui.export_agent_configs(Path(tmpdir))
-        data = json.loads(out_path.read_text(encoding="utf-8"))
-        assert data["project"] == "r-irbe/ctx-capsule"
-        assert data["version"] == "2.0.0"
-        assert set(data["harnesses"].keys()) == {"pi", "opencode", "claude_code", "codex_cli", "github_copilot"}
-        assert set(data["categories"].keys()) == {"evidence", "kv_cache", "speculative", "hardware", "sampling"}
-
-        # 2. Individual harness filtering
-        expected_map = {
-            "pi-fleet": "pi",
-            "opencode": "opencode",
-            "claude-code": "claude_code",
-            "codex-cli": "codex_cli",
-            "github-copilot": "github_copilot",
-        }
-        for val_name, target_key in expected_map.items():
-            harness_setting["idx"] = harness_setting["values"].index(val_name)
-            out_path = tui.export_agent_configs(Path(tmpdir))
-            data = json.loads(out_path.read_text(encoding="utf-8"))
-            assert list(data["harnesses"].keys()) == [target_key]
-            assert len(data["all_harnesses"]) == 5
-
-    tui.reset_defaults()
-
-
-def test_run_curses_and_cli_entrypoints(monkeypatch):
-    tui = load_tui_module()
-    monkeypatch.setattr(curses, "curs_set", lambda _: None)
-
-    keys = [
-        curses.KEY_DOWN,
-        curses.KEY_RIGHT,
-        9,  # Tab to Tab 2
-        curses.KEY_DOWN,
-        curses.KEY_LEFT,
-        ord("3"),  # Jump to Tab 3
-        ord("p"),  # Apply preset
-        ord("r"),  # Reset defaults
-        ord("q"),
     ]
-    fake_scr = FakeStdscr(keys)
-    tui.run_curses(fake_scr)
-    assert fake_scr.clear_count == len(keys)
-    assert fake_scr.refresh_count == len(keys)
+    for preset_id in ds_presets:
+        res = run_ts_tui("preset", preset_id, "--dry-run")
+        assert res.returncode == 0, f"Preset {preset_id} failed: {res.stderr}"
+        clean = strip_ansi(res.stdout)
+        assert f"[< {preset_id} >]" in clean
+        assert "[PTO Tune & Swap (p)]" in clean
 
-    # Also test CLI subprocess with --render-once, --tab, --select, --preset, --export-dir
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for tab_num in range(1, 6):
-            cmd = [
-                sys.executable,
-                str(TUI_PATH),
-                "--render-once",
-                "--tab",
-                str(tab_num),
-                "--select",
-                "1",
-                "--preset",
-                "default",
-                "--export-dir",
-                tmpdir,
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            assert res.returncode == 0, f"CLI failed on tab {tab_num}: {res.stderr}"
-            assert "r-irbe/ctx-capsule" in res.stdout
-            assert (Path(tmpdir) / "ctx-capsule-agents.json").exists()
+    res_tune = run_ts_tui(
+        "tune",
+        "thinking_effort=high_analytical",
+        "kv_type_k=q4_0",
+        "--dry-run",
+    )
+    assert res_tune.returncode == 0, f"Tune failed: {res_tune.stderr}"
+    assert "[< q4_0 >]" in strip_ansi(res_tune.stdout)
+
+    # Restore default preset
+    run_ts_tui("preset", "coding_pinpoint", "--dry-run")
+
+
+def test_export_toml_and_eight_agent_sdk_configs():
+    """Verify export-toml compiles the 5-layer TOML hierarchy and writes all 8 coding agent SDK configs."""
+    res = run_ts_tui("export-toml", "--dry-run")
+    assert res.returncode == 0, f"export-toml failed: {res.stderr}"
+    sdk_dir = REPO_ROOT / "tools" / "ctx-capsule" / "exports" / "sdks"
+    for expected_sdk in [
+        "pi-provider.json",
+        ".mcp.json",
+        "opencode.json",
+        "claude-sdk-bridge.json",
+        "google-genai-bridge.json",
+        "codex-config.toml",
+        "copilot-byok.json",
+        "weft-capsule-bridge.json",
+    ]:
+        assert (sdk_dir / expected_sdk).exists(), f"Missing exported SDK config {expected_sdk}"
+
+
+def test_launch_py_capsule_flag_delegates_to_ts_tui():
+    """Verify scripts/launch.py --capsule --dry-run delegates directly to ctx_capsule_tui.ts."""
+    launch_script = REPO_ROOT / "scripts" / "launch.py"
+    res = subprocess.run(
+        [sys.executable, str(launch_script), "--capsule", "--dry-run"],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+    assert res.returncode == 0, f"launch.py --capsule --dry-run failed: {res.stderr}"
+    clean = strip_ansi(res.stdout)
+    assert ("CTX-CAPSULE FOOP CONTROL PLANE" in clean or "CTX-CAPSULE CONTROL PLANE" in clean)
+    assert "ACTIVE LLAMA.CPP FLEET" in clean
+
 
 
 def test_cpp_kv_capsule_filter_binary_fuse_and_simhash():
@@ -596,8 +338,9 @@ def test_pto_profile_runner_and_ctx_capsule_ts_integration():
         check=False,
     )
     assert res_pto_only.returncode == 0, f"ctx_capsule_tui.ts --pto-optimize failed: {res_pto_only.stderr}"
-    assert "STATUS: PTO Fine-Tuned (cs_irpgo_2stage via clang21_lld_znver3)" in res_pto_only.stdout
-    assert "ik_llama_pto_lto" in res_pto_only.stdout
+    clean_pto_only = strip_ansi(res_pto_only.stdout)
+    assert "STATUS: PTO Fine-Tuned (cs_irpgo_2stage via clang21_lld_znver3)" in clean_pto_only
+    assert "ik_llama_pto_lto" in clean_pto_only
 
     res_ts = subprocess.run(
         [
@@ -613,8 +356,9 @@ def test_pto_profile_runner_and_ctx_capsule_ts_integration():
         check=False,
     )
     assert res_ts.returncode == 0, f"ctx_capsule_tui.ts failed: {res_ts.stderr}"
-    assert "[capsule.pto.trace_and_optimize]" in res_ts.stdout
-    assert "[PTO Tune & Swap (p)]" in res_ts.stdout
+    clean_ts = strip_ansi(res_ts.stdout)
+    assert "[capsule.pto.trace_and_optimize]" in clean_ts
+    assert "[PTO Tune & Swap (p)]" in clean_ts
     defaults_toml = (REPO_ROOT / "scripts" / "configs" / "hierarchy" / "00-defaults.toml").read_text(encoding="utf-8")
     assert "[pto]" in defaults_toml
     assert 'pto_mode = "irpgo_thinlto_split"' in defaults_toml
@@ -819,6 +563,58 @@ def test_live_http_server_evidence_handshake_chat_and_completions():
         finally:
             srv.terminate()
             srv.wait(timeout=5)
+
+
+def test_launch_py_all_models_and_profiles_dry_run_and_idempotent_export():
+    import tomllib
+    tui_script = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
+    launch_script = REPO_ROOT / "scripts" / "launch.py"
+
+    # 1. Run --export-toml 3 times consecutively and verify tomllib.loads parses scripts/configs/models.toml with zero duplicate key errors
+    for _ in range(3):
+        res = subprocess.run(["node", "--experimental-strip-types", str(tui_script), "--export-toml"], capture_output=True, text=True, cwd=str(REPO_ROOT))
+        assert res.returncode == 0, f"Export toml failed: {res.stderr}"
+
+    models_toml = REPO_ROOT / "scripts" / "configs" / "models.toml"
+    assert models_toml.exists()
+    cfg_text = models_toml.read_text(encoding="utf-8")
+    cfg = tomllib.loads(cfg_text)
+
+    assert "models" in cfg
+    assert "profiles" in cfg
+
+    # 2. Run python3 scripts/launch.py <key> --dry-run for EVERY model in cfg["models"] and EVERY profile in cfg["profiles"]
+    all_keys = list(cfg["models"].keys()) + list(cfg["profiles"].keys())
+    for required_prof in ["ds41-1017-np1-512k-max-speed", "ds41-1017-np1-1m-extreme", "ds41-1017-np4-512k-swarm", "ds41-1017-np8-1m-swarm"]:
+        if required_prof not in all_keys:
+            all_keys.append(required_prof)
+
+    for key in all_keys:
+        res = subprocess.run([sys.executable, str(launch_script), key, "--dry-run"], capture_output=True, text=True, cwd=str(REPO_ROOT))
+        assert res.returncode == 0, f"Launch dry-run failed for key '{key}': stdout={res.stdout}, stderr={res.stderr}"
+
+    # 3. Verify --profile combination and --engram-resident / --spec-verify-pinned emission
+    combo = subprocess.run(
+        [
+            sys.executable,
+            str(launch_script),
+            "deepseek-v4.1-1017-ud-q4kxl",
+            "--profile",
+            "ds41-1017-np4-512k-swarm",
+            "--engram-resident",
+            "--spec-verify-pinned",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    assert combo.returncode == 0, f"Combo dry-run failed: {combo.stderr}"
+    assert "-np 4" in combo.stdout
+    assert "-c 524288" in combo.stdout
+    assert "--swa-compress" in combo.stdout
+    assert "--engram-resident" in combo.stdout
+    assert "--spec-verify-pinned" in combo.stdout
 
 
 

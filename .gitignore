@@ -163,3 +163,9 @@ a.out.*
 .dev
 .github
 rust-mmap-engine/formalization/.lake/
+
+# Agent and harness state
+.agents/
+.codex/
+.ctx-capsule/
+.weft/

@@ -71,4 +71,4 @@ exec "${BINARY}" \
     -ub 1024 -dsa -dsatk 1024 -fidx \
     -c 1048576 -nkvo \
     --chat-template-kwargs '{"reasoning_effort":"max"}' \
-    --no-evidence-filter -ctk q4_0 -ictk q4_0 -muge -mqkv -ser 4,1 -crs 0.50 -sps 0.20  -mla 2 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --numa expert --numa-replicate-shared -fa on --transparent-huge-pages --temp 0.8 --top-k 0 --top-p 0.95 --min-p 0.05 --repeat-penalty 1.05 --swa-compress -sas --mlock --reasoning on --spec-type ngram-map-k4v:n_max=8,n_min=2  --spec-autotune --zdd-sparse-kv --spec-verify-pinned --timeout 3600
+    --no-evidence-filter -ctk q4_0 -ictk q4_0 -muge -mqkv -ser 4,1 -crs 0.50 -sps 0.20 -mla 2 --cohort-prefix-sharing --cohort-min-prefix 64 --cache-ram -1 --numa expert --numa-replicate-shared -fa on --transparent-huge-pages --temp 0.8 --top-k 0 --top-p 0.95 --min-p 0.05 --repeat-penalty 1.05 --swa-compress -sas --mlock --reasoning on --spec-type ngram-map-k4v:n_max=8,n_min=2 --spec-autotune --zdd-sparse-kv --spec-verify-pinned --timeout 3600

@@ -75,7 +75,7 @@ def detect_platform_info() -> Dict[str, Any]:
     info = {
         "os": platform.system(),
         "arch": platform.machine(),
-        "hostname": platform.node(),
+        "hostname": "redacted",
         "numa_nodes": 1,
         "cpu_cores": os.cpu_count() or 1,
         "is_apple_silicon": False,

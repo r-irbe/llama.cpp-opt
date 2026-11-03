@@ -254,6 +254,8 @@ COMMON_CMAKE_ARGS=(
     "-DGGML_SPLIT_MACHINE_FUNCTIONS=${SPLIT_FUNCS_FLAG}"
     -DGGML_USE_LLD=ON
     "-DGGML_CUDA_ALLOW_UNSUPPORTED_COMPILER=${ALLOW_UNSUPPORTED_CUDA}"
+    -Wunreachable-code-break
+    -Wmissing-noreturn
 )
 
 if [[ "$ENABLE_RUST_FFI" -eq 1 ]]; then

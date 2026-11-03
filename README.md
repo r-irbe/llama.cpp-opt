@@ -100,6 +100,24 @@
 >| **`DeepSeek-V4.1-Flash-EngramQ8-Q2_K_Protected`** (`385.00 GiB`, Hybrid MoE + MLA) | PP: `43.67 t/s` (`57.34 s`)<br>TG: `12.68 t/s`<br>VmHWM: `184.86 GiB` | PP: `52.38 t/s` (`60.92 s`)<br>TG: `14.51 t/s`<br>VmHWM: `185.07 GiB` | PP: `48.13 t/s` (`77.95 s`)<br>TG: `19.38 t/s`<br>VmHWM: `185.22 GiB` | PP: `47.35 t/s` (`79.75 s`)<br>TG: `13.44 t/s`<br>VmHWM: `185.35 GiB` | PP: `62.62 t/s` (`60.30 s`)<br>TG: `14.78 t/s`<br>VmHWM: `185.25 GiB` | PP: **`114.98 t/s` (`32.84 s` TTFT)**<br>TG: **`20.09 t/s`**<br>VmHWM: `185.29 GiB` | — | **WikiText-2 (`-mla 2 -ctk q4_0 --zdd-sparse-kv`)**: **`PPL = 2.1301 ± 0.13498`** (`189.43 tok/s` eval) |
 >| **`Qwen3.8-Flash-Next-UD-Q4_K_XL`** (`103.68 GiB`, Hybrid MoE) | — | — | — | — | — | — | — | **`MTP` (`n_max=4`)**: **`54.79 tok/s`** (`1.54x` vs `35.65 t/s`, `69/82 = 84.1%` draft calls accepted, `172/207 = 83.1%` draft tokens accepted) |
 >
+>#### 🏆 `DeepSeek-V4.1-Flash-1017` Optimization Highlights & Ranked Setup Table (`results/deepseek_v41_1017_ranked_benchmark_report.md`)
+>
+>- **Native `GGML_TYPE_MXFP8` (`type 43`) & Mainline `deepseek41.ple.*` Compatibility**: Supports both external Engram sidecar GGUFs (`deepseek41.engram.file`) and inline `per_layer_token_embd.weight` `MXFP8` (`[256, 768022850]`, `188.83 GiB`, `33 B` per 32-element block) in 9-shard `DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL` (`466.32 GiB`, 1,043 tensors).
+>- **Automatic `--numa expert` CUDA Host-Pinning Gate (`llama_numa_cuda_pinning_gate`)**: Automatically disables `cudaHostRegister` host pinning when `--numa expert` binds the 120 routed `MXFP4` MoE expert tensors across 8 NUMA nodes via `mbind(MPOL_MF_MOVE)`, preserving 2 MiB THP compaction across `469.9 GiB` of resident host memory.
+>- **Multi-Stage `[ngram-mod, dspark]` Speculative Chain + PolyGraph Pinned Verification (`--spec-verify-pinned`)**: Combines self-speculative N-gram drafting (`ngram-mod:n_max=6,n_min=2`) with the `DSpark-1017-Q8_0` neural block drafter (`dspark:n_max=6,n_min=1`), `--spec-ckpt-mode per-step`, TreeGraft EMA divergence arbitration, and Lean-verified PolyGraph shape-pinned verification (`--spec-autotune`).
+>- **Multi-Sequence (`-np 1..8`) `--swa-compress` + `-ictk q8_0`**: Compacts 40 sliding-window layers into `200.00 MiB` (`5120 rows` at `-np 4`) and quantizes the DSV4 Lightning Indexer cache (`LID K`) to `q8_0` (`85 MiB` at 64K), fitting `-np 4` at `512K` (`12.33 GiB` total VRAM) and `1M` (`18.13 GiB` total VRAM) on a single 24 GB RTX 4090.
+>
+>| Rank | Setup ID | Checkpoint (`DeepSeek-V4.1-Flash-1017` Family) | Context (`-c`) | Slots (`-np`) | Speculative / NUMA Configuration | Prompt (`PP`) | Decode (`TG`) | Provenance & Highlights |
+>| :---: | :--- | :--- | :---: | :---: | :--- | :---: | :---: | :--- |
+>| **1** | `DSV41-R1-NP1-POLYGRAPH-PINNED-SPEC` | `EngramQ8-Q2_K_Protected` (`385 GiB`) | `65,536` | `1` | `ngram-mod:n_max=7` + `--spec-verify-pinned` + `--spec-autotune` | **`188.44 t/s`** | **`25.19 t/s`** (`20.8–29.4`) | `-16.8%` wall time, `-31.2%` CUDA graph instances (`586 -> 403`) |
+>| **2** | `DSV41-R2-NP1-512K-DSPARK-NGRAM-COMPOSITE` | `EngramQ8-Q2_K_Protected` + `dspark-1017-Q8_0` (`7.43 GiB`) | `524,288` | `1` | `[ngram-mod:6,2, dspark:6,1]` + `per-step` ckpt + `--spec-autotune` | `14.73 t/s` | **`23.34 t/s`** (`42.84 ms/t`) | `66.7% -> 100% -> 81.0%` accept; converged `dspark:n_max=5,verify_pinned=1` |
+>| **3** | `DSV41-R3-NP1-BENCH-HOT-PTO` | `EngramQ8-Q2_K_Protected` (`385 GiB`) | `65,536` | `1` | Target-only `--numa distribute` (`build-pto`) | **`188.44 t/s`** | **`22.94 ± 0.20 t/s`** | `CV = 0.87%`, WikiText-2 `PPL = 2.1301` (`189.43 t/s`) |
+>| **4** | `DSV41-R4-NP4-512K-HOT-PTO` | `EngramQ8-Q2_K_Protected` (`385 GiB`) | `524,288` | `4` | `--swa-compress -ictk q8_0 --zdd-sparse-kv --numa distribute` | **`114.98 t/s`** | **`20.09 t/s`** | `32.84 s` TTFT at 512K, `VmHWM = 185.29 GiB` |
+>| **5** | `DSV41-1017-R6-UD-Q4KXL-CONCURRENT-NP4-EXPERT` | `1017-UD-Q4_K_XL` (`466.3 GiB`, 9 shards, inline `MXFP8`) | `16,384` | `4` (`C=2`) | `--numa expert` (120 `MXFP4` exps bound across 8 nodes) + ThinLTO `-Wl,-z,now` | **`147.95 t/s`** | **`17.55 t/s`** (`18.01` max) | PMU-verified `IPC = 0.791`, `cache-miss = 6.86%`, `br-miss = 0.01%` |
+>| **6** | `DSV41-1017-R7-UD-Q4KXL-NP1-EXPERT-AUTO-UNPIN` | `1017-UD-Q4_K_XL` (`466.3 GiB`, 9 shards, inline `MXFP8`) | `16,384` | `1` | `--numa expert` (auto-unpin gate, `469.9 GiB` resident) | `62.60 t/s` | **`17.51 t/s`** (`17.73` max) | `1,387.99 ms` TTFT (76 tok), `56.39–57.10 ms/tok` decode |
+>| **7** | `DSV41-1017-R8-UD-Q4KXL-NP1-ENGRAM-RESIDENT` | `1017-UD-Q4_K_XL` (`466.3 GiB`, 9 shards, inline `MXFP8`) | `16,384` | `1` | `--numa expert --engram-resident` (`94.4 GiB` 8-node THP prefault) | `56.27 t/s` | **`16.69 t/s`** (`16.79` max) | `1,297.32 ms` TTFT (73 tok), `0.8 s` parallel `MADV_POPULATE_READ` |
+>| **8** | `DSV41-1017-R11-64K-IQ2XXS-DEFERRED` | `1017-GSQ-RCO-IQ2_XXS` + `Engram-IQ4_NL` (`231.7 GiB`) | `65,536` | `4` | `--swa-compress -ictk q8_0 --defer-ple --defer-experts` | `0.77 t/s` | `2.19 t/s` | Cold NVMe deferred baseline (`7.25 GiB` total VRAM at `-np 4`) |
+>
 >---
 >
 >#### 📚 Algorithmic & Methodological References (APA 7th Edition)
@@ -237,34 +255,41 @@ https://github.com/ikawrakow/ik_llama.cpp/blob/main/docs/build.md
 
 Download `.gguf` model files (e.g. [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf)) to your favorite directory (e.g. `/my_local_files/gguf`).
 
-#### Unified Declarative Launcher (`scripts/launch.sh`) & Interactive `ctx-capsule` TUI (`tools/ctx-capsule/ctx_capsule_tui.ts`)
-All server runs can be launched via the unified declarative launcher reading from `scripts/configs/models.toml` (compiled from the 5-layer TOML hierarchy under `scripts/configs/hierarchy/`):
+#### Unified Declarative Launcher (`scripts/launch.py` / `scripts/launch.sh`) & Interactive `ctx-capsule` 5-Layer Config Plane
+All server runs can be launched via the unified declarative launcher reading from `scripts/configs/models.toml` and the 5-layer hierarchy under `scripts/configs/hierarchy/`:
+- **5-Layer TOML Hierarchy Merge Order**: `00-defaults.toml` -> `hardware/<hardware_profile>.toml` -> `models/<model>.toml` -> `templates/<template>.toml` -> `instances/active_fleet.toml` -> `models.toml`.
 
 ```bash
-# List available declarative model profiles:
-./scripts/launch.sh --list
+# List available declarative model configurations ([models.*]) and profiles/presets ([profiles.*]):
+python3 scripts/launch.py --list
 
-# Launch DeepSeek-V4.1-Flash (default hardware-optimized profile):
-./scripts/launch.sh deepseek_v41_flash
+# Launch models ([models.*]) or profiles ([profiles.*]) directly:
+python3 scripts/launch.py deepseek-v4.1-1017-ud-q4kxl --dry-run
+python3 scripts/launch.py ds41-1017-np1-512k-max-speed --dry-run
+python3 scripts/launch.py ds41-1017-np1-1m-extreme --dry-run
+python3 scripts/launch.py ds41-1017-np4-512k-swarm --dry-run
+python3 scripts/launch.py ds41-1017-np8-1m-swarm --dry-run
 
-# Launch GLM-5.3-Flash with custom port and host:
-./scripts/launch.sh glm_53_flash --port 8000 --host 0.0.0.0
+# Combine any base model with any profile/preset using --profile / -P:
+python3 scripts/launch.py deepseek-v4.1-1017-ud-q4kxl --profile ds41-1017-np4-512k-swarm --dry-run
 
-# Launch Qwen3.8-27B or inspect generated command in dry-run mode:
-./scripts/launch.sh qwen38_27b --dry-run
+# Interactive TUI, TOML export, and telemetry flags:
+python3 scripts/launch.py --capsule
+python3 scripts/launch.py --export-toml
+python3 scripts/launch.py --telemetry
 ```
 
 To interactively switch models, apply workload templates (`coding_pinpoint`, `deep_formal_audit`, `low_vram_1m`, `max_throughput_np8`), inspect ASCII architecture diagrams, recompile the 5-layer TOML hierarchy, or trigger an in-place PTO binary replacement:
 
 ```bash
-# Render interactive two-column TUI modal or inspect current state:
-node --experimental-strip-types tools/ctx-capsule/ctx_capsule_tui.ts --snapshot
+# Run interactive ctx-capsule TUI / /capsule in Pi (ctx_capsule tool):
+node --experimental-strip-types tools/ctx-capsule/ctx_capsule_tui.ts
 
-# Compile scripts/configs/hierarchy/{00-defaults,hardware,models,templates,instances} -> scripts/configs/models.toml:
+# Export / recompile 5-layer TOML hierarchy bundle:
 node --experimental-strip-types tools/ctx-capsule/ctx_capsule_tui.ts --export-toml
 
-# Trigger PTO trace & in-place binary swap from the control plane:
-node --experimental-strip-types tools/ctx-capsule/ctx_capsule_tui.ts --pto-optimize
+# View capsule telemetry:
+node --experimental-strip-types tools/ctx-capsule/ctx_capsule_tui.ts telemetry
 ```
 
 #### Profile-Targeted Optimization (`PTO` / `build-pto`) Pipeline
