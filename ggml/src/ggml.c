@@ -1320,19 +1320,22 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
-    // MXFP8 (OCP MX, E4M3 + E8M0 scale): gather-only — consumed exclusively via
-    // GGML_OP_GET_ROWS (Engram tables). No vec_dot/quantize kernels by design;
-    // see mainline PR #30817. CPU supports_op gate in ggml-backend.cpp enforces it.
+    // MXFP8 (OCP MX, E4M3 + E8M0 scale). Gather is the primary consumer
+    // (Engram tables, mainline PR #30817). Compute kernels exist in this fork
+    // (Phase 4: quantize_row_mxfp8_ref encoder + vec_dot_mxfp8_q8_0 with Q8_0
+    // activations) but are opt-in: the CPU supports_op gate in
+    // ggml-backend.cpp still rejects MXFP8 outside GET_ROWS unless
+    // GGML_MXFP8_COMPUTE=1 is set, so nothing silently widens.
     [GGML_TYPE_MXFP8] = {
         .type_name                = "mxfp8",
         .blck_size                = QK_MXFP8,
         .type_size                = sizeof(block_mxfp8),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
-        .from_float               = NULL,
-        .from_float_ref           = NULL,
-        .vec_dot                  = NULL,
-        .vec_dot_type             = GGML_TYPE_COUNT,
+        .from_float               = quantize_row_mxfp8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp8_ref,
+        .vec_dot                  = vec_dot_mxfp8_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
         .row_meta_size            = 0,
     },

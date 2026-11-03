@@ -1070,14 +1070,29 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
 }
 
 GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
-    // MXFP8 is a gather-only type: GET_ROWS reads it, nothing else does (and
-    // nothing writes it). Mirrors mainline PR #30817.
+    // MXFP8 is primarily a gather-only type: GET_ROWS reads it (Engram tables).
+    // Compute support is opt-in (Phase 4) because it only pays off when a
+    // container explicitly packs MXFP8 linears: GGML_MXFP8_COMPUTE=1 allows
+    // MXFP8 as the weight operand of MUL_MAT/MUL_MAT_ID (vec_dot_mxfp8_q8_0,
+    // Q8_0 activations) and as a CPY source for dequant inspection. Without the
+    // knob the gate matches mainline PR #30817 (gather-only), so nothing
+    // silently widens.
+    static const bool mxfp8_compute = []() {
+        const char * e = getenv("GGML_MXFP8_COMPUTE");
+        return e != nullptr && *e != '\0' && atoi(e) != 0;
+    }();
     if (op->type == GGML_TYPE_MXFP8) {
-        return false;
+        return mxfp8_compute && op->op == GGML_OP_CPY;
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP8 && !(op->op == GGML_OP_GET_ROWS && i == 0)) {
-            return false;
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP8) {
+            const bool gather  = op->op == GGML_OP_GET_ROWS && i == 0;
+            const bool matmul  = mxfp8_compute && i == 0 &&
+                                 (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID);
+            const bool dequant = mxfp8_compute && i == 0 && op->op == GGML_OP_CPY;
+            if (!gather && !matmul && !dequant) {
+                return false;
+            }
         }
     }
     switch (op->op) {

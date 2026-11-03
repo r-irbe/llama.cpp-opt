@@ -82,6 +82,14 @@ void   dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RE
 void   vec_dot_mxfp4_q8_0_x4(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void   dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// MXFP8 encode + compute (Phase 4). The encoder produces E4M3 (fn) codes with
+// round-to-nearest-even under one E8M0 power-of-two scale per 32-value block;
+// the dot product consumes Q8_0 activations and is exact w.r.t. the get_rows
+// dequantizer (block-scale folding is a power-of-two multiply).
+uint8_t ggml_fp32_to_e4m3(float x);
+void   quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k);
+void   quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void   vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void   quantize_row_iq2_ks_ref(const float * GGML_RESTRICT x, block_iq2_ks  * GGML_RESTRICT y, int64_t k);
 void   quantize_row_iq2_ks(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);

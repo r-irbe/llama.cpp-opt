@@ -231,6 +231,19 @@ llama_build_and_test(test-bench-server-queue.cpp)
 target_include_directories(test-bench-server-queue PRIVATE ${PROJECT_SOURCE_DIR}/common)
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
+llama_target_and_test(test-mxfp8-compute.cpp      LABEL "quant")
+# Second registration with the compute gate enabled: GGML_MXFP8_COMPUTE=1 must
+# accept MXFP8 weights for MUL_MAT and the graph result must match the decoded
+# reference. The default entry above runs with the gate OFF (gather-only parity).
+add_test(NAME test-mxfp8-compute-enabled COMMAND $<TARGET_FILE:test-mxfp8-compute> --compute)
+
+# test-quantize-fns.cpp was orphaned in this fork (never registered). It is kept
+# buildable for targeted inspection, but not CI-gating: the fork's IQK vec_dot
+# entry points delegate to iqk_mul_mat(nrc, nrc, ...) and produce NaN/abort when
+# called with the test's single-row convention (bx = by = 0, nrc = 1) for many
+# pre-existing types (q4_0, q5_0, q4_K, ...), independently of MXFP8.
+llama_target_and_test(test-quantize-fns.cpp       LABEL "quant")
+set_tests_properties(test-quantize-fns PROPERTIES DISABLED TRUE)
 
 
 # dummy executable - not installed

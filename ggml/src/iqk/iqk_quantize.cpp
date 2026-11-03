@@ -4824,6 +4824,148 @@ void dequantize_row_mxfp8(const block_mxfp8 * x, float * y, int64_t k) {
     }
 }
 
+// MXFP8 (E4M3 fn + per-32 E8M0 scale) encode + compute.
+// Reference: mainline PR ggml-org/llama.cpp#30817 for the storage/gather side;
+// compute is opt-in here (see ggml-backend.cpp gate) and exact w.r.t. the
+// dequantize_row_mxfp8 kernel: folding the power-of-two block scale after the
+// accumulation is bit-identical to scaling each value first.
+
+uint8_t ggml_fp32_to_e4m3(float x) {
+    // E4M3 (fn): sign | 4-bit exp (bias 7) | 3-bit mantissa, no inf, 0x7F/0xFF = NaN.
+    if (std::isnan(x)) {
+        return 0x7F;
+    }
+    const uint8_t sign = std::signbit(x) ? 0x80 : 0x00;
+    const float ax = std::fabs(x);
+    if (ax > 448.0f) {
+        return sign | 0x7E;              // saturate to the largest finite value
+    }
+    if (ax < 0x1p-10f) {
+        return sign;                     // rounds to zero (half of the smallest subnormal)
+    }
+    int e2 = 0;
+    const float m = std::frexpf(ax, &e2);   // ax = m * 2^e2, m in [0.5, 1)
+    int exp = e2 + 6;                       // biased exponent of the leading 1 bit
+    if (exp <= 0) {
+        // subnormal: spacing is 2^-9
+        const int man = (int) std::nearbyint(ax * 512.0f);   // round half to even
+        return sign | (uint8_t) man;
+    }
+    int man = (int) std::nearbyint((2.0f*m - 1.0f) * 8.0f);
+    if (man == 8) {
+        man = 0;
+        ++exp;
+    }
+    if (exp >= 16) {
+        return sign | 0x7E;
+    }
+    if (exp == 15 && man == 7) {
+        return sign | 0x7E;              // 0x7F/0xFF are NaN codes
+    }
+    return sign | (uint8_t) ((exp << 3) | man);
+}
+
+void quantize_row_mxfp8_ref(const float * x, block_mxfp8 * y, int64_t k) {
+    constexpr int kBlockSize = QK_MXFP8;
+    GGML_ASSERT(k % kBlockSize == 0);
+    const int64_t nblock = k / kBlockSize;
+    for (int64_t ib = 0; ib < nblock; ++ib) {
+        float amax = 0;
+        for (int j = 0; j < kBlockSize; ++j) {
+            amax = std::max(amax, std::fabs(x[j]));
+        }
+        if (amax == 0) {
+            std::memset(&y[ib], 0, sizeof(block_mxfp8));
+            x += kBlockSize;
+            continue;
+        }
+        int e2 = 0;
+        std::frexpf(amax, &e2);                   // amax = m * 2^e2, m in [0.5, 1)
+        int e = e2 - 1 + 127;                     // floor(log2(amax)) + 127 => amax/d in [1, 2)
+        e = std::min(std::max(e, 0), 254);        // 0xFF is the NaN scale, keep it unused
+        y[ib].e = (uint8_t) e;
+        const float d = GGML_E8M0_TO_FP32((uint8_t) e);
+        for (int j = 0; j < kBlockSize; ++j) {
+            y[ib].qs[j] = ggml_fp32_to_e4m3(x[j] / d);
+        }
+        x += kBlockSize;
+    }
+}
+
+void quantize_row_mxfp8(const float * x, void * y, int64_t k) {
+    quantize_row_mxfp8_ref(x, (block_mxfp8 *) y, k);
+}
+
+#if defined __AVX2__
+// Decode 8 E4M3 (fn) codes to 8 exact floats: normals are sign|(exp+120)<<23|man<<20,
+// subnormals are man*2^-9, 0x7F/0xFF map to NaN (bit-identical to ggml_e4m3_to_fp32).
+static inline __m256 mxfp8_decode8(__m128i bytes) {
+    const __m256i v    = _mm256_cvtepu8_epi32(bytes);
+    const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(v, _mm256_set1_epi32(0x80)), 24);
+    const __m256i ex   = _mm256_and_si256(_mm256_srli_epi32(v, 3), _mm256_set1_epi32(0x0F));
+    const __m256i man  = _mm256_and_si256(v, _mm256_set1_epi32(0x07));
+    const __m256i norm = _mm256_or_si256(
+        _mm256_slli_epi32(_mm256_add_epi32(ex, _mm256_set1_epi32(120)), 23),
+        _mm256_slli_epi32(man, 20));
+    const __m256 sub = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(0x1p-9f));
+    __m256 r = _mm256_blendv_ps(_mm256_castsi256_ps(norm), sub,
+                                _mm256_castsi256_ps(_mm256_cmpeq_epi32(ex, _mm256_setzero_si256())));
+    const __m256i is_nan = _mm256_and_si256(_mm256_cmpeq_epi32(ex, _mm256_set1_epi32(15)),
+                                            _mm256_cmpeq_epi32(man, _mm256_set1_epi32(7)));
+    r = _mm256_blendv_ps(r, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FC00000)),
+                         _mm256_castsi256_ps(is_nan));
+    return _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(r), sign));
+}
+
+static inline float mxfp8_hsum8(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+static inline float mxfp8_dot_block(const block_mxfp8 * x, const block_q8_0 * y) {
+    const float d = x->e == 0xFF ? std::numeric_limits<float>::quiet_NaN() : GGML_E8M0_TO_FP32(x->e);
+    __m256 acc = _mm256_setzero_ps();
+    for (int g = 0; g < QK_MXFP8/8; ++g) {
+        const __m128i codes = _mm_loadl_epi64((const __m128i *) (x->qs + 8*g));
+        const __m256i q8    = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *) (y->qs + 8*g)));
+#if defined __FMA__
+        acc = _mm256_fmadd_ps(mxfp8_decode8(codes), _mm256_cvtepi32_ps(q8), acc);
+#else
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(mxfp8_decode8(codes), _mm256_cvtepi32_ps(q8)));
+#endif
+    }
+    return mxfp8_hsum8(acc) * d * GGML_FP16_TO_FP32(y->d);
+}
+#else
+static inline float mxfp8_dot_block(const block_mxfp8 * x, const block_q8_0 * y) {
+    const float d = x->e == 0xFF ? std::numeric_limits<float>::quiet_NaN() : GGML_E8M0_TO_FP32(x->e);
+    float sumf = 0;
+    for (int j = 0; j < QK_MXFP8; ++j) {
+        sumf += ggml_e4m3_to_fp32(x->qs[j]) * float(y->qs[j]);
+    }
+    return sumf * d * GGML_FP16_TO_FP32(y->d);
+}
+#endif
+
+void vec_dot_mxfp8_q8_0(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+    GGML_ASSERT(n % QK_MXFP8 == 0);
+    GGML_UNUSED(bs);
+    const int nbl = n / QK_MXFP8;
+    for (int ir = 0; ir < nrc; ++ir) {
+        const block_mxfp8 * x = (const block_mxfp8 *) ((const char *) vx + ir*bx);
+        const block_q8_0  * y = (const block_q8_0  *) ((const char *) vy + ir*by);
+        float sumf = 0;
+        for (int ib = 0; ib < nbl; ++ib) {
+            sumf += mxfp8_dot_block(x + ib, y + ib);
+        }
+        s[ir] = sumf;
+    }
+}
+
 void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
     if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_K, vy, 0, s, 0, 0, 1)) {
