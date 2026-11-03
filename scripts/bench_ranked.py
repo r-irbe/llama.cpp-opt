@@ -100,7 +100,7 @@ PP_PARAGRAPH = (
 )
 
 
-def build_pp_long_prompt(target_lines: int = 64) -> str:
+def build_pp_long_prompt(target_lines: int = 48) -> str:
     paras = []
     for i in range(target_lines):
         letter = random.Random(i).choice(string.ascii_uppercase)
@@ -309,13 +309,19 @@ class BenchServer:
 # --- benchmark core -------------------------------------------------------------
 
 def run_scenario(base_url: str, name: str, spec: dict, reps: int, pmu_toggle: bool,
-                 server_pid: int = None, warmup_rounds: int = 0):
-    """Run one scenario: warmups + N reps; returns rep list + median summary."""
+                 server_pid: int = None, warmup_rounds: int = 0, slot_ctx: int = 0):
+    """Run one scenario: warmups + N reps; returns rep list + median summary.
+    Warmups reuse the scenario's own payload (short generation) so that
+    scenario-specific cold paths (page faults on the long-prefill gather set)
+    are excluded from the measured reps."""
     reps_out = []
-    warm_prompts = ["Warmup: respond with a single short sentence about memory locality."]
     for _ in range(warmup_rounds):
+        w_spec = dict(spec)
+        if w_spec.get("prompt_builder") == "pp_long_builder":
+            w_spec["prompt"] = build_pp_long_prompt()
         chat_completion(base_url, {
-            "messages": [{"role": "user", "content": warm_prompts[0]}], "max_tokens": 32}, timeout=REP_TIMEOUT_S)
+            "messages": [{"role": "user", "content": w_spec["prompt"]}],
+            "max_tokens": 16, "temperature": 0.2}, timeout=REP_TIMEOUT_S)
 
     pmu_proc = None
     pmu_csv = Path(tempfile.gettempdir()) / f"bench_ranked_pmu_{os.getpid()}_{name}.csv"
@@ -330,6 +336,14 @@ def run_scenario(base_url: str, name: str, spec: dict, reps: int, pmu_toggle: bo
             spec_run = dict(spec)
             if spec_run.get("prompt_builder") == "pp_long_builder":
                 spec_run["prompt"] = build_pp_long_prompt()
+            # Warn if the prompt plausibly overflows a slot: llama-server divides
+            # -c across -np slots. The char/4 estimate over-predicts ~20%, so this
+            # is advisory; an actual overflow is captured as an HTTP 400 error in
+            # the rep record with the server's own token count.
+            approx_prompt_tokens = len(spec_run["prompt"]) // 4
+            if slot_ctx and approx_prompt_tokens + spec_run["max_tokens"] > slot_ctx:
+                print(f"      [warn] scenario '{name}': prompt ~{approx_prompt_tokens} tok vs "
+                      f"slot ctx {slot_ctx} - the server may reject this rep (raise --ctx)")
             payloads = [{"messages": [{"role": "user", "content": spec_run["prompt"]}],
                          "max_tokens": spec_run["max_tokens"], "temperature": spec_run["temperature"]}]
             win_t0 = time.time()
@@ -474,7 +488,9 @@ def main():
     ap.add_argument("--threads", type=int, default=56)
     ap.add_argument("--threads-batch", type=int, default=56, dest="threads_batch")
     ap.add_argument("--gpu-layers", type=int, default=99, dest="gpu_layers")
-    ap.add_argument("--ctx", type=int, default=16384)
+    ap.add_argument("--ctx", type=int, default=32768,
+                    help="total server context (-c); divided across --parallel slots "
+                         "(llama-server semantics), so slot ctx = ctx/parallel")
     ap.add_argument("--parallel", type=int, default=4, help="server slots (-np) sized for the concurrent scenario")
     ap.add_argument("--tensor-override", default=r"^blk\..*\.ffn_.*_exps.*=CPU", dest="tensor_override",
                     help="expert tensors to the CPU (server -ot)")
@@ -495,6 +511,8 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     provenance = {"created": stamp, "scenarios": scenarios,
+                  "server_ctx_total": args.ctx, "server_parallel": args.parallel,
+                  "server_ctx_per_slot": max(1, args.ctx // max(1, args.parallel)),
                   "binary": str(args.binary), "binary_sha256": get_binary_sha256(args.binary) if _COMMON else "unknown"}
     if _COMMON:
         provenance["git_sha"] = get_git_sha()
@@ -536,7 +554,8 @@ def main():
             for si, sname in enumerate(scenarios):
                 print(f"[{tag}] scenario {si+1}/{len(scenarios)}: {sname} x{args.reps} reps ...")
                 r = run_scenario(base_url, sname, SCENARIOS[sname], args.reps, args.pmu and bool(server_pid),
-                                 server_pid=server_pid, warmup_rounds=args.warmup_rounds)
+                                 server_pid=server_pid, warmup_rounds=args.warmup_rounds,
+                                 slot_ctx=max(1, args.ctx // max(1, args.parallel)))
                 per_scen[sname] = r
                 s = r["summary"]
                 if s:
