@@ -4,8 +4,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
+#include <exception>
+#include <optional>
 #include <deque>
 #include <memory>
+#include <list>
 #include <mutex>
 #include <unordered_set>
 
@@ -49,7 +53,8 @@ struct server_queue {
     std::deque<server_task> queue_tasks;
     std::deque<server_task> queue_tasks_deferred;
 
-    std::vector<server_task_multi> queue_multitasks;
+    // Nodes can retire without moving/destroying nested payload under the lock.
+    std::list<server_task_multi> queue_multitasks;
 
     std::mutex mutex_tasks; // guards queue_multitasks
 
@@ -126,39 +131,82 @@ struct server_queue {
 
     // updatethe remaining subtasks, while appending results to multitask
     void update_multitask(int id_multi, int id_sub, server_task_result& result);
+
+private:
+    friend struct server_response;
+    // Caller owns the retirement holder and destroys it after releasing BOTH
+    // response and task mutexes. This does not cancel/drain child backend work.
+    void detach_multitasks(int id_task, const std::unordered_set<int> * id_tasks,
+                          std::list<server_task_multi> & retired);
+};
+
+enum class server_receive_status { result, closed, retired, timeout };
+
+template<class T> struct server_receive_outcome {
+    server_receive_status status;
+    std::optional<T> value;
+};
+
+// Compatibility failure with a fixed message: never fabricate a successful
+// value on closure/retirement. Throwing still needs exception-runtime storage;
+// this is not an allocation-independent emergency terminal channel.
+struct server_receive_error : std::exception {
+    server_receive_status status;
+    explicit server_receive_error(server_receive_status status) : status(status) {}
+    const char * what() const noexcept override { return "server receive ended without a result"; }
 };
 
 struct server_response {
+    // The associated queue must outlive this response (as in server_context).
+    explicit server_response(server_queue * tasks = nullptr) : task_queue(tasks) {}
+
     typedef std::function<void(int, int, server_task_result&)> callback_multitask_t;
     callback_multitask_t callback_update_multitask;
 
-    bool running = true;
     // for keeping track of all tasks waiting for the result
     std::set<int> waiting_task_ids;
 
     // the main result queue (using ptr for polymorphism)
-    std::vector<server_task_result_ptr> queue_results;
+    std::list<server_task_result_ptr> queue_results;
 
-    std::vector<server_task_result> queue_results_legacy;
+    std::list<server_task_result> queue_results_legacy;
 
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
     // add the id_task to the list of tasks waiting for response
-    void add_waiting_task_id(int id_task);
+    bool add_waiting_task_id(int id_task);
 
-    void add_waiting_tasks(const std::vector<server_task>& tasks);
+    // All-or-nothing registration; false after closure, no partial insertion on
+    // allocation failure. Callers must register successfully BEFORE posting.
+    bool add_waiting_tasks(const std::vector<server_task>& tasks);
 
+    // Create legacy parent tracking only while its delivery registration is live.
+    // Uses the same response -> task lock order as legacy result publication.
+    bool add_multitask(int id_multi, std::vector<int> & sub_ids);
+
+    // Retire delivery rights and queued ownership, not backend/slot ownership.
+    // Destroy detached payloads outside both mutexes; repeated removal is safe.
+    // IDs must not be reused while an older producer/cancel can still refer to them.
     // when the request is finished, we can remove task associated with it
     void remove_waiting_task_id(int id_task);
 
     void remove_waiting_task_ids(const std::unordered_set<int>& id_tasks);
 
-    // This function blocks the thread until there is a response for this id_task
-    server_task_result recv(int id_task);
+    using receive_clock = std::chrono::steady_clock;
+    using receive_deadline = receive_clock::time_point;
+    // Match > closed > all selected registrations retired > timeout. A ready
+    // match wins at zero/expired deadline; unrelated wakes never renew it.
+    server_receive_outcome<server_task_result> receive(
+        int id_task, receive_deadline deadline = receive_deadline::max());
+    server_receive_outcome<server_task_result_ptr> receive(
+        const std::unordered_set<int> & id_tasks, receive_deadline deadline = receive_deadline::max());
 
-    // same as recv(), but have timeout in seconds
-// if timeout is reached, nullptr is returned
+    // Compatibility adapters only: production consumers must migrate to explicit
+    // outcomes before receive-to-wire stage acceptance.
+    // Value receive throws server_receive_error on non-result; pointer polling
+    // returns null for any non-result (not just timeout).
+    server_task_result recv(int id_task);
     server_task_result_ptr recv_with_timeout(const std::unordered_set<int>& id_tasks, int timeout);
 
     // Register the function to update multitask
@@ -171,9 +219,13 @@ struct server_response {
 
     void send(server_task_result_ptr&& result);
 
-    // terminate the waiting loop
-    void terminate() {
-        running = false;
-        condition_results.notify_all();
-    };
+    // Seal new delivery admission/publication and wake current/future receivers.
+    // Already queued results can drain. Not backend cancellation/quiescence.
+    void close();
+    void terminate() { close(); } // Source-compatible nonfatal alias.
+
+private:
+    bool running = true; // Protected by mutex_results, including closure.
+    server_queue * task_queue;
+    void remove_waiting_task_ids_impl(int id_task, const std::unordered_set<int> * id_tasks);
 };

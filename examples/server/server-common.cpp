@@ -1,4 +1,5 @@
 #include "server-common.h"
+#include "server-response-calibration.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -507,13 +508,17 @@ json probs_vector_to_json(const llama_context* ctx, const std::vector<completion
 // note: if data is a json array, it will be sent as multiple events, one per item
 bool server_sent_event(httplib::DataSink& sink, const json& data) {
     static auto send_single = [](httplib::DataSink& sink, const json& data) -> bool {
+        SERVER_CAL_SCOPE(frame_observation, "sse_frame_destroyed");
         const std::string str =
             "data: " +
             data.dump(-1, ' ', false, json::error_handler_t::replace) +
             "\n\n"; // required by RFC 8895 - A message is terminated by a blank line (two line terminators in a row).
 
         LOG_DBG("data stream, to_send: %s", str.c_str());
-        return sink.write(str.c_str(), str.size());
+        SERVER_CAL_SNAPSHOT("sse_write_begin", &str, nullptr, &data, &str);
+        const bool accepted = sink.write(str.c_str(), str.size());
+        SERVER_CAL_STAGE(accepted ? "sse_write_returned_true" : "sse_write_failed");
+        return accepted;
     };
 
     if (data.is_array()) {
@@ -532,12 +537,16 @@ bool server_sent_event(httplib::DataSink& sink, const json& data) {
 
 bool server_sent_oai_resp_event(httplib::DataSink& sink, const json& data) {
     static auto send_single = [](httplib::DataSink& sink, const json& data) -> bool {
+        SERVER_CAL_SCOPE(frame_observation, "sse_frame_destroyed");
         const std::string str =
             "event: " + data.at("event").get<std::string>() + "\n" +
             "data: " + data.at("data").dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 
         LOG_DBG("data stream, to_send: %s", str.c_str());
-        return sink.write(str.c_str(), str.size());
+        SERVER_CAL_SNAPSHOT("sse_write_begin", &str, nullptr, &data, &str);
+        const bool accepted = sink.write(str.c_str(), str.size());
+        SERVER_CAL_STAGE(accepted ? "sse_write_returned_true" : "sse_write_failed");
+        return accepted;
     };
 
     if (data.is_array()) {
@@ -556,6 +565,7 @@ bool server_sent_oai_resp_event(httplib::DataSink& sink, const json& data) {
 
 bool server_sent_anthropic_event(httplib::DataSink& sink, const json& data) {
     static auto send_single = [](httplib::DataSink& sink, const json& data) -> bool {
+        SERVER_CAL_SCOPE(frame_observation, "sse_frame_destroyed");
         const std::string str =
             (data.contains("event") && data.contains("data")) ?
             ("event: " + data.at("event").get<std::string>() + "\n" +
@@ -563,7 +573,10 @@ bool server_sent_anthropic_event(httplib::DataSink& sink, const json& data) {
             ("data: " + data.at("data").dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
 
         LOG_DBG("data stream, to_send: %s", str.c_str());
-        return sink.write(str.c_str(), str.size());
+        SERVER_CAL_SNAPSHOT("sse_write_begin", &str, nullptr, &data, &str);
+        const bool accepted = sink.write(str.c_str(), str.size());
+        SERVER_CAL_STAGE(accepted ? "sse_write_returned_true" : "sse_write_failed");
+        return accepted;
     };
 
     if (data.is_array()) {

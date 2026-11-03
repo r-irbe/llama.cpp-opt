@@ -1,3 +1,5 @@
+#pragma once
+
 #include "server-task.h"
 #include "server-decision.h"
 #include "server-queue.h"
@@ -255,6 +257,9 @@ struct server_context {
 
     gpt_params params_base;
 
+    // Private disposable checkpoint cache; never the shared configured root.
+    std::string checkpoint_spill_session_dir;
+
     llama_batch batch = {};
 
     bool clean_kv_cache = true;
@@ -279,7 +284,7 @@ struct server_context {
     json default_generation_settings_for_props;
 
     server_queue    queue_tasks;
-    server_response queue_results;
+    server_response queue_results{&queue_tasks};
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 

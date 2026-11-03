@@ -147,6 +147,15 @@ struct result_timings {
 };
 
 struct server_task_result {
+    server_task_result() = default;
+    server_task_result(const server_task_result &) = default;
+    server_task_result & operator=(const server_task_result &) = default;
+    // A user-declared destructor suppresses implicit moves; retain value semantics
+    // for legacy queues and avoid copying the base payload during derived moves.
+    server_task_result(server_task_result &&) = default;
+    server_task_result & operator=(server_task_result &&) = default;
+    virtual ~server_task_result() = default;
+
     int id = -1;
     int id_multi = -1;
 
@@ -373,7 +382,7 @@ struct server_task_result_decision : server_task_result {
     }
 };
 
-// using shared_ptr for polymorphism of server_task_result
+// Exclusive polymorphic ownership; deletion runs the derived payload destructor.
 using server_task_result_ptr = std::unique_ptr<server_task_result>;
 
 struct server_prompt_checkpoint {
@@ -389,6 +398,8 @@ struct server_prompt_checkpoint {
 
     // disk-spill location when data was offloaded (empty = resident / no spill)
     std::string spill_path;
+    uint64_t spill_bytes = 0;
+    uint64_t spill_checksum = 0;
 
     size_t size() const {
         return data.size();

@@ -1,5 +1,10 @@
 #pragma warning(disable : 4996)
 #include "server-context.h"
+#include "server-app.h"
+#include "server-response-reader.h"
+#include "server-response-calibration.h"
+#include "server-response-task.h"
+#include "server-completion-stream.h"
 #include "server-common.h"
 #include "server-chat.h"
 #include "server-cors-proxy.h"
@@ -76,7 +81,6 @@ struct DatabaseHandle {
 
 using json = nlohmann::ordered_json;
 namespace fs = std::filesystem;
-constexpr int HTTP_POLLING_SECONDS = 1;
 
 bool server_verbose = false;
 bool server_log_json = true;
@@ -328,127 +332,31 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
     });
 }
 
-// generator-like API for server responses, support pooling connection state and aggregating results
-struct server_response_reader {
-    std::unordered_set<int> id_tasks;
-    server_context& ctx_server;
-    size_t received_count = 0;
-    bool cancelled = false;
-
-    server_response_reader(server_context& ctx_server) : ctx_server(ctx_server) {}
-    ~server_response_reader() {
-        stop();
-    }
-
-    void post_tasks(std::vector<server_task>&& tasks) {       
-        id_tasks = server_task::get_list_id(tasks);
-        ctx_server.queue_results.add_waiting_tasks(tasks);
-        ctx_server.queue_tasks.post(std::move(tasks));
-    }
-    
-    bool has_next() {
-        return !cancelled && received_count < id_tasks.size();
-    }
-
-    // cancel-cascade fix: true only if one of THIS reader's tasks is on a
-    // slot (the active decode). Used to gate llama_decode_stop() so a queued/
-    // deferred task's disconnect cannot abort another task's active decode via
-    // the process-global stop_internal_decode flag. Best-effort cross-thread
-    // read (slots are not resized at runtime; same race class as the global).
-    bool any_task_on_slot() const {
-        for (const auto & slot : ctx_server.slots) {
-            if (slot.is_processing() && id_tasks.count(slot.id_task)) return true;
-        }
-        return false;
-    }
-
-    // return nullptr if should_stop() is true before receiving a result
-    // note: if one error is received, it will stop further processing and return error result
-    server_task_result_ptr next(const std::function<bool()>& should_stop) {
-        while (true) {
-            server_task_result_ptr result = ctx_server.queue_results.recv_with_timeout(id_tasks, HTTP_POLLING_SECONDS);
-            if (result == nullptr) {
-                // timeout, check stop condition
-                if (should_stop()) {
-                    SRV_DBG("%s", "stopping wait for next result due to should_stop condition\n");
-                    return nullptr;
-                }
-            }
-            else {
-                if (result->is_error()) {
-                    stop(); // cancel remaining tasks
-                    SRV_DBG("%s", "received error result, stopping further processing\n");
-                    return result;
-                }
-                if (result->is_stop()) {
-                    received_count++;
-                }
-                return result;
-            }
-        }
-
-        // should not reach here
-    }
-
-    struct batch_response {
-        bool is_terminated = false; // if true, indicates that processing was stopped before all results were received
-        std::vector<server_task_result_ptr> results;
-        server_task_result_ptr error; // nullptr if no error
-    };
-
-    batch_response wait_for_all(const std::function<bool()>& should_stop) {
-        batch_response batch_res;
-        batch_res.results.resize(id_tasks.size());
-        while (has_next()) {
-            auto res = next(should_stop);
-            if (res == nullptr) {
-                batch_res.is_terminated = true;
-                return batch_res;
-            }
-            if (res->error) {
-                batch_res.error = std::move(res);
-                return batch_res;
-            }
-            const size_t idx = res->get_index();
-            GGML_ASSERT(idx < batch_res.results.size() && "index out of range");
-            GGML_ASSERT(batch_res.results[idx] == nullptr && "duplicate result received");
-            batch_res.results[idx] = std::move(res);
-        }
-        return batch_res;
-    }
-
-    void stop() {
-        ctx_server.queue_results.remove_waiting_task_ids(id_tasks);
-        if (has_next() && !cancelled) {
-            // if tasks is not finished yet, cancel them
-            cancelled = true;
-            std::vector<server_task> cancel_tasks;
-            cancel_tasks.reserve(id_tasks.size());
-            for (const auto& id_task : id_tasks) {
-                SRV_WRN("cancel task, id_task = %d\n", id_task);
-                server_task task(SERVER_TASK_TYPE_CANCEL);
-                task.id_target = id_task;
-                ctx_server.queue_results.remove_waiting_task_id(id_task);
-                cancel_tasks.push_back(std::move(task));
-            }
-            // push to beginning of the queue, so it has highest priority
-            ctx_server.queue_tasks.post(std::move(cancel_tasks), true);
-        }
-        else {
-            SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
-        }
-    }
-};
-
 auto res_err = [](httplib::Response& res, json error_data) {
     json final_response{ {"error", error_data} };
     res.set_content(safe_json_to_str(final_response), MIMETYPE_JSON);
+    SERVER_CAL_SNAPSHOT("error_body_installed", &res, nullptr, &final_response, &res.body);
     res.status = json_value(error_data, "code", 500);
 };
 
 auto res_ok = [](httplib::Response& res, const json& data) {
     res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
+    SERVER_CAL_SNAPSHOT("body_installed", &res, nullptr, &data, &res.body);
     res.status = 200;
+};
+
+// Keep route-specific success/error payload contracts, but never deserialize a
+// missing control result or report it as successful. No automatic command replay.
+auto receive_control_result = [](server_context & server, server_task task, httplib::Response & res)
+        -> std::optional<server_task_result> {
+    auto outcome = server_request_legacy(server.queue_tasks, server.queue_results, std::move(task));
+    if (outcome.status != server_receive_status::result) {
+        res_err(res, format_error_response(
+            "Control response delivery ended; the operation may already have executed",
+            ERROR_TYPE_UNAVAILABLE));
+        return std::nullopt;
+    }
+    return std::move(outcome.value);
 };
 
 std::function<void(int)> shutdown_handler;
@@ -471,7 +379,8 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
     }
 }
 
-int main(int argc, char ** argv) {
+int server_run(int argc, char ** argv, server_context & ctx_server,
+               const std::function<void(int)> & ready) {
 #if SERVER_VERBOSE != 1
     log_disable();
 #endif
@@ -507,9 +416,6 @@ int main(int argc, char ** argv) {
     server_log_json = params.log_json;
     server_verbose = params.verbosity > 0;
 
-
-    // struct that contains llama context and inference
-    server_context ctx_server;
 
     if (!params.system_prompt.empty()) {
         ctx_server.system_prompt_set(params.system_prompt);
@@ -583,7 +489,10 @@ int main(int argc, char ** argv) {
     svr->set_read_timeout (params.timeout_read);
     svr->set_write_timeout(params.timeout_write);
 
-    if (!svr->bind_to_port(params.hostname, params.port)) {
+    const bool bound = params.port == 0
+        ? (params.port = svr->bind_to_any_port(params.hostname)) > 0
+        : svr->bind_to_port(params.hostname, params.port);
+    if (!bound) {
         fprintf(stderr, "\ncouldn't bind to server socket: hostname=%s port=%d\n\n", params.hostname.c_str(), params.port);
         return 1;
     }
@@ -738,6 +647,8 @@ int main(int argc, char ** argv) {
 
     // register server middlewares
     svr->set_pre_routing_handler([&middleware_validate_api_key, &middleware_server_state](const httplib::Request& req, httplib::Response& res) {
+        // Test-only correlation, never a fault/control switch or production input.
+        SERVER_CAL_REQUEST(req.get_header_value("X-Response-Calibration"));
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         // If this is OPTIONS request, skip validation because browsers don't include Authorization header
         if (req.method == "OPTIONS") {
@@ -771,12 +682,9 @@ int main(int argc, char ** argv) {
                     task.type = SERVER_TASK_TYPE_METRICS;
                     task.id_target = -1;
 
-                    ctx_server.queue_results.add_waiting_task_id(task.id);
-                    ctx_server.queue_tasks.post(std::move(task));
-
-                    // get the result
-                    server_task_result result = ctx_server.queue_results.recv(task.id);
-                    ctx_server.queue_results.remove_waiting_task_id(task.id);
+                    auto received = receive_control_result(ctx_server, std::move(task), res);
+                    if (!received) return;
+                    auto & result = *received;
 
                     const int n_idle_slots       = result.data.at("idle");
                     const int n_processing_slots = result.data.at("processing");
@@ -845,12 +753,9 @@ int main(int argc, char ** argv) {
         task.id_target = -1;
         task.type = SERVER_TASK_TYPE_METRICS;
 
-        ctx_server.queue_results.add_waiting_task_id(task.id);
-        ctx_server.queue_tasks.post(std::move(task));
-
-        // get the result
-        server_task_result result = ctx_server.queue_results.recv(task.id);
-        ctx_server.queue_results.remove_waiting_task_id(task.id);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         res.set_content(result.data.at("slots").dump(), "application/json");
         res.status = 200; // HTTP OK
@@ -870,12 +775,9 @@ int main(int argc, char ** argv) {
         task.type = SERVER_TASK_TYPE_METRICS;
         task.data.push_back({{"reset_bucket", true}});
 
-        ctx_server.queue_results.add_waiting_task_id(task.id);
-        ctx_server.queue_tasks.post(std::move(task));
-
-        // get the result
-        server_task_result result = ctx_server.queue_results.recv(task.id);
-        ctx_server.queue_results.remove_waiting_task_id(task.id);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         json data = result.data;
 
@@ -974,11 +876,9 @@ int main(int argc, char ** argv) {
             { "filepath", filepath }
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         if (result.error) {
             res_err(res, result.data);
@@ -1004,11 +904,9 @@ int main(int argc, char ** argv) {
             { "filepath", filepath }
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         if (result.error) {
             res_err(res, result.data);
@@ -1024,11 +922,9 @@ int main(int argc, char ** argv) {
             { "id_slot", id_slot },
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         if (result.error) {
             res_err(res, result.data);
@@ -1296,9 +1192,12 @@ int main(int argc, char ** argv) {
             bool stream = json_value(data, "stream", false);
             if (!stream) {
                 // non-stream, wait for the results
+                SERVER_CAL_SCOPE(batch_observation, "batch_results_destroyed");
                 auto all_results = rd->wait_for_all(is_connection_closed);
+                SERVER_CAL_CONTEXT(batch_context, &all_results.results);
                 if (all_results.is_terminated) {
-                    if (rd->any_task_on_slot()) llama_decode_stop(); // cancel-cascade fix: stop only if OUR task is the active decode
+                    // Reader retires delivery and queues owner-local cancellation.
+                    // A disconnect must not trigger a process-global decode abort.
                     return; // connection is closed
                 }
                 else if (all_results.error) {
@@ -1306,14 +1205,17 @@ int main(int argc, char ** argv) {
                     return;
                 }
                 else {
+                    SERVER_CAL_SCOPE(aggregate_observation, "aggregate_json_destroyed");
                     json arr = json::array();
                     for (auto& r_item : all_results.results) {
                         GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(r_item.get()) != nullptr);
                         json r_json = r_item->to_json();
+                        SERVER_CAL_SNAPSHOT("child_json_ready", r_item.get(), r_item.get(), &r_json);
                         if (data.contains("__evidence_telemetry")) {
                             r_json["evidence_telemetry"] = data["__evidence_telemetry"];
                         }
                         arr.push_back(std::move(r_json));
+                        SERVER_CAL_SNAPSHOT("aggregate_json_transfer", &arr, nullptr, &arr);
                     }
                     // if single request, return single object instead of array
                     res_ok(res, arr.size() == 1 ? arr[0] : arr);
@@ -1323,10 +1225,10 @@ int main(int argc, char ** argv) {
                 // in streaming mode, the first error must be treated as non-stream response
                 // this is to match the OAI API behavior
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+                SERVER_CAL_SCOPE(first_observation, "first_result_destroyed");
                 server_task_result_ptr first_result = rd->next(is_connection_closed);
                 if (first_result == nullptr) {
-                    if (rd->any_task_on_slot()) llama_decode_stop(); // cancel-cascade fix: stop only if OUR task is the active decode
-                    return; // connection is closed
+                    return; // reader has retired a closed connection
                 }
                 else if (first_result->is_error()) {
                     res_err(res, first_result->to_json());
@@ -1340,74 +1242,9 @@ int main(int argc, char ** argv) {
                 }
                 // next responses are streamed
                 json first_result_json = first_result->to_json();
-                const auto chunked_content_provider = [first_result_json, rd, oaicompat, &ctx_server](size_t, httplib::DataSink& sink) mutable -> bool {
-                    const auto sse = [oaicompat, &sink](const json& res) {
-                        if (oaicompat == OAICOMPAT_TYPE_ANTHROPIC) {
-                            return server_sent_anthropic_event(sink, res);
-                        }
-                        else if (oaicompat == OAICOMPAT_TYPE_RESP) {
-                            return server_sent_oai_resp_event(sink, res);
-                        }
-                        else {
-                            return server_sent_event(sink, res);
-                        }
-                    };
-                    // flush the first result as it's not an error
-                    if (!first_result_json.empty()) {
-                        if (!sse(first_result_json)) {
-                            sink.done();
-                            return false; // sending failed, go to on_complete()
-                        }
-                        first_result_json.clear(); // mark as sent
-                    }
-
-                    // receive subsequent results
-                    auto result = rd->next([&sink] { return !sink.is_writable(); });
-                    if (result == nullptr) {
-                        sink.done();
-                        return false; // connection is closed, go to on_complete()
-                    }
-
-                    // send the results
-                    json res_json = result->to_json();
-                    bool ok = false;
-                    if (result->is_error()) {
-                        ok = server_sent_event(sink, json{ { "error", result->to_json() } });
-                        sink.done();
-                        return false; // go to on_complete()
-                    }
-                    else {
-                        GGML_ASSERT(
-                            dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
-                            || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
-                        );
-                        ok = sse(res_json);
-                    }
-
-                    if (!ok) {
-                        sink.done();
-                        return false; // sending failed, go to on_complete()
-                    }
-
-                    // check if there is more data
-                    if (!rd->has_next()) {
-                        if (oaicompat != OAICOMPAT_TYPE_ANTHROPIC && oaicompat != OAICOMPAT_TYPE_NONE && oaicompat != OAICOMPAT_TYPE_RESP) {
-                            static const std::string ev_done = "data: [DONE]\n\n";
-                            sink.write(ev_done.data(), ev_done.size());
-                        } else if (ctx_server.params_base.send_done) {
-                            // --send-done (wired 2026-10-28): additionally emit
-                            // the OAI [DONE] terminator for stream flavors that
-                            // omit it by default (anthropic / none / resp).
-                            static const std::string ev_done = "data: [DONE]\n\n";
-                            sink.write(ev_done.data(), ev_done.size());
-                        }
-                        sink.done();
-                        return false; // no more data, go to on_complete()
-                    }
-
-                    // has next data, continue
-                    return true;
-                };
+                SERVER_CAL_SNAPSHOT("first_result_json_ready", first_result.get(), first_result.get(), &first_result_json);
+                const auto chunked_content_provider = server_completion_stream_provider(
+                    std::move(first_result_json), rd, oaicompat, ctx_server.params_base.send_done);
 
                 auto on_complete = [rd](bool) {
                     rd->stop();
@@ -1789,7 +1626,6 @@ int main(int argc, char ** argv) {
 
         // collect results
         if (all_results.is_terminated) {
-            if (rd.any_task_on_slot()) llama_decode_stop(); // cancel-cascade fix: stop only if OUR task is the active decode
             return; // connection is closed
         }
         else if (all_results.error) {
@@ -1863,7 +1699,6 @@ int main(int argc, char ** argv) {
         auto all_results = rd.wait_for_all(req.is_connection_closed);
 
         if (all_results.is_terminated) {
-            if (rd.any_task_on_slot()) llama_decode_stop();
             return; // connection is closed
         }
         else if (all_results.error) {
@@ -1933,11 +1768,9 @@ int main(int argc, char ** argv) {
 
         server_task task;
         task.type = SERVER_TASK_TYPE_SET_LORA;
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         res.set_content(result.data.dump(), "application/json");
         res.status = 200; // HTTP OK
@@ -1968,11 +1801,9 @@ int main(int argc, char ** argv) {
         task.type = SERVER_TASK_TYPE_LOAD_CONTROL_VECTOR;
         task.data = body;
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         res.set_content(result.data.dump(), "application/json");
         res.status = result.error ? 400 : 200;
@@ -1985,11 +1816,9 @@ int main(int argc, char ** argv) {
         task.type = SERVER_TASK_TYPE_UNLOAD_CONTROL_VECTOR;
         task.data = body;
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         res.set_content(result.data.dump(), "application/json");
         res.status = result.error ? 400 : 200;
@@ -2028,11 +1857,9 @@ int main(int argc, char ** argv) {
         server_task task;
         task.type = SERVER_TASK_TYPE_SET_CONTROL_VECTOR;
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        auto received = receive_control_result(ctx_server, std::move(task), res);
+        if (!received) return;
+        auto & result = *received;
 
         res.set_content(result.data.dump(), "application/json");
         res.status = result.error ? 400 : 200;
@@ -2517,6 +2344,8 @@ int main(int argc, char ** argv) {
     svr->new_task_queue = [&params] { return new httplib::ThreadPool(params.n_threads_http); };
 
     LOG_INFO("HTTP server listening", log_data);
+
+    if (ready) ready(params.port);
 
     // run the HTTP server in a thread - see comment below
     std::thread t([&]() {

@@ -327,6 +327,66 @@ target_include_directories(test-polygraph-plan PRIVATE ${PROJECT_SOURCE_DIR}/com
 target_link_libraries(test-polygraph-plan PRIVATE common)
 add_test(NAME test-polygraph-plan COMMAND $<TARGET_FILE:test-polygraph-plan>)
 
+add_executable(test-parallel-split-failure test-parallel-split-failure.cpp)
+target_include_directories(test-parallel-split-failure PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_link_libraries(test-parallel-split-failure PRIVATE ggml)
+# Match the actual production directory definition, not only the requested option.
+get_directory_property(_ggml_test_definitions DIRECTORY "${PROJECT_SOURCE_DIR}/ggml/src" COMPILE_DEFINITIONS)
+if (GGML_OPENMP AND "GGML_USE_OPENMP" IN_LIST _ggml_test_definitions)
+    find_package(OpenMP QUIET COMPONENTS CXX)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(test-parallel-split-failure PRIVATE OpenMP::OpenMP_CXX)
+        target_compile_definitions(test-parallel-split-failure PRIVATE TEST_GGML_OPENMP)
+        # OMP_THREAD_LIMIT was introduced in OpenMP 3.0. Older runtimes can
+        # ignore it and correctly supply a full team, so do not expect fallback.
+        if (OpenMP_CXX_VERSION VERSION_GREATER_EQUAL "3.0")
+            foreach(limit IN ITEMS 1 2)
+                add_test(NAME test-parallel-split-limit-${limit}
+                    COMMAND $<TARGET_FILE:test-parallel-split-failure> --expect-native)
+                set_tests_properties(test-parallel-split-limit-${limit} PROPERTIES TIMEOUT 30
+                    ENVIRONMENT "CUDA_VISIBLE_DEVICES=;GGML_CUDA_NO_PINNED=1;OMP_DYNAMIC=FALSE;OMP_THREAD_LIMIT=${limit}")
+            endforeach()
+        endif()
+        add_test(NAME test-parallel-split-nested
+            COMMAND $<TARGET_FILE:test-parallel-split-failure> --nested-serialized)
+        set_tests_properties(test-parallel-split-nested PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "CUDA_VISIBLE_DEVICES=;GGML_CUDA_NO_PINNED=1;OMP_DYNAMIC=FALSE;OMP_THREAD_LIMIT=3")
+        # Make the configured Clang resource headers explicit in compile_commands
+        # as well: a different clangd version may otherwise miss omp.h.
+        if (CMAKE_CXX_COMPILER_CLANG_RESOURCE_DIR AND NOT MSVC)
+            target_compile_options(test-parallel-split-failure PRIVATE
+                "-resource-dir=${CMAKE_CXX_COMPILER_CLANG_RESOURCE_DIR}")
+        endif()
+    endif()
+endif()
+add_test(NAME test-parallel-split-failure COMMAND $<TARGET_FILE:test-parallel-split-failure>)
+set_tests_properties(test-parallel-split-failure PROPERTIES TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=;GGML_CUDA_NO_PINNED=1;OMP_DYNAMIC=FALSE;OMP_THREAD_LIMIT=3")
+
+if (NOT WIN32)
+    add_executable(test-eval-failure test-eval-failure.cpp)
+    target_include_directories(test-eval-failure PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/examples/server)
+    target_link_libraries(test-eval-failure PRIVATE common)
+    add_test(NAME test-eval-failure COMMAND $<TARGET_FILE:test-eval-failure>)
+    set_tests_properties(test-eval-failure PROPERTIES TIMEOUT 60 ENVIRONMENT "CUDA_VISIBLE_DEVICES=;GGML_CUDA_NO_PINNED=1")
+endif()
+
+add_executable(test-checkpoint-spill test-checkpoint-spill.cpp)
+target_include_directories(test-checkpoint-spill PRIVATE ${PROJECT_SOURCE_DIR}/common)
+add_test(NAME test-checkpoint-spill COMMAND $<TARGET_FILE:test-checkpoint-spill>)
+
+# Host-only resource/cache regression: mock CUDA calls, use production owners.
+find_package(Threads REQUIRED)
+add_executable(test-cuda-reduction-lifecycle test-cuda-reduction-lifecycle.cpp)
+target_include_directories(test-cuda-reduction-lifecycle PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+add_test(NAME test-cuda-reduction-lifecycle COMMAND $<TARGET_FILE:test-cuda-reduction-lifecycle>)
+set_tests_properties(test-cuda-reduction-lifecycle PROPERTIES TIMEOUT 30)
+
+add_executable(test-cuda-graph-memory test-cuda-graph-memory.cpp)
+target_include_directories(test-cuda-graph-memory PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+target_link_libraries(test-cuda-graph-memory PRIVATE Threads::Threads)
+add_test(NAME test-cuda-graph-memory COMMAND $<TARGET_FILE:test-cuda-graph-memory>)
+set_tests_properties(test-cuda-graph-memory PROPERTIES TIMEOUT 30)
+
 option(POLYGRAPH_MICROBENCH "Build test-cuda-graph-pinned (model-free CUDA backend is broken in this fork; see the .cpp header)" OFF)
 if (GGML_CUDA AND POLYGRAPH_MICROBENCH)
     add_executable(test-cuda-graph-pinned test-cuda-graph-pinned.cpp)
