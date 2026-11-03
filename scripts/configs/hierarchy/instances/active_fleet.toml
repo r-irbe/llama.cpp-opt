@@ -3,9 +3,9 @@
 # =============================================================================
 
 [fleet]
-active_instance_id = "llama-primary-8080"
+active_instance_id = "llama-worker-8083"
 slab_arbitration_policy = "cooperative_lru_yield"
-total_instances = 3
+total_instances = 4
 
 [fleet.instances."llama-primary-8080"]
 label = "Primary Coding & Reasoning Engine"
@@ -57,10 +57,11 @@ status = "stopped"
 pid = 0
 active_slots = 0
 last_replaced_from_binary = "none"
+
 [fleet.instances."llama-worker-8083"]
 label = "Dynamic Instance (deepseek_v41_fastest_np8 :8083)"
 engine_flavor = "ik_llama_pto_lto"
-binary_path = "build-pto/bin/llama-server"
+binary_path = "build/bin/llama-server"
 model_id = "deepseek_v41_fastest_np8"
 template_id = "ds41-1017-np8-1m-swarm"
 host = "127.0.0.1"
@@ -69,7 +70,8 @@ numa_nodes = "0-7 (NPS4 distribute)"
 gpu_device = 0
 vram_budget_gib = 12.00
 slab_priority = "cooperative"
-status = "healthy"
-pid = 42100
+status = "starting"
+pid = 0
 active_slots = 8
-last_replaced_from_binary = "ik_llama_rust_ffi:build/bin/llama-server"
+last_replaced_from_binary = "none"
+"ik_llama_rust_ffi:build/bin/llama-server"

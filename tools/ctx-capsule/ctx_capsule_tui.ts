@@ -24,10 +24,16 @@ async function resolveRunCapsuleCli(): Promise<
   (opts: { argv: readonly string[]; workspaceRoot: string }) => Promise<number>
 > {
   const parentDir = path.resolve(__dirname, "../../..");
-  const candidates: string[] = [path.join(parentDir, "ctx-capsule/src/index.ts")];
+  const candidates: string[] = [
+    path.join(parentDir, "tacit-mui/packages/pi-harness-bridge/src/capsule/index.ts"),
+    path.join(parentDir, "ctx-capsule/src/index.ts"),
+  ];
   if (fs.existsSync(parentDir)) {
     for (const entry of fs.readdirSync(parentDir)) {
-      candidates.push(path.join(parentDir, entry, "packages/pi-harness-bridge/src/capsule/index.ts"));
+      const candidate = path.join(parentDir, entry, "packages/pi-harness-bridge/src/capsule/index.ts");
+      if (!candidates.includes(candidate)) {
+        candidates.push(candidate);
+      }
     }
   }
   for (const candidate of candidates) {
@@ -47,4 +53,3 @@ async function resolveRunCapsuleCli(): Promise<
 const runCapsuleCli = await resolveRunCapsuleCli();
 
 const exitCode = (process.exitCode = await runCapsuleCli({ argv: process.argv.slice(2), workspaceRoot }));
-

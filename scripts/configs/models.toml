@@ -7,17 +7,17 @@
 binary = "build-pto/bin/llama-server"
 host = "127.0.0.1"
 port = 8080
-active_model = "deepseek_v41_fastest_np8"
-active_template = "ds41-1017-np8-1m-swarm"
+active_model = "deepseek-v4.1-1017-iq2xxs"
+active_template = "ds41-1017-np1-512k-max-speed"
 hardware_profile = "epyc_milan_rtx4090"
 threads = 56
 threads_batch = 56
 gpu_layers = 99
 flash_attn = "on"
 numa = "distribute"
-ctk = "q4_0"
-ctv = "q4_0"
-ictk = "q4_0"
+ctk = "q8_0"
+ctv = "q8_0"
+ictk = "q8_0"
 swa_compress = true
 fused_indexer = true
 dsa_attention = true
@@ -25,8 +25,8 @@ defer_ple = true
 thinking_effort = "max_deep_think"
 evidence_strategy = "code_pinpoint"
 evidence_chunk_tokens = 140
-evidence_keep_ratio = "15%"
-capsule_filter = "fuse16_simhash64"
+evidence_keep_ratio = "20%"
+capsule_filter = "fuse8_simhash64"
 zdd_sparse_kv = true
 cohort_prefix_sharing = true
 spec_bandit = "thompson_counterfactual"
@@ -167,7 +167,7 @@ fallback_paths = []
 ctx_size = 1048576
 ctk = "q4_0"
 ctv = "q4_0"
-parallel = 8
+parallel = 1
 mla = 2
 override_tensor = "exps=CPU"
 default_template = "low_vram_1m"
@@ -179,7 +179,7 @@ fallback_paths = []
 ctx_size = 131072
 ctk = "q8_0"
 ctv = "q8_0"
-parallel = 8
+parallel = 1
 override_tensor = "exps=CPU"
 default_template = "deep_formal_audit"
 
@@ -430,4 +430,3 @@ thinking_effort = "max_deep_think"
 temp = "0.1"
 telemetry_mode = "pi_telemetry_plus_jsonl"
 sdk_sync_targets = "all_7_harnesses"
-sses"
