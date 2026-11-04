@@ -243,7 +243,7 @@ add_test(NAME test-mxfp8-compute-enabled COMMAND $<TARGET_FILE:test-mxfp8-comput
 # called with the test's single-row convention (bx = by = 0, nrc = 1) for many
 # pre-existing types (q4_0, q5_0, q4_K, ...), independently of MXFP8.
 llama_target_and_test(test-quantize-fns.cpp       LABEL "quant")
-set_tests_properties(test-quantize-fns PROPERTIES DISABLED TRUE)
+# set_tests_properties(test-quantize-fns PROPERTIES DISABLED TRUE)
 
 
 # dummy executable - not installed

@@ -459,6 +459,19 @@ static __device__ __forceinline__ float iq1bn_fp8_to_float(uint8_t fp8) {
     return s.f;
 }
 
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(const uint8_t x) {
+    const uint32_t sign = (uint32_t) (x & 0x80) << 24;
+    const uint32_t exp  = (x >> 3) & 0xF;
+    const uint32_t man  = x & 0x7;
+    if ((x & 0x7F) == 0x7F) {
+        return __int_as_float(sign | 0x7FC00000u);
+    }
+    if (exp == 0) {
+        return __int_as_float(__float_as_int((float) man * 0x1p-9f) | sign);
+    }
+    return __int_as_float(sign | ((exp + 120u) << 23) | (man << 20));
+}
+
 template <ggml_type type>
 struct ggml_cuda_type_traits;
 
@@ -620,6 +633,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;
     static constexpr int qi = QI4_NL;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = 1;
+    static constexpr int qi = QI8_0;
 };
 
 template<>

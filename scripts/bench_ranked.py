@@ -295,7 +295,7 @@ class BenchServer:
             return
         self.proc.terminate()
         try:
-            self.proc.wait(timeout=20)
+            self.proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait(timeout=10)

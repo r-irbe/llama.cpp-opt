@@ -2029,6 +2029,9 @@ static void mul_mat_q8_KV_q8_KV(int n, const void * vx, size_t bx, const DataInf
     }
 }
 
+template <int nrc_y>
+static void mul_mat_q8_KV_q8_KV_1(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+
 // The HAVE_FANCY_SIMD should only be #if defined(__AVX512_VNNI__ && defined(__AVX512VL__)
 template <int nrc_y>
 static void mul_mat_q8_KV_r8_q8_KV(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
@@ -3182,6 +3185,7 @@ bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_
 #endif
         case GGML_TYPE_Q8_KV:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_KV_q8_KV, kernels)
+            kernels[0] = mul_mat_q8_KV_q8_KV_1<1>;
 #ifdef HAVE_FANCY_SIMD
             func16 = mul_mat_q8_KV_q8_KV<16>;
 #endif

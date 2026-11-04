@@ -6,6 +6,7 @@ static void run_response_calibration(httplib::Client & client, int port, FILE * 
         int observed_context, int observed_vocabulary) {
     std::mutex output_mutex;
     std::atomic<unsigned> attempts{0};
+    int slow_consumer_cells = 0;
     const auto output = [&](json row) {
         row["steady_ns"] = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -170,10 +171,131 @@ static void run_response_calibration(httplib::Client & client, int port, FILE * 
             CHECK(countdown.load() == 0 && active_at_failure.load() == 2);
             request(client, "RECOVERY", "/completion", base, 200, true);
         }
+        {
+            // SLOW-THROTTLED: streamed SSE request with throttled reading callback (sleep 10ms between chunks)
+            httplib::Client slow_client("127.0.0.1", port);
+            slow_client.set_connection_timeout(2); slow_client.set_read_timeout(10);
+            slow_client.set_default_headers({{"Authorization", "Bearer fixture-key"}, {"Accept-Encoding", "identity"}});
+
+            auto body = base;
+            body["stream"] = true;
+            body["n_predict"] = 8;
+
+            auto peer_future = std::async(std::launch::async, [&] {
+                request(client, "SLOW-THROTTLED-PEER", "/completion", base, 200, true);
+            });
+
+            const auto id = attempts.fetch_add(1) + 1;
+            CHECK(id <= 600);
+            output({{"event", "episode_begin"}, {"id", id}, {"cell", "SLOW-THROTTLED"}});
+            std::string chunks;
+            int chunk_count = 0;
+            auto res = slow_client.Post("/completion", {{"X-Response-Calibration", std::to_string(id)}},
+                body.dump(), "application/json",
+                [&](const char * data, size_t size) {
+                    chunks.append(data, size);
+                    chunk_count++;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    return true;
+                });
+            peer_future.get();
+            check_sse_payloads(chunks);
+            const bool ok = res && res->status == 200 && chunk_count > 0 && chunks.find("\"stop\":true") != std::string::npos;
+            json sample = {{"event", "measurement"}, {"episode", id}, {"cell", "SLOW-THROTTLED"},
+                {"requested_output", body.value("n_predict", -1)}, {"observed_slot_context", observed_context},
+                {"observed_vocabulary_entries", observed_vocabulary}, {"response_bytes", chunks.size()},
+                {"status", res ? res->status : -1}, {"blocked_write", "unavailable"},
+                {"tenant", "analysis_A"}, {"achieved_parent_concurrency", "unavailable"}, {"tenant_enforcement", false}};
+            output(sample);
+            output({{"event", "episode_end"}, {"id", id}, {"ok", ok}});
+            CHECK(ok && response_calibration_complete());
+            slow_consumer_cells++;
+        }
+        {
+            // SLOW-PAUSE: streamed SSE request with pause-resume callback (sleep 20ms once mid-stream)
+            httplib::Client slow_client("127.0.0.1", port);
+            slow_client.set_connection_timeout(2); slow_client.set_read_timeout(10);
+            slow_client.set_default_headers({{"Authorization", "Bearer fixture-key"}, {"Accept-Encoding", "identity"}});
+
+            auto body = base;
+            body["stream"] = true;
+            body["n_predict"] = 8;
+
+            auto peer_future = std::async(std::launch::async, [&] {
+                request(client, "SLOW-PAUSE-PEER", "/completion", base, 200, true);
+            });
+
+            const auto id = attempts.fetch_add(1) + 1;
+            CHECK(id <= 600);
+            output({{"event", "episode_begin"}, {"id", id}, {"cell", "SLOW-PAUSE"}});
+            std::string chunks;
+            bool paused = false;
+            auto res = slow_client.Post("/completion", {{"X-Response-Calibration", std::to_string(id)}},
+                body.dump(), "application/json",
+                [&](const char * data, size_t size) {
+                    chunks.append(data, size);
+                    if (!paused) {
+                        paused = true;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    return true;
+                });
+            peer_future.get();
+            check_sse_payloads(chunks);
+            const bool ok = res && res->status == 200 && paused && chunks.find("\"stop\":true") != std::string::npos;
+            json sample = {{"event", "measurement"}, {"episode", id}, {"cell", "SLOW-PAUSE"},
+                {"requested_output", body.value("n_predict", -1)}, {"observed_slot_context", observed_context},
+                {"observed_vocabulary_entries", observed_vocabulary}, {"response_bytes", chunks.size()},
+                {"status", res ? res->status : -1}, {"blocked_write", "unavailable"},
+                {"tenant", "analysis_A"}, {"achieved_parent_concurrency", "unavailable"}, {"tenant_enforcement", false}};
+            output(sample);
+            output({{"event", "episode_end"}, {"id", id}, {"ok", ok}});
+            CHECK(ok && response_calibration_complete());
+            slow_consumer_cells++;
+        }
+        {
+            // SLOW-ABORT: streamed SSE request where client aborts early (returns false after receiving partial data)
+            httplib::Client slow_client("127.0.0.1", port);
+            slow_client.set_connection_timeout(2); slow_client.set_read_timeout(10);
+            slow_client.set_default_headers({{"Authorization", "Bearer fixture-key"}, {"Accept-Encoding", "identity"}});
+
+            auto body = base;
+            body["stream"] = true;
+            body["n_predict"] = 8;
+
+            auto peer_future = std::async(std::launch::async, [&] {
+                request(client, "SLOW-ABORT-PEER", "/completion", base, 200, true);
+            });
+
+            const auto id = attempts.fetch_add(1) + 1;
+            CHECK(id <= 600);
+            output({{"event", "episode_begin"}, {"id", id}, {"cell", "SLOW-ABORT"}});
+            std::string chunks;
+            bool aborted = false;
+            auto res = slow_client.Post("/completion", {{"X-Response-Calibration", std::to_string(id)}},
+                body.dump(), "application/json",
+                [&](const char * data, size_t size) {
+                    if (size > 0) {
+                        chunks.append(data, size);
+                        aborted = true;
+                        return false;
+                    }
+                    return true;
+                });
+            peer_future.get();
+            const bool ok = aborted && (!res || res->status != 200);
+            json sample = {{"event", "measurement"}, {"episode", id}, {"cell", "SLOW-ABORT"},
+                {"requested_output", body.value("n_predict", -1)}, {"observed_slot_context", observed_context},
+                {"observed_vocabulary_entries", observed_vocabulary}, {"response_bytes", chunks.size()},
+                {"status", -1}, {"blocked_write", "unavailable"},
+                {"tenant", "analysis_A"}, {"achieved_parent_concurrency", "unavailable"}, {"tenant_enforcement", false}};
+            output(sample);
+            output({{"event", "episode_end"}, {"id", id}, {"ok", ok}});
+            CHECK(ok && response_calibration_complete());
+            slow_consumer_cells++;
+        }
     }
-    // Slow/no-read, late errors, detached ownership and authenticated tenant
-    // enforcement are not fabricated by this first-stage cell selector.
     output({{"event", "measurement"}, {"completed_attempts", attempts.load()},
-        {"slow_consumer_cells", "not_yet_instrumented"}, {"retirement_coverage", "partial"},
+        {"slow_consumer_cells", slow_consumer_cells}, {"retirement_coverage", "partial"},
         {"reservation_enforcement", "unavailable"}, {"production_limits_ready", false}});
 }

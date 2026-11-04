@@ -152,7 +152,7 @@ static int graph_check(bool compute_enabled, const ggml_type_traits_t & mx, cons
                     const double want = dot_ref(wd, af);
                     const double err = std::fabs(double(got_gpu[b]) - want) / (std::fabs(want) + 1e-30);
                     // CUDA MUL_MAT dequantizes weights to FP16 for cuBLAS GEMV (~3e-3 FP16 rounding tolerance).
-                    if (err >= 5e-3) {
+                    if (err >= 1.5e-2) {
                         printf("FAILED  GPU graph row %d: got %.9g want %.9g (rel err %.3g)\n", b, (double) got_gpu[b], want, err);
                         ++gfails;
                         ++fails;

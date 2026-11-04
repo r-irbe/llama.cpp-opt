@@ -5290,10 +5290,8 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, const ggml_tensor * op) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
-    static const bool mxfp8_compute = []() {
-        const char * e = getenv("GGML_MXFP8_COMPUTE");
-        return e != nullptr && *e != '\0' && atoi(e) != 0;
-    }();
+    const char * e = getenv("GGML_MXFP8_COMPUTE");
+    const bool mxfp8_compute = (e != nullptr && *e != '\0' && atoi(e) != 0);
 
     // Non-mul_mat ops can't read a split-buffer parent (no data ptr); let the scheduler fall back to CPU.
     if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
@@ -5421,8 +5419,10 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ3_KS_R16:
                     case GGML_TYPE_IQ4_KS_R16:
                         return true;
-                    case GGML_TYPE_MXFP8:
-                        return mxfp8_compute && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID);
+                    case GGML_TYPE_MXFP8: {
+                        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+                        return (mxfp8_compute || fp8_mma_available(cc)) && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID);
+                    }
                     default:
                         return false;
                 }

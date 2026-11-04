@@ -359,6 +359,8 @@ auto receive_control_result = [](server_context & server, server_task task, http
     return std::move(outcome.value);
 };
 
+extern "C" __attribute__((weak)) int __llvm_profile_write_file(void);
+
 std::function<void(int)> shutdown_handler;
 std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
@@ -367,7 +369,7 @@ inline void signal_handler(int signal) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        _exit(1);
     }
 
     shutdown_handler(signal);
@@ -834,6 +836,21 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
                     {"value",  (uint64_t) data.at("deferred")}
             }}}
         };
+
+        if (data.contains("slab_arbiter_allocated_slabs")) {
+            all_metrics_def["gauge"].push_back({
+                {"name",  "slab_arbiter_allocated_slabs"},
+                {"help",  "Number of allocated 2MiB slabs in shared fleet arbiter."},
+                {"value", (uint64_t) data.at("slab_arbiter_allocated_slabs")}
+            });
+        }
+        if (data.contains("slab_arbiter_free_slabs")) {
+            all_metrics_def["gauge"].push_back({
+                {"name",  "slab_arbiter_free_slabs"},
+                {"help",  "Number of free 2MiB slabs in shared fleet arbiter."},
+                {"value", (uint64_t) data.at("slab_arbiter_free_slabs")}
+            });
+        }
 
         std::stringstream prometheus;
 
@@ -2404,6 +2421,9 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
 
     shutdown_handler = [&](int) {
         ctx_server.queue_tasks.terminate();
+        if (svr) {
+            svr->stop();
+        }
     };
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -2422,10 +2442,16 @@ int server_run(int argc, char ** argv, server_context & ctx_server,
 
     ctx_server.queue_tasks.start_loop();
 
-    svr->stop();
+    if (svr) {
+        svr->stop();
+    }
     t.join();
 
     llama_backend_free();
 
-    return 0;
+    if (__llvm_profile_write_file) {
+        __llvm_profile_write_file();
+    }
+
+    exit(0);
 }

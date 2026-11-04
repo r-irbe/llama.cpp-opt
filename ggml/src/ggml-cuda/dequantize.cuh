@@ -138,20 +138,7 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 #endif // GGML_CUDA_F16
 }
 
-// E4M3 (fn) decode, exact in fp32; 0x7F/0xFF are NaN. Used by MXFP8 (gather & compute,
-// mainline PR #30817).
-static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(const uint8_t x) {
-    const uint32_t sign = (uint32_t) (x & 0x80) << 24;
-    const uint32_t exp  = (x >> 3) & 0xF;
-    const uint32_t man  = x & 0x7;
-    if ((x & 0x7F) == 0x7F) {
-        return __int_as_float(sign | 0x7FC00000u);
-    }
-    if (exp == 0) {
-        return __int_as_float(__float_as_int((float) man * 0x1p-9f) | sign);
-    }
-    return __int_as_float(sign | ((exp + 120u) << 23) | (man << 20));
-}
+// E4M3 (fn) decode is defined in common.cuh. Used by MXFP8 (gather & compute).
 
 static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
     const block_mxfp8 * x = (const block_mxfp8 *) vx;

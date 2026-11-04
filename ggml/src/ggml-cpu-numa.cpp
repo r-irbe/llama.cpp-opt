@@ -69,6 +69,59 @@ void set_numa_expert(bool enable) {
     }
 }
 
+static std::atomic<bool> g_default_interleave{false};
+
+bool default_interleave_active() {
+    return g_default_interleave.load(std::memory_order_relaxed);
+}
+
+bool set_default_interleave(int n_nodes) {
+#if defined(__gnu_linux__)
+    if (n_nodes <= 1) {
+        return false;
+    }
+
+    const auto & topo = topology();
+    if (topo.size() < 2) {
+        return false;
+    }
+
+    // node ids come from sysfs and are not necessarily 0..n-1, size the mask from the max id
+    const size_t bits_per_word = 8 * sizeof(unsigned long);
+    int max_id = 0;
+    for (const auto & n : topo) {
+        max_id = std::max(max_id, n.id);
+    }
+    std::vector<unsigned long> nodemask(max_id / bits_per_word + 1, 0);
+
+    int n_set = 0;
+    for (const auto & n : topo) {
+        if (n_set >= n_nodes) {
+            break;
+        }
+        if (n.id < 0) {
+            continue;
+        }
+        nodemask[n.id / bits_per_word] |= 1UL << (n.id % bits_per_word);
+        n_set++;
+    }
+    if (n_set <= 1) {
+        return false;
+    }
+
+    const long ret = syscall(__NR_set_mempolicy, MPOL_INTERLEAVE, nodemask.data(), nodemask.size() * bits_per_word);
+    if (ret != 0) {
+        return false;
+    }
+
+    g_default_interleave.store(true, std::memory_order_relaxed);
+    return true;
+#else
+    (void) n_nodes;
+    return false;
+#endif
+}
+
 static bool read_file(const std::string & path, std::string & out) {
     std::ifstream f(path);
     if (!f.is_open()) {
@@ -903,9 +956,17 @@ bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nod
 
     static std::atomic<bool> s_logged_expert_bind{false};
     if (!s_logged_expert_bind.exchange(true, std::memory_order_relaxed)) {
-        fprintf(stderr, "ggml_numa: --numa expert round-robin MPOL_BIND active (%d experts across %d NUMA nodes, first tensor=%s)\n",
+        fprintf(stderr, "ggml_numa: --numa expert requesting per-expert mbind(MPOL_BIND, MPOL_MF_MOVE) (%d experts across %d NUMA nodes, first tensor=%s)\n",
                 n_experts, n_numa_nodes, tensor->name);
     }
+
+    // when a process-wide interleave policy is installed, a refused bind must not
+    // replace it with MPOL_PREFERRED: the slice then simply keeps the even baseline
+    const bool keep_interleave = g_default_interleave.load(std::memory_order_relaxed);
+
+    int n_ok = 0;
+    int n_fail = 0;
+    int first_errno = 0;
 
     for (int e = 0; e < n_experts; ++e) {
         int target_node = e % n_numa_nodes;
@@ -921,12 +982,29 @@ bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nod
         nodemask[target_node / bits_per_word] = 1UL << (target_node % bits_per_word);
 
         long ret = syscall(__NR_mbind, (void *)page_start, len, MPOL_BIND, nodemask.data(), nodemask.size() * bits_per_word, MPOL_MF_MOVE);
-        if (ret != 0) {
-            syscall(__NR_mbind, (void *)page_start, len, MPOL_PREFERRED, nodemask.data(), nodemask.size() * bits_per_word, 0);
+        if (ret == 0) {
+            n_ok++;
+        } else {
+            n_fail++;
+            if (first_errno == 0) {
+                first_errno = errno;
+            }
+            if (!keep_interleave) {
+                syscall(__NR_mbind, (void *)page_start, len, MPOL_PREFERRED, nodemask.data(), nodemask.size() * bits_per_word, 0);
+            }
         }
         madvise((void *)page_start, len, MADV_HUGEPAGE);
     }
-    return true;
+
+    static std::atomic<bool> s_logged_expert_bind_result{false};
+    if (n_fail > 0 && !s_logged_expert_bind_result.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "ggml_numa: --numa expert mbind(MPOL_BIND, MPOL_MF_MOVE) refused for %d/%d slices (first errno=%d %s); %s\n",
+                n_fail, n_ok + n_fail, first_errno, strerror(first_errno),
+                keep_interleave ? "slices keep the process-wide interleave baseline"
+                                : "slices fell back to MPOL_PREFERRED, no migration happened");
+    }
+
+    return n_ok > 0;
 #else
     (void)tensor;
     (void)n_numa_nodes;
@@ -1140,6 +1218,14 @@ bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx) {
 
 bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes) {
     return ggml::cpu::numa::bind_tensor_experts_round_robin(tensor, n_numa_nodes);
+}
+
+bool ggml_cpu_numa_set_default_interleave(int n_numa_nodes) {
+    return ggml::cpu::numa::set_default_interleave(n_numa_nodes);
+}
+
+bool ggml_cpu_numa_default_interleave_active(void) {
+    return ggml::cpu::numa::default_interleave_active();
 }
 
 bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_nodes) {

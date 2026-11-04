@@ -2964,6 +2964,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.endpoint_metrics = true;
         return true;
     }
+    if (arg == "--slab-arbiter-shm") {
+        CHECK_ARG
+        params.slab_arbiter_shm = argv[i];
+        return true;
+    }
+    if (arg == "--slab-priority") {
+        CHECK_ARG
+        params.slab_priority = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--slot-save-path") {
         CHECK_ARG
         params.slot_save_path = argv[i];
@@ -3903,6 +3913,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "       --log-format {text,json}",
                                                                         "log output format: json or text (default: text)" });
     options.push_back({ "server",      "       --metrics",              "enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --slab-arbiter-shm PATH", "shared memory path for fleet slab arbiter (default: '%s')", params.slab_arbiter_shm.c_str() });
+    options.push_back({ "server",      "       --slab-priority N",       "priority weight for slab preemption arbitration (default: %d)", params.slab_priority });
     options.push_back({ "server",      "       --no-slots",             "disables slots monitoring endpoint (default: %s)", params.endpoint_slots ? "enabled" : "disabled" });
     options.push_back({ "server",      "       --slot-save-path PATH",  "path to save slot kv cache (default: disabled)" });
     options.push_back({ "server",      "       --chat-template JINJA_TEMPLATE",

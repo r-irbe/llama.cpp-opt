@@ -6,7 +6,12 @@
 #include "speculative.h"
 #include "json-schema-to-grammar.h"
 #include "cohort-radix-trie.h"
+#include "slab-arena.h"
 #include <nlohmann/json_fwd.hpp>
+
+#ifndef HOST_PINNED
+#define HOST_PINNED NUMA_FAST_CPU
+#endif
 
 #include <cstddef>
 #include <memory>
@@ -31,6 +36,8 @@ struct server_slot {
     int id;
     int id_task = -1;
     int id_multi = -1;
+
+    common::SlabHandle slab_handle;
 
     struct slot_params params;
 
@@ -307,6 +314,11 @@ struct server_context {
     float slot_prompt_similarity = 0.0f;
     int32_t cache_ram_n_min = 0;
     float cache_ram_similarity = 0.5f;
+
+#ifndef _WIN32
+    std::unique_ptr<common::SharedFleetSlabArbiter<64, 2 * 1024 * 1024>> slab_arbiter;
+    uint32_t slab_model_id = 0;
+#endif
 
     ~server_context();
 

@@ -21,6 +21,9 @@
 #include <iostream>
 #include <regex>
 #include <exception>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 // DFlash/DSpark (draft model family) and MTP stages work with multimodal
 static bool server_speculative_multimodal_supported(const common_params_speculative & params) {
@@ -224,6 +227,17 @@ server_context::~server_context() {
         common_speculative_free(slot.spec);
         slot.spec = nullptr;
     }
+#ifndef _WIN32
+    if (slab_arbiter && slab_arbiter->arena()) {
+        for (server_slot& slot : slots) {
+            if (slot.slab_handle.is_valid()) {
+                slab_arbiter->arena()->free_slab(slot.slab_handle.slab_id);
+                slot.slab_handle = common::SlabHandle();
+            }
+        }
+        slab_arbiter->arena()->yield_borrowed_slabs(slab_model_id);
+    }
+#endif
     if (!checkpoint_spill_session_dir.empty()) {
         // Remove only this process's now-empty directory; never recurse or
         // delete files belonging to other running/crashed server instances.
@@ -534,6 +548,20 @@ void server_context::init() {
         };
     }
 
+#ifndef _WIN32
+    if (!params_base.slab_arbiter_shm.empty()) {
+        slab_arbiter = std::make_unique<common::SharedFleetSlabArbiter<64, 2 * 1024 * 1024>>();
+        if (!slab_arbiter->open_or_create(params_base.slab_arbiter_shm, false)) {
+            if (!slab_arbiter->open_or_create(params_base.slab_arbiter_shm, true)) {
+                SRV_WRN("failed to open or create slab arbiter at %s\n", params_base.slab_arbiter_shm.c_str());
+            }
+        }
+        slab_model_id = static_cast<uint32_t>(::getpid());
+        if (slab_arbiter && slab_arbiter->lease()) {
+            slab_arbiter->lease()->priority_weight.store(static_cast<uint64_t>(params_base.slab_priority), std::memory_order_relaxed);
+        }
+    }
+#endif
 }
 
 
@@ -2601,7 +2629,12 @@ json server_context::get_formatted_generation(const server_slot& slot) const {
         {"chat_format",               common_chat_format_name(slot.params.chat_parser_params.format)},
         {"reasoning_format",          common_reasoning_format_name(slot.params.chat_parser_params.reasoning_format)},
         {"reasoning_in_content",      slot.params.chat_parser_params.reasoning_in_content},
-        {"samplers",                  samplers_sequence}
+        {"samplers",                  samplers_sequence},
+        {"slab",                      {
+            {"is_valid",   slot.slab_handle.is_valid()},
+            {"slab_id",    slot.slab_handle.slab_id},
+            {"generation", slot.slab_handle.generation}
+        }}
     };
 }
 
@@ -3237,6 +3270,13 @@ void server_context::process_single_task(server_task&& task) {
             { "slots",                           slots_data },
         };
 
+#ifndef _WIN32
+        if (slab_arbiter && slab_arbiter->arena()) {
+            res.data["slab_arbiter_allocated_slabs"] = slab_arbiter->arena()->count_allocated_slabs();
+            res.data["slab_arbiter_free_slabs"]      = slab_arbiter->arena()->count_free_slabs();
+        }
+#endif
+
         if (json_value(task.data, "reset_bucket", false)) {
             metrics.reset_bucket();
         }
@@ -3718,6 +3758,13 @@ void server_context::release_slots()
             slot.command = SLOT_COMMAND_NONE;
             slot.t_last_used = ggml_time_us();
 
+#ifndef _WIN32
+            if (slab_arbiter && slab_arbiter->arena() && slot.slab_handle.is_valid()) {
+                slab_arbiter->arena()->free_slab(slot.slab_handle.slab_id);
+                slot.slab_handle = common::SlabHandle();
+            }
+#endif
+
             LOG_INFO("slot released", {
                 {"id_slot",         slot.id},
                 {"id_task",         slot.id_task},
@@ -3731,6 +3778,12 @@ void server_context::release_slots()
             queue_tasks.notify_slot_changed();
         }
     }
+
+#ifndef _WIN32
+    if (slab_arbiter && slab_arbiter->arena() && slots_idle()) {
+        slab_arbiter->arena()->yield_borrowed_slabs(slab_model_id);
+    }
+#endif
 }
 
 bool server_context::slots_idle(){
@@ -5181,6 +5234,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         const int ret = server_decode(ctx, batch_view);
         const auto action = server_classify_decode(ret);
         if (action != server_decode_action::success) {
+            if (action == server_decode_action::allocation_failed && i == 0 && llama_n_ubatch(ctx) > 1) {
+                const uint32_t next_ubatch = std::max(1u, llama_n_ubatch(ctx) / 2);
+                llama_set_n_ubatch(ctx, next_ubatch);
+                n_batch = std::max(1, std::min(n_batch, (int32_t)next_ubatch));
+                i -= n_batch;
+                continue;
+            }
+
             if (n_batch == 1 || action != server_decode_action::retry_kv) {
                 const bool cancelled = action == server_decode_action::cancelled;
                 if (cancelled) {
@@ -5403,6 +5464,33 @@ void server_context::update_slots() {
     if (slots_idle()) {
         return;
     }
+
+#ifndef _WIN32
+    if (slab_arbiter && slab_arbiter->arena()) {
+        slab_arbiter->arena()->yield_borrowed_slabs(slab_model_id);
+        for (auto & slot : slots) {
+            if (slot.is_processing() && !slot.slab_handle.is_valid()) {
+                uint16_t slab_id = slab_arbiter->arena()->allocate_slab(slab_model_id, common::SlabMemoryTier::HOST_PINNED);
+                if (slab_id == common::INVALID_SLAB_ID) {
+                    for (size_t s = 0; s < 64; ++s) {
+                        const auto & desc = slab_arbiter->arena()->get_descriptor(static_cast<uint16_t>(s));
+                        if (desc.owner_model_id != 0 && desc.owner_model_id != slab_model_id && desc.borrower_model_id == 0) {
+                            slab_id = slab_arbiter->arena()->borrow_slab(slab_model_id, desc.owner_model_id);
+                            if (slab_id != common::INVALID_SLAB_ID) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (slab_id != common::INVALID_SLAB_ID) {
+                    slot.slab_handle.slab_id = slab_id;
+                    slot.slab_handle.slot_offset = static_cast<uint16_t>(slot.id);
+                    slot.slab_handle.generation++;
+                }
+            }
+        }
+    }
+#endif
 
     // ConcurrencyKnee sampling (investigation-garden spec 5.3): feed every
     // speculative slot with the current active-stream count. When saturated

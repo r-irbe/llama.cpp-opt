@@ -9,6 +9,7 @@
 #include "spsc-ring.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -239,6 +240,37 @@ int main() {
             }
 
             check(llama_numa_init_ex(GGML_NUMA_STRATEGY_EXPERT) == LLAMA_NUMA_INIT_STATUS_SUCCESS, "second call is idempotent");
+        }
+    }
+
+    printf("numa expert deterministic placement (MPOL_INTERLEAVE baseline)\n");
+    {
+        if (topology().size() < 2) {
+            printf("  skipped: needs at least 2 NUMA nodes\n");
+        } else {
+            // the loader-first-touch baseline is what collapses a 470 GB model onto one
+            // socket; a fresh allocation must now land on every node instead
+            check(set_default_interleave((int) topology().size()), "default MPOL_INTERLEAVE installed");
+            check(default_interleave_active(), "default interleave reports active");
+
+            const size_t size = 32ull << 20;
+            char * buf = (char *) malloc(size);
+            check(buf != nullptr, "32 MiB probe allocation");
+            if (buf) {
+                memset(buf, 1, size);
+
+                std::vector<int> hit((size_t) topology().size() + 1, 0);
+                int n_nodes_hit = 0;
+                for (size_t off = 0; off < size; off += 4096) {
+                    const int n = page_node(buf + off);
+                    if (n >= 0 && (size_t) n < hit.size()) {
+                        if (hit[n]++ == 0) n_nodes_hit++;
+                    }
+                }
+                check(n_nodes_hit >= 2, "interleaved pages span multiple NUMA nodes (" +
+                        std::to_string(n_nodes_hit) + " of " + std::to_string(topology().size()) + ")");
+                free(buf);
+            }
         }
     }
 

@@ -7,6 +7,7 @@ ranked DeepSeek-V4.1-Flash-1017 presets, 5-layer hierarchical TOML + 8-agent SDK
 scripts/launch.py integration, C++ common/kv-capsule-filter.h, and live HTTP Evidence Mode.
 """
 
+import contextlib
 import json
 import re
 import subprocess
@@ -41,6 +42,41 @@ def display_width(text: str) -> int:
 def run_ts_tui(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
     cmd = ["node", "--experimental-strip-types", str(TS_TUI_PATH), *args]
     return subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd), check=False)
+
+
+@contextlib.contextmanager
+def preserve_repo_configs():
+    configs_to_backup = [
+        REPO_ROOT / "scripts" / "configs" / "models.toml",
+        REPO_ROOT / "scripts" / "configs" / "hierarchy" / "instances" / "active_fleet.toml",
+        REPO_ROOT / "scripts" / "configs" / "hierarchy" / "00-defaults.toml",
+    ]
+    saved = {}
+    for p in configs_to_backup:
+        if p.exists():
+            try:
+                rel = p.relative_to(REPO_ROOT)
+                res = subprocess.run(
+                    ["git", "show", f"HEAD:{rel}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=str(REPO_ROOT),
+                )
+                saved[p] = res.stdout
+            except Exception:
+                saved[p] = p.read_text(encoding="utf-8")
+    try:
+        yield
+    finally:
+        for p, content in saved.items():
+            p.write_text(content, encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def auto_preserve_repo_configs():
+    with preserve_repo_configs():
+        yield
 
 
 def test_legacy_python_tui_deleted_and_canonical_ts_tui_present():
@@ -79,30 +115,31 @@ def test_seven_tabs_and_pi_tui_geometry_invariants():
 
 def test_presets_and_runtime_parameter_tuning_via_ts_control_plane():
     """Verify applying all 4 DeepSeek-V4.1-Flash-1017 presets and tuning parameters via ctx_capsule_tui.ts."""
-    ds_presets = [
-        "ds41-1017-np1-512k-max-speed",
-        "ds41-1017-np1-1m-extreme",
-        "ds41-1017-np4-512k-swarm",
-        "ds41-1017-np8-1m-swarm",
-    ]
-    for preset_id in ds_presets:
-        res = run_ts_tui("preset", preset_id, "--dry-run")
-        assert res.returncode == 0, f"Preset {preset_id} failed: {res.stderr}"
-        clean = strip_ansi(res.stdout)
-        assert f"[< {preset_id} >]" in clean
-        assert "[PTO Tune & Swap (p)]" in clean
+    with preserve_repo_configs():
+        ds_presets = [
+            "ds41-1017-np1-512k-max-speed",
+            "ds41-1017-np1-1m-extreme",
+            "ds41-1017-np4-512k-swarm",
+            "ds41-1017-np8-1m-swarm",
+        ]
+        for preset_id in ds_presets:
+            res = run_ts_tui("preset", preset_id, "--dry-run")
+            assert res.returncode == 0, f"Preset {preset_id} failed: {res.stderr}"
+            clean = strip_ansi(res.stdout)
+            assert f"[< {preset_id} >]" in clean
+            assert "[PTO Tune & Swap (p)]" in clean
 
-    res_tune = run_ts_tui(
-        "tune",
-        "thinking_effort=high_analytical",
-        "kv_type_k=q4_0",
-        "--dry-run",
-    )
-    assert res_tune.returncode == 0, f"Tune failed: {res_tune.stderr}"
-    assert "[< q4_0 >]" in strip_ansi(res_tune.stdout)
+        res_tune = run_ts_tui(
+            "tune",
+            "thinking_effort=high_analytical",
+            "kv_type_k=q4_0",
+            "--dry-run",
+        )
+        assert res_tune.returncode == 0, f"Tune failed: {res_tune.stderr}"
+        assert "[< q4_0 >]" in strip_ansi(res_tune.stdout)
 
-    # Restore default preset
-    run_ts_tui("preset", "coding_pinpoint", "--dry-run")
+        # Restore default preset
+        run_ts_tui("preset", "coding_pinpoint", "--dry-run")
 
 
 def test_export_toml_and_eight_agent_sdk_configs():
@@ -264,115 +301,108 @@ int main() {
 
 def test_pto_profile_runner_and_ctx_capsule_ts_integration():
     """Verify 6-stage PTO profile runner, Mode B live-daemon merge, pto_finetune.sh, and ctx_capsule_tui.ts --pto-optimize."""
-    pto_runner = REPO_ROOT / "scripts" / "pto_profile_runner.py"
-    pto_finetune = REPO_ROOT / "scripts" / "pto_finetune.sh"
-    ts_tui = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
+    with preserve_repo_configs():
+        pto_runner = REPO_ROOT / "scripts" / "pto_profile_runner.py"
+        pto_finetune = REPO_ROOT / "scripts" / "pto_finetune.sh"
+        ts_tui = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
 
-    assert pto_runner.exists()
-    assert pto_finetune.exists()
-    assert ts_tui.exists()
+        assert pto_runner.exists()
+        assert pto_finetune.exists()
+        assert ts_tui.exists()
 
-    # 1. Verify --print-pgo-flags outputs Clang-21 IRPGO, CS-IRPGO, ThinLTO, and Machine Function Splitting
-    res_flags = subprocess.run(
-        [sys.executable, str(pto_runner), "--print-pgo-flags"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_flags.returncode == 0
-    assert "GGML_PTO_MODE=GENERATE" in res_flags.stdout
-    assert "GGML_PTO_MODE=CS_GENERATE" in res_flags.stdout
-    assert "GGML_THINLTO=ON" in res_flags.stdout
-    assert "GGML_SPLIT_MACHINE_FUNCTIONS=ON" in res_flags.stdout
-    assert "GGML_NCCL=OFF" in res_flags.stdout
+        # 1. Verify --print-pgo-flags outputs Clang-21 IRPGO, CS-IRPGO, ThinLTO, and Machine Function Splitting
+        res_flags = subprocess.run(
+            [sys.executable, str(pto_runner), "--print-pgo-flags"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_flags.returncode == 0
+        assert "GGML_PTO_MODE=GENERATE" in res_flags.stdout
+        assert "GGML_PTO_MODE=CS_GENERATE" in res_flags.stdout
+        assert "GGML_THINLTO=ON" in res_flags.stdout
+        assert "GGML_SPLIT_MACHINE_FUNCTIONS=ON" in res_flags.stdout
+        assert "GGML_NCCL=OFF" in res_flags.stdout
 
-    # 2. Verify 6-stage synthetic sweep dry-run uses production env defaults (GGML_CUDA_NO_PINNED=0, -t 56)
-    res_dry = subprocess.run(
-        [sys.executable, str(pto_runner), "--dry-run"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_dry.returncode == 0, f"pto_profile_runner --dry-run failed: {res_dry.stderr}"
-    assert "GGML_CUDA_NO_PINNED=0" in res_dry.stdout
-    assert "Stage 1/6:" in res_dry.stdout
-    assert "Stage 5/6: Live llama-server Multi-Slot HTTP" in res_dry.stdout
-    assert "Stage 6/6: llama-bench GEMM / FlashAttention / MoE Microbenchmark" in res_dry.stdout
-    assert "llvm-profdata" in res_dry.stdout
+        # 2. Verify 6-stage synthetic sweep dry-run uses production env defaults (GGML_CUDA_NO_PINNED=0, -t 56)
+        res_dry = subprocess.run(
+            [sys.executable, str(pto_runner), "--dry-run"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_dry.returncode == 0, f"pto_profile_runner --dry-run failed: {res_dry.stderr}"
+        assert "GGML_CUDA_NO_PINNED=0" in res_dry.stdout
+        assert "Stage 1/6:" in res_dry.stdout
+        assert "Stage 5/6: Live llama-server Multi-Slot HTTP" in res_dry.stdout
+        assert "Stage 6/6: llama-bench GEMM / FlashAttention / MoE Microbenchmark" in res_dry.stdout
+        assert "llvm-profdata" in res_dry.stdout
 
-    # 3. Verify Mode B (--live-daemon-merge) dry-run
-    res_merge = subprocess.run(
-        [sys.executable, str(pto_runner), "--live-daemon-merge", "--dry-run"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_merge.returncode == 0
-    assert "PTO MODE B: CONTINUOUS LIVE-DAEMON TRACE MERGE" in res_merge.stdout
+        # 3. Verify Mode B (--live-daemon-merge) dry-run
+        res_merge = subprocess.run(
+            [sys.executable, str(pto_runner), "--live-daemon-merge", "--dry-run"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_merge.returncode == 0
+        assert "PTO MODE B: CONTINUOUS LIVE-DAEMON TRACE MERGE" in res_merge.stdout
 
-    # 4. Verify scripts/pto_finetune.sh --dry-run routes through scripts/build-guard.sh
-    res_sh = subprocess.run(
-        [str(pto_finetune), "--pto=use", "--shared-libs", "--compiler=clang-21", "--dry-run"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_sh.returncode == 0, f"pto_finetune.sh failed: {res_sh.stderr}"
-    assert "scripts/build-guard.sh" in res_sh.stdout
-    assert "-DGGML_NCCL=OFF" in res_sh.stdout
-    assert "-DGGML_THINLTO=ON" in res_sh.stdout
-    assert "-DGGML_SPLIT_MACHINE_FUNCTIONS=ON" in res_sh.stdout
-    assert "-DBUILD_SHARED_LIBS=ON" in res_sh.stdout
+        # 4. Verify scripts/pto_finetune.sh --dry-run routes through scripts/build-guard.sh
+        res_sh = subprocess.run(
+            [str(pto_finetune), "--pto=use", "--shared-libs", "--compiler=clang-21", "--dry-run"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_sh.returncode == 0, f"pto_finetune.sh failed: {res_sh.stderr}"
+        assert "scripts/build-guard.sh" in res_sh.stdout
+        assert "-DGGML_NCCL=OFF" in res_sh.stdout
+        assert "-DGGML_THINLTO=ON" in res_sh.stdout
+        assert "-DGGML_SPLIT_MACHINE_FUNCTIONS=ON" in res_sh.stdout
+        assert "-DBUILD_SHARED_LIBS=ON" in res_sh.stdout
 
-    # 5. Verify tools/ctx-capsule/ctx_capsule_tui.ts --pto-optimize and --export-toml
-    res_pto_only = subprocess.run(
-        [
-            "node",
-            "--experimental-strip-types",
-            str(ts_tui),
-            "--pto-optimize",
-            "cs_irpgo_2stage",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_pto_only.returncode == 0, f"ctx_capsule_tui.ts --pto-optimize failed: {res_pto_only.stderr}"
-    clean_pto_only = strip_ansi(res_pto_only.stdout)
-    assert "STATUS: PTO Fine-Tuned (cs_irpgo_2stage via clang21_lld_znver3)" in clean_pto_only
-    assert "ik_llama_pto_lto" in clean_pto_only
+        # 5. Verify tools/ctx-capsule/ctx_capsule_tui.ts --pto-optimize and --export-toml
+        res_pto_only = subprocess.run(
+            [
+                "node",
+                "--experimental-strip-types",
+                str(ts_tui),
+                "--pto-optimize",
+                "cs_irpgo_2stage",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_pto_only.returncode == 0, f"ctx_capsule_tui.ts --pto-optimize failed: {res_pto_only.stderr}"
+        clean_pto_only = strip_ansi(res_pto_only.stdout)
+        assert "STATUS: PTO Fine-Tuned (cs_irpgo_2stage via clang21_lld_znver3)" in clean_pto_only
+        assert "ik_llama_pto_lto" in clean_pto_only
 
-    res_ts = subprocess.run(
-        [
-            "node",
-            "--experimental-strip-types",
-            str(ts_tui),
-            "--pto-optimize",
-            "cs_irpgo_2stage",
-            "--export-toml",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res_ts.returncode == 0, f"ctx_capsule_tui.ts failed: {res_ts.stderr}"
-    clean_ts = strip_ansi(res_ts.stdout)
-    assert "[capsule.pto.trace_and_optimize]" in clean_ts
-    assert "[PTO Tune & Swap (p)]" in clean_ts
-    defaults_toml = (REPO_ROOT / "scripts" / "configs" / "hierarchy" / "00-defaults.toml").read_text(encoding="utf-8")
-    assert "[pto]" in defaults_toml
-    assert 'pto_mode = "irpgo_thinlto_split"' in defaults_toml
-    models_toml = (REPO_ROOT / "scripts" / "configs" / "models.toml").read_text(encoding="utf-8")
-    assert "[pto]" in models_toml
-    assert 'pto_mode = "cs_irpgo_2stage"' in models_toml
-
-    # Restore default TOML bundle
-    subprocess.run(
-        ["node", "--experimental-strip-types", str(ts_tui), "--export-toml"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        res_ts = subprocess.run(
+            [
+                "node",
+                "--experimental-strip-types",
+                str(ts_tui),
+                "--pto-optimize",
+                "cs_irpgo_2stage",
+                "--export-toml",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_ts.returncode == 0, f"ctx_capsule_tui.ts failed: {res_ts.stderr}"
+        clean_ts = strip_ansi(res_ts.stdout)
+        assert "[capsule.pto.trace_and_optimize]" in clean_ts
+        assert "[PTO Tune & Swap (p)]" in clean_ts
+        defaults_toml = (REPO_ROOT / "scripts" / "configs" / "hierarchy" / "00-defaults.toml").read_text(encoding="utf-8")
+        assert "[pto]" in defaults_toml
+        assert 'pto_mode = "irpgo_thinlto_split"' in defaults_toml
+        models_toml = (REPO_ROOT / "scripts" / "configs" / "models.toml").read_text(encoding="utf-8")
+        assert "[pto]" in models_toml
+        assert 'pto_mode = "cs_irpgo_2stage"' in models_toml
 
 
 def test_live_http_server_evidence_handshake_chat_and_completions():
@@ -566,55 +596,56 @@ def test_live_http_server_evidence_handshake_chat_and_completions():
 
 
 def test_launch_py_all_models_and_profiles_dry_run_and_idempotent_export():
-    import tomllib
-    tui_script = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
-    launch_script = REPO_ROOT / "scripts" / "launch.py"
+    with preserve_repo_configs():
+        import tomllib
+        tui_script = REPO_ROOT / "tools" / "ctx-capsule" / "ctx_capsule_tui.ts"
+        launch_script = REPO_ROOT / "scripts" / "launch.py"
 
-    # 1. Run --export-toml 3 times consecutively and verify tomllib.loads parses scripts/configs/models.toml with zero duplicate key errors
-    for _ in range(3):
-        res = subprocess.run(["node", "--experimental-strip-types", str(tui_script), "--export-toml"], capture_output=True, text=True, cwd=str(REPO_ROOT))
-        assert res.returncode == 0, f"Export toml failed: {res.stderr}"
+        # 1. Run --export-toml 3 times consecutively and verify tomllib.loads parses scripts/configs/models.toml with zero duplicate key errors
+        for _ in range(3):
+            res = subprocess.run(["node", "--experimental-strip-types", str(tui_script), "--export-toml"], capture_output=True, text=True, cwd=str(REPO_ROOT))
+            assert res.returncode == 0, f"Export toml failed: {res.stderr}"
 
-    models_toml = REPO_ROOT / "scripts" / "configs" / "models.toml"
-    assert models_toml.exists()
-    cfg_text = models_toml.read_text(encoding="utf-8")
-    cfg = tomllib.loads(cfg_text)
+        models_toml = REPO_ROOT / "scripts" / "configs" / "models.toml"
+        assert models_toml.exists()
+        cfg_text = models_toml.read_text(encoding="utf-8")
+        cfg = tomllib.loads(cfg_text)
 
-    assert "models" in cfg
-    assert "profiles" in cfg
+        assert "models" in cfg
+        assert "profiles" in cfg
 
-    # 2. Run python3 scripts/launch.py <key> --dry-run for EVERY model in cfg["models"] and EVERY profile in cfg["profiles"]
-    all_keys = list(cfg["models"].keys()) + list(cfg["profiles"].keys())
-    for required_prof in ["ds41-1017-np1-512k-max-speed", "ds41-1017-np1-1m-extreme", "ds41-1017-np4-512k-swarm", "ds41-1017-np8-1m-swarm"]:
-        if required_prof not in all_keys:
-            all_keys.append(required_prof)
+        # 2. Run python3 scripts/launch.py <key> --dry-run for EVERY model in cfg["models"] and EVERY profile in cfg["profiles"]
+        all_keys = list(cfg["models"].keys()) + list(cfg["profiles"].keys())
+        for required_prof in ["ds41-1017-np1-512k-max-speed", "ds41-1017-np1-1m-extreme", "ds41-1017-np4-512k-swarm", "ds41-1017-np8-1m-swarm"]:
+            if required_prof not in all_keys:
+                all_keys.append(required_prof)
 
-    for key in all_keys:
-        res = subprocess.run([sys.executable, str(launch_script), key, "--dry-run"], capture_output=True, text=True, cwd=str(REPO_ROOT))
-        assert res.returncode == 0, f"Launch dry-run failed for key '{key}': stdout={res.stdout}, stderr={res.stderr}"
+        for key in all_keys:
+            res = subprocess.run([sys.executable, str(launch_script), key, "--dry-run"], capture_output=True, text=True, cwd=str(REPO_ROOT))
+            assert res.returncode == 0, f"Launch dry-run failed for key '{key}': stdout={res.stdout}, stderr={res.stderr}"
 
-    # 3. Verify --profile combination and --engram-resident / --spec-verify-pinned emission
-    combo = subprocess.run(
-        [
-            sys.executable,
-            str(launch_script),
-            "deepseek-v4.1-1017-ud-q4kxl",
-            "--profile",
-            "ds41-1017-np4-512k-swarm",
-            "--engram-resident",
-            "--spec-verify-pinned",
-            "--dry-run",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-    )
-    assert combo.returncode == 0, f"Combo dry-run failed: {combo.stderr}"
-    assert "-np 4" in combo.stdout
-    assert "-c 524288" in combo.stdout
-    assert "--swa-compress" in combo.stdout
-    assert "--engram-resident" in combo.stdout
-    assert "--spec-verify-pinned" in combo.stdout
+        # 3. Verify --profile combination and --engram-resident / --spec-verify-pinned emission
+        combo = subprocess.run(
+            [
+                sys.executable,
+                str(launch_script),
+                "deepseek-v4.1-1017-ud-q4kxl",
+                "--profile",
+                "ds41-1017-np4-512k-swarm",
+                "--engram-resident",
+                "--spec-verify-pinned",
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        assert combo.returncode == 0, f"Combo dry-run failed: {combo.stderr}"
+        assert "-np 4" in combo.stdout
+        assert "-c 524288" in combo.stdout
+        assert "--swa-compress" in combo.stdout
+        assert "--engram-resident" in combo.stdout
+        assert "--spec-verify-pinned" in combo.stdout
 
 
 def test_playwright_tui_devtools_screencast_and_inline_graphics_audit():

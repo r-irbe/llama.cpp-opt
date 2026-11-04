@@ -338,6 +338,7 @@ private:
 } // namespace llama
 
 namespace common {
+using llama::memory::INVALID_SLAB_ID;
 using llama::memory::SlabMemoryTier;
 using llama::memory::SlabDescriptor;
 using llama::memory::SlabHandle;

@@ -1260,6 +1260,68 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return 0.5f * helper.f * __low2float(bq8_1->ds) * (sumi.x + sumi.y);
 }
 
+#define VDR_MXFP8_Q8_0_MMVQ 2
+#define VDR_MXFP8_Q8_1_MMVQ 2
+
+// Full-block dot product of block_mxfp8 with block_q8_0:
+// Scaled shared exponent 2^(e - 127) applied directly in registers to unscaled dot product sum.
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_0(
+    const block_mxfp8 * __restrict__ x, const block_q8_0 * __restrict__ y) {
+
+    const float d = x->e == 0xFF ? __int_as_float(0x7FC00000u) : (x->e == 0 ? 0x1p-127f : __int_as_float((uint32_t) x->e << 23u));
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < QK_MXFP8; ++j) {
+        sum += ggml_cuda_e4m3_to_fp32(x->qs[j]) * (float) y->qs[j];
+    }
+    return sum * d * __half2float(y->d);
+}
+
+// Chunked vec_dot of block_mxfp8 with block_q8_0 for MMVQ:
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_0(
+    const void * __restrict__ vbq, const block_q8_0 * __restrict__ bq8_0, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bx = (const block_mxfp8 *) vbq + kbx;
+    const block_q8_0  * by = bq8_0 + kbx;
+
+    const float d = bx->e == 0xFF ? __int_as_float(0x7FC00000u) : (bx->e == 0 ? 0x1p-127f : __int_as_float((uint32_t) bx->e << 23u));
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP8_Q8_0_MMVQ; ++l) {
+        const int idx = (iqs + l) * 4;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sum += ggml_cuda_e4m3_to_fp32(bx->qs[idx + k]) * (float) by->qs[idx + k];
+        }
+    }
+    return sum * d * __half2float(by->d);
+}
+
+// Chunked vec_dot of block_mxfp8 with block_q8_1 for MMVQ:
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bx = (const block_mxfp8 *) vbq + kbx;
+
+    const float d = bx->e == 0xFF ? __int_as_float(0x7FC00000u) : (bx->e == 0 ? 0x1p-127f : __int_as_float((uint32_t) bx->e << 23u));
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP8_Q8_1_MMVQ; ++l) {
+        const int idx = (iqs + l) * 4;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sum += ggml_cuda_e4m3_to_fp32(bx->qs[idx + k]) * (float) bq8_1->qs[idx + k];
+        }
+    }
+    return sum * d * __low2float(bq8_1->ds);
+}
+
+// Overload taking (const void *, const block_q8_1 *, int, int) so vec_dot_mxfp8_q8_0 matches vec_dot_q_cuda_t signature:
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_0(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_mxfp8_q8_1(vbq, bq8_1, kbx, iqs);
+}
+
 #define VDR_IQ4_XS_Q8_1_MMVQ 4
 #define VDR_IQ4_XS_Q8_1_MMQ  4
 

@@ -588,6 +588,9 @@ struct gpt_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    std::string slab_arbiter_shm = "";
+    int32_t     slab_priority    = 100;
+
     // Cohort Prompt Prefix Sharing (PPS)
     bool    cohort_prefix_sharing   = false; // enable cohort-aware prompt prefix sharing
     int32_t cohort_min_prefix       = 64;    // minimum prefix tokens required to trigger sharing

@@ -4982,7 +4982,7 @@ void vec_dot_mxfp8_q8_0(int n, float * s, size_t bs, const void * vx, size_t bx,
 
 void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_K, vy, 0, s, 0, 0, 1)) {
+    if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_2_X4, vy, 0, s, 0, 0, 1)) {
         return;
     }
 #endif
@@ -4991,32 +4991,20 @@ void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
-    //const block_mxfp4 * x = (const block_mxfp4 *)vx;
-    //const block_q8_K  * y = (const block_q8_K    *)vy;
-    //int nblock = n/QK_MXFP4;
-    //float sumf = 0;
-    //for (int ibl = 0; ibl < nblock; ++ibl) {
-    //    //int sumi = 0;
-    //    auto qy = y[ibl].qs;
-    //    auto qx = x[ibl].qs;
-    //    float db = d * y[ibl].d;
-    //    for (int ib = 0; ib < QK_K/kBlockSize; ++ib) {
-    //        float dl = db * ((x[ibl].scales[ib] & 254) - 127);
-    //        //int ls = (x[ibl].scales[ib] & 254) - 127;
-    //        const int8_t * values = iq4k_values + ((x[ibl].scales[ib] & 1) << 4);
-    //        int suml = 0;
-    //        for (int j = 0; j < kBlockSize/2; ++j) {
-    //            suml += qy[j               ] * values[qx[j] & 0xf]
-    //                  + qy[j + kBlockSize/2] * values[qx[j] >>  4];
-    //        }
-    //        sumf += dl * suml;
-    //        //sumi += ls * suml;
-    //        qy += kBlockSize;
-    //        qx += kBlockSize/2;
-    //    }
-    //    //sumf += d * y[ibl].d * sumi;
-    //}
-    //*s = sumf;
+    const block_mxfp4 * x = (const block_mxfp4 *)vx;
+    const block_q8_0  * y = (const block_q8_0   *)vy;
+    int nblock = n/QK_MXFP4;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nblock; ++ib) {
+        float d = GGML_E8M0_TO_FP32_HALF(x[ib].e) * GGML_FP16_TO_FP32(y[ib].d);
+        float sumi = 0.0f;
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            sumi += kvalues_mxfp4[x[ib].qs[j] & 0xf] * (float)y[ib].qs[j]
+                  + kvalues_mxfp4[x[ib].qs[j] >>  4] * (float)y[ib].qs[j + QK_MXFP4/2];
+        }
+        sumf += d * sumi;
+    }
+    *s = sumf;
 }
 
 void quantize_row_mxfp4_r8_ref(const float * x, block_mxfp4_r8 * y, int64_t k) {
@@ -9336,11 +9324,20 @@ void vec_dot_q8_KV_q8_KV(int n, float * s, size_t bs, const void * vx, size_t bx
         return;
     }
 #endif
-    GGML_ASSERT(n%QK4_NL == 0);
+    GGML_ASSERT(n%32 == 0);
     GGML_ASSERT(nrc == 1);
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
+    auto dx = (const float *)vx;
+    auto dy = (const float *)vy;
+    auto x = (const int8_t *)(dx + 2);
+    auto y = (const int8_t *)(dy + 2);
+    int64_t sum = 0;
+    for (int j = 0; j < n; ++j) {
+        sum += (int32_t)x[j] * (int32_t)y[j];
+    }
+    *s = dx[0] * dy[0] * (float)sum;
 }
 
 

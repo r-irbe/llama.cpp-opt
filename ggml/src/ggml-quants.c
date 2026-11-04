@@ -5645,8 +5645,22 @@ void ggml_vec_dot_q6_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         return;
     }
 #endif
-    // TODO
-    *s = 0;
+    const block_q6_0 * restrict x = (const block_q6_0 *)vx;
+    const block_q8_0 * restrict y = (const block_q8_0 *)vy;
+    const int nb = n / QK6_0;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d);
+        int32_t sumi = 0;
+        for (int j = 0; j < QK6_0/2; ++j) {
+            const uint8_t h = x[i].qh[j%(QK6_0/4)] >> 4*(j/(QK6_0/4));
+            const int32_t x0 = ((x[i].qs[j] & 0x0F) | ((h << 4) & 0x30)) - 32;
+            const int32_t x1 = ((x[i].qs[j] >>   4) | ((h << 2) & 0x30)) - 32;
+            sumi += x0 * y[i].qs[j] + x1 * y[i].qs[j + QK6_0/2];
+        }
+        sumf += d * sumi;
+    }
+    *s = sumf;
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
@@ -15877,8 +15891,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I2_S:
         case GGML_TYPE_PQ2_0:
         case GGML_TYPE_PTQ1_0:
-        case GGML_TYPE_PQ2_0_R8: break;
-        case GGML_TYPE_PTQ1_0_R8: break;
+        case GGML_TYPE_PQ2_0_R8:
+        case GGML_TYPE_PTQ1_0_R8:
             // nothing to validate
             break;
         default:

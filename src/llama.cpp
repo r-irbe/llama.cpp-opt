@@ -5789,13 +5789,15 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                         if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_down_exps, n_nodes)) bound_count++;
                     }
                 }
-                LLAMA_LOG_INFO("%s: bound %d routed MoE expert tensors across %d NUMA nodes (strategy expert)\n", __func__, bound_count, n_nodes);
+                if (ggml::cpu::numa::default_interleave_active()) {
+                    LLAMA_LOG_INFO("%s: per-expert mbind succeeded on %d routed MoE expert tensors across %d NUMA nodes; "
+                            "the rest stay on the MPOL_INTERLEAVE baseline (strategy expert)\n",
+                            __func__, bound_count, n_nodes);
+                } else {
+                    LLAMA_LOG_INFO("%s: bound %d routed MoE expert tensors across %d NUMA nodes (strategy expert)\n",
+                            __func__, bound_count, n_nodes);
+                }
             }
-        }
-
-        if (ggml_is_numa() && ggml_numa_get_affinity() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
-            const int n_nodes = (int) ggml::cpu::numa::topology().size();
-            LLAMA_LOG_INFO("%s: verified per-node tensor placement and worker affinity across %d NUMA nodes (strategy distribute)\n", __func__, n_nodes);
         }
 
         // ---- engram-resident: interleave + THP + parallel prefault of the per-layer token table ----
@@ -9141,6 +9143,7 @@ struct llama_model_params llama_model_default_params() {
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
         /*.defer_ple                   =*/ false,
+        /*.engram_resident             =*/ false,
         /*.swa_compress                =*/ false,
     };
 
@@ -9356,6 +9359,36 @@ static void llama_numa_cuda_pinning_gate(enum ggml_numa_strategy numa) {
 #endif
 }
 
+// The loader's first touch decides where host weights land unless a memory policy says
+// otherwise. On a dual-socket box that is not a detail: measured with 470 GB of
+// CPU-resident experts on 2xEPYC (NPS4), first-touch placement collapsed to 146 GiB /
+// 324 GiB between the two sockets, only one socket's memory channels carried the expert
+// gathers, and decode throughput fell from 17.1 to 10.5 tok/s (-39%). Installing
+// MPOL_INTERLEAVE over all nodes before the load makes placement deterministic and even
+// (58.7 GiB per node) and also gives every refused per-expert mbind(MPOL_BIND) a sane
+// policy to fall back to instead of MPOL_PREFERRED. GGML_NUMA_INTERLEAVE=0 opts out.
+static bool llama_numa_install_interleave(size_t n_nodes, const char * what) {
+    const char * env = getenv("GGML_NUMA_INTERLEAVE");
+    if (env && (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 ||
+                strcmp(env, "false") == 0 || strcmp(env, "no") == 0)) {
+        LLAMA_LOG_WARN("%s: GGML_NUMA_INTERLEAVE=%s: --numa %s keeps loader first-touch page placement "
+                "(may collapse onto one socket)\n", __func__, env, what);
+        return false;
+    }
+    if (n_nodes < 2) {
+        return false;
+    }
+    if (!ggml::cpu::numa::set_default_interleave((int) n_nodes)) {
+        LLAMA_LOG_WARN("%s: --numa %s could not install MPOL_INTERLEAVE (set_mempolicy refused); "
+                "page placement falls back to loader first touch\n", __func__, what);
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: --numa %s installed MPOL_INTERLEAVE across %zu NUMA nodes: host weights are "
+            "placed page-round-robin instead of loader first-touch (GGML_NUMA_INTERLEAVE=0 opts out)\n",
+            __func__, what, n_nodes);
+    return true;
+}
+
 enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
     if (numa == GGML_NUMA_STRATEGY_DISABLED) {
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
@@ -9373,7 +9406,9 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
 
         ggml::cpu::numa::set_numa_expert(true);
         ggml_numa_init(numa);
-        LLAMA_LOG_INFO("%s: --numa expert enabled with %zu nodes; routed MoE tensors will be bound across NUMA nodes\n",
+        llama_numa_install_interleave(topo.size(), "expert");
+        LLAMA_LOG_INFO("%s: --numa expert enabled with %zu nodes; routed MoE expert slices are additionally "
+                "mbind(MPOL_BIND)'d per expert where the kernel allows migration\n",
                 __func__, topo.size());
         return LLAMA_NUMA_INIT_STATUS_SUCCESS;
     }
@@ -9386,6 +9421,11 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
                                 : (numa == GGML_NUMA_STRATEGY_NUMACTL)    ? "numactl"
                                 : (numa == GGML_NUMA_STRATEGY_MIRROR)     ? "mirror"
                                 : "custom";
+        if (numa == GGML_NUMA_STRATEGY_DISTRIBUTE) {
+            // distribute used to log "verified per-node tensor placement" while only
+            // binding worker threads; actually place the pages now
+            llama_numa_install_interleave(topo.size(), strat_name);
+        }
         LLAMA_LOG_INFO("%s: --numa %s enabled across %zu NUMA nodes\n", __func__, strat_name, topo.size());
     }
     return LLAMA_NUMA_INIT_STATUS_SUCCESS;
@@ -10602,6 +10642,10 @@ uint32_t llama_n_batch(const struct llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const struct llama_context * ctx) {
     return ctx->cparams.n_ubatch;
+}
+
+void llama_set_n_ubatch(struct llama_context * ctx, uint32_t n_ubatch) {
+    ctx->cparams.n_ubatch = n_ubatch;
 }
 
 uint32_t llama_n_seq_max(const struct llama_context * ctx) {

@@ -16,6 +16,21 @@ namespace ggml::cpu::numa {
 // Bind individual expert slices within a 3D tensor to NUMA nodes round-robin via mbind(MPOL_BIND)
 bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nodes);
 
+// Install a process-wide default memory policy, set_mempolicy(MPOL_INTERLEAVE), over the
+// given number of nodes. Every allocation made by this thread from now on -- and by every
+// thread it creates afterwards -- is then spread page-round-robin across those nodes.
+//
+// This is the deterministic baseline placement for CPU-resident weights: without it, page
+// placement is whatever the loader's first touch happened to produce, which on a dual
+// socket box can collapse most of the model onto one socket and cost ~40% of decode
+// throughput (measured: TG 10.5 -> 17.1 tok/s on 2xEPYC NPS4 with 470 GB of weights).
+// Per-expert binding (above) is an optional upgrade attempted on top of this baseline.
+// Returns false when NUMA is unusable, the syscall is refused, or fewer than 2 nodes.
+bool set_default_interleave(int n_nodes);
+
+// whether set_default_interleave() installed a process-wide policy
+bool default_interleave_active();
+
 struct node {
     int id = -1;
     int socket_id = -1;           // physical package/socket ID from /sys/devices/system/cpu/cpu*/topology/physical_package_id
@@ -105,6 +120,11 @@ bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx);
 
 // C-compatible wrapper for binding expert tensor slices round-robin to NUMA nodes
 bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes);
+
+// C-compatible wrapper for installing the process-wide MPOL_INTERLEAVE default policy
+// (deterministic even placement of host tensors across NUMA nodes)
+bool ggml_cpu_numa_set_default_interleave(int n_numa_nodes);
+bool ggml_cpu_numa_default_interleave_active(void);
 
 // C-compatible wrapper for interleaving shared tensor pages across NUMA nodes
 bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_nodes);

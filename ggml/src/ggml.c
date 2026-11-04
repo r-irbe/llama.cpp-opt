@@ -21350,6 +21350,8 @@ static void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_0_R8:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_MXFP4_R8:
+        case GGML_TYPE_MXFP8:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_KS:
         case GGML_TYPE_IQ4_KS_R4:
