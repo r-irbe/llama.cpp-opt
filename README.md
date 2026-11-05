@@ -17,6 +17,8 @@ Most local AI tools hit a wall as soon as you move past a basic chat prompt: the
 3. **Run multi-agent workflows up to 22x faster**: When multiple coding agents or team members work on the same project prompt, the server processes the shared instructions once instead of repeating the work for every request.
 4. **Skip manual flag tuning**: Built-in hardware inspection and auto-tuning tools detect your CPU, RAM, and GPU layout and pick the fastest settings automatically.
 
+![How llama.cpp-opt Works: From One Model File to Any Hardware Setup](docs/assets/architecture-overview.png)
+
 > **Looking for the deep technical architecture, benchmark tables, or upstream release history?**
 > - [**User & Operations Guide (`docs/USER_GUIDE.md`)**](docs/USER_GUIDE.md) -- All CLI flags, tools, and operational recipes.
 > - [**Architecture & Benchmark Synthesis (`docs/ARCHITECTURE_AND_BENCHMARK_SYNTHESIS.md`)**](docs/ARCHITECTURE_AND_BENCHMARK_SYNTHESIS.md) -- Hardware test results, memory designs, and formal verification details.
@@ -108,6 +110,8 @@ python3 scripts/launch.py --model models/starter-model-ggufx.gguf --capsule
 
 ## Adapt to Your Use Case (Customer Journeys)
 
+![What You Gain Across Four Real-World Customer Journeys](docs/assets/customer-journeys-impact.png)
+
 Choose the scenario below that best matches what you are building or solving. Click any journey to see the recommended setup and ready-to-run command.
 
 <details open>
@@ -182,7 +186,13 @@ python3 scripts/launch.py \
 All optimizations are tested on real models and hardware with automated quality checks to ensure output accuracy matches standard baselines.
 
 <details>
-<summary><b>View summary of measured speedups and memory savings</b></summary>
+<summary><b>How does it work under the hood? (Visual guide to shared prefixes & 1M context compression)</b></summary>
+
+![How llama.cpp-opt Eliminates Redundant Work & Memory Bottlenecks](docs/assets/memory-and-prefix-sharing.png)
+</details>
+
+<details>
+<summary><b>View summary table of measured speedups and memory savings</b></summary>
 
 | What You Are Doing | Standard Baseline | With `llama.cpp-opt` | Practical Benefit |
 | :--- | :--- | :--- | :--- |
