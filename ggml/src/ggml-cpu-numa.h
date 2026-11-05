@@ -31,6 +31,10 @@ bool set_default_interleave(int n_nodes);
 // whether set_default_interleave() installed a process-wide policy
 bool default_interleave_active();
 
+// Collapse one host-resident tensor into 2 MiB pages (MADV_HUGEPAGE + MADV_COLLAPSE).
+// Returns the number of bytes the kernel accepted (0 when nothing was done).
+size_t collapse_tensor_hugepages(struct ggml_tensor * tensor);
+
 struct node {
     int id = -1;
     int socket_id = -1;           // physical package/socket ID from /sys/devices/system/cpu/cpu*/topology/physical_package_id
@@ -124,6 +128,9 @@ bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_n
 // C-compatible wrapper for installing the process-wide MPOL_INTERLEAVE default policy
 // (deterministic even placement of host tensors across NUMA nodes)
 bool ggml_cpu_numa_set_default_interleave(int n_numa_nodes);
+
+// C-compatible wrapper for collapsing a host tensor into 2 MiB pages (MADV_COLLAPSE)
+size_t ggml_cpu_numa_collapse_tensor_hugepages(struct ggml_tensor * tensor);
 bool ggml_cpu_numa_default_interleave_active(void);
 
 // C-compatible wrapper for interleaving shared tensor pages across NUMA nodes

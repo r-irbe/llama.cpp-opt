@@ -51,6 +51,11 @@ namespace fs = std::filesystem;
 #ifndef MPOL_MF_MOVE
 #define MPOL_MF_MOVE 2
 #endif
+// from linux/mman.h (6.1+): synchronous huge page collapse; unlike MADV_HUGEPAGE
+// it also works when /sys/kernel/mm/transparent_hugepage/enabled is "never"
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
 #endif
 
 namespace ggml::cpu::numa {
@@ -1117,6 +1122,43 @@ size_t prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes
 #endif
 }
 
+// Collapse a host-resident tensor into 2 MiB pages.
+//
+// Decode gathers walk a 470 GB working set in 8 MiB expert slices; with 4 KiB
+// pages the L2 TLB of a Zen 3 core covers ~12 MiB of mapping, so the walk is a
+// continuous TLB miss stream. khugepaged is not an option on this class of box
+// (/sys/kernel/mm/transparent_hugepage/enabled is often forced to "never" by a
+// post-boot unit), but MADV_COLLAPSE is synchronous and ignores that knob
+// (verified: 99% of a 256 MiB probe became huge pages with THP=never).
+// Returns the number of bytes handed to the kernel (0 when nothing to do).
+size_t collapse_tensor_hugepages(struct ggml_tensor * tensor) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data) {
+        return 0;
+    }
+
+    const uintptr_t page_mask  = ~(uintptr_t) 4095;
+    const uintptr_t start_addr = (uintptr_t) tensor->data;
+    const size_t    total      = ggml_nbytes(tensor);
+    const uintptr_t page_start = start_addr & page_mask;
+    const uintptr_t page_end   = (start_addr + total + 4095ULL) & page_mask;
+    const size_t    len        = page_end - page_start;
+    if (len < (2u << 20)) {
+        return 0; // below one huge page, nothing can collapse
+    }
+
+    // hint first so khugepaged would also pick it up where it is enabled
+    madvise((void *) page_start, len, MADV_HUGEPAGE);
+    if (madvise((void *) page_start, len, MADV_COLLAPSE) != 0) {
+        return 0;
+    }
+    return len;
+#else
+    (void) tensor;
+    return 0;
+#endif
+}
+
 bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes) {
 #if defined(__gnu_linux__)
     if (!tensor || !tensor->data || n_numa_nodes <= 1) {
@@ -1222,6 +1264,11 @@ bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_n
 
 bool ggml_cpu_numa_set_default_interleave(int n_numa_nodes) {
     return ggml::cpu::numa::set_default_interleave(n_numa_nodes);
+}
+
+// collapse a host-resident tensor into 2 MiB pages (MADV_COLLAPSE, works with THP=never)
+size_t ggml_cpu_numa_collapse_tensor_hugepages(struct ggml_tensor * tensor) {
+    return ggml::cpu::numa::collapse_tensor_hugepages(tensor);
 }
 
 bool ggml_cpu_numa_default_interleave_active(void) {

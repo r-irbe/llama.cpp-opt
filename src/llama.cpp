@@ -5790,6 +5790,61 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             if (!attempt_bind) {
                 LLAMA_LOG_INFO("%s: routed MoE experts stay page-striped on the MPOL_INTERLEAVE baseline "
                         "(set GGML_NUMA_EXPERT_BIND=1 to bind each expert slice to one node instead)\n", __func__);
+
+                // 470 GB walked in 8 MiB slices with 4 KiB pages is a TLB miss stream, but
+                // collapsing to 2 MiB pages makes the interleave granularity 2 MiB and the
+                // allocator cannot spread huge pages as evenly as 4 KiB ones: measured
+                // 12.77 tok/s with collapse vs 16.97 without (placement re-skewed to
+                // n7=0.2 GiB / n1=88 GiB). Opt-in only, GGML_NUMA_HUGEPAGES=1.
+                const char * hp_env = getenv("GGML_NUMA_HUGEPAGES");
+                const bool want_hugepages = hp_env && (strcmp(hp_env, "1") == 0 || strcmp(hp_env, "true") == 0 ||
+                                                       strcmp(hp_env, "yes") == 0 || strcmp(hp_env, "on") == 0);
+                if (want_hugepages) {
+                    std::vector<ggml_tensor *> cand;
+                    auto add = [&cand](ggml_tensor * t) {
+                        if (t && t->data && ggml_backend_buffer_is_host(t->buffer) && ggml_nbytes(t) >= (2u << 20)) {
+                            cand.push_back(t);
+                        }
+                    };
+                    add(model.tok_embd_per_layer);
+                    for (auto & layer : model.layers) {
+                        add(layer.engram_embd);
+                        add(layer.ffn_gate_exps);
+                        add(layer.ffn_up_exps);
+                        add(layer.ffn_down_exps);
+                        add(layer.ffn_gate_shexp);
+                        add(layer.ffn_up_shexp);
+                        add(layer.ffn_down_shexp);
+                    }
+                    if (!cand.empty()) {
+                        const int n_workers = std::min<int>(16, std::max<int>(1, (int) std::thread::hardware_concurrency() / 8));
+                        std::atomic<size_t> next{0};
+                        std::atomic<size_t> collapsed{0};
+                        auto t0 = ggml_time_us();
+                        std::vector<std::thread> pool;
+                        pool.reserve(n_workers);
+                        for (int w = 0; w < n_workers; ++w) {
+                            pool.emplace_back([&] {
+                                for (;;) {
+                                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                                    if (i >= cand.size()) break;
+                                    collapsed.fetch_add(ggml_cpu_numa_collapse_tensor_hugepages(cand[i]),
+                                                        std::memory_order_relaxed);
+                                }
+                            });
+                        }
+                        for (auto & th : pool) th.join();
+                        const double secs = 1e-6 * (ggml_time_us() - t0);
+                        if (collapsed.load() > 0) {
+                            LLAMA_LOG_INFO("%s: collapsed %.2f GiB of CPU-resident weights into 2 MiB pages "
+                                    "(%zu tensors, %.1f s, %d workers)\n", __func__,
+                                    collapsed.load() / (1024.0 * 1024.0 * 1024.0), cand.size(), secs, n_workers);
+                        } else {
+                            LLAMA_LOG_WARN("%s: MADV_COLLAPSE accepted nothing (%zu candidates, %.1f s); "
+                                    "weights stay on 4 KiB pages\n", __func__, cand.size(), secs);
+                        }
+                    }
+                }
             } else if (n_nodes > 1) {
                 int bound_count = 0;
                 for (auto & layer : model.layers) {
