@@ -1,5 +1,5 @@
 /-!
-# PolyGraph Plan-Buffer — formal specification
+# PolyGraph Plan-Buffer -- formal specification
 
 Certified semantics for shape-pinned speculative verification (PolyGraph).
 
