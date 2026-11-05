@@ -70,6 +70,7 @@ def load_hierarchical_config(config_path: Path) -> dict:
                         rec = mv.get("recommended", {})
                         merged_m = dict(rec)
                         merged_m.update({k: v for k, v in mv.items() if k != "recommended"})
+                        merged_m.setdefault("name", merged_m.get("display_name") or merged_m.get("description") or mk)
                         if mk in cfg["models"]:
                             for rk, rv in merged_m.items():
                                 cfg["models"][mk].setdefault(rk, rv)

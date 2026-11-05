@@ -649,8 +649,8 @@ def build_dynamic_parameter_space(hw: HostHardwareProfile) -> dict:
         "spec_ckpt_mode": {
             "group": "speculative",
             "cli_flag": "--spec-ckpt-mode",
-            "values": ["full", "fast"],
-            "default": "fast",
+            "values": ["auto", "per-step", "gpu-fallback", "cpu"],
+            "default": "auto",
             "description": "KV cache checkpoint rollback mode for speculative verification"
         },
         "suffix_min_match": {
@@ -833,20 +833,23 @@ def evaluate_simulated_point(config: dict, model_name: str, hw: HostHardwareProf
     }
 
     if GLOBAL_MAB_PROFILE:
-        p_name = GLOBAL_MAB_PROFILE.get("model_name", "custom").lower()
-        model_profiles[p_name] = {
-            "params_b": 671.0 if "deepseek" in p_name else 100.0,
-            "active_params_b": 37.0 if "deepseek" in p_name else 14.0,
+        raw_p_name = GLOBAL_MAB_PROFILE.get("model_name", "custom").lower()
+        stem_p_name = Path(raw_p_name).stem.lower()
+        prof_entry = {
+            "params_b": 671.0 if "deepseek" in raw_p_name else 100.0,
+            "active_params_b": 37.0 if "deepseek" in raw_p_name else 14.0,
             "weights_gb": float(GLOBAL_MAB_PROFILE.get("file_size_gb", 340.6)),
             "critical_gb": float(GLOBAL_MAB_PROFILE.get("critical_bytes_gb", 6.41)),
             "moe_gb": float(GLOBAL_MAB_PROFILE.get("moe_bytes_gb", 142.38)),
             "engram_gb": float(GLOBAL_MAB_PROFILE.get("engram_table_bytes_gb", 188.83)),
-            "layers": 61 if "deepseek" in p_name else 32,
+            "layers": 61 if "deepseek" in raw_p_name else 32,
             "is_moe": GLOBAL_MAB_PROFILE.get("moe_bytes_gb", 0) > 0,
             "has_engram": GLOBAL_MAB_PROFILE.get("engram_table_bytes_gb", 0) > 0,
             "is_mla": GLOBAL_MAB_PROFILE.get("is_mla", True)
         }
-        prof = model_profiles[p_name]
+        model_profiles[raw_p_name] = prof_entry
+        model_profiles[stem_p_name] = prof_entry
+        prof = prof_entry
     else:
         prof = model_profiles.get(model_name.lower(), model_profiles.get("deepseek-v4.1" if "deepseek" in model_name.lower() else "qwen-flash-next"))
 
@@ -1056,7 +1059,7 @@ def get_model_sha256(model_path: str, model_name: str = "") -> str:
             return val
         except Exception:
             pass
-    val = f"simulated:{model_name or "unknown"}"
+    val = f"simulated:{model_name or 'unknown'}"
     _MODEL_SHA256_CACHE[key] = val
     return val
 
@@ -1067,6 +1070,24 @@ def get_load_avg() -> str:
         return f"{la[0]:.2f},{la[1]:.2f},{la[2]:.2f}"
     except Exception:
         return "0.00,0.00,0.00"
+
+
+def _format_canonical_spec_arg(config: dict) -> str:
+    spec_type = config.get("spec_type", "none")
+    if not spec_type or spec_type == "none":
+        return ""
+    n_draft = int(config.get("n_draft", 4) or 0)
+    if n_draft <= 0:
+        return ""
+    kvs = [f"n_max={n_draft}"]
+    if spec_type in ("mtp", "dflash", "dspark") and config.get("p_min") is not None:
+        kvs.append(f"p_min={config.get('p_min')}")
+    if spec_type == "suffix":
+        if config.get("suffix_min_match"):
+            kvs.append(f"suffix_min_match_len={config.get('suffix_min_match')}")
+        if config.get("suffix_max_depth"):
+            kvs.append(f"suffix_max_depth={config.get('suffix_max_depth')}")
+    return f"{spec_type}:{','.join(kvs)}"
 
 
 def build_trial_cmd(config: dict, model_path: str, ctx_len: int, hw: "HostHardwareProfile", draft_model_path: str = None) -> list:
@@ -1098,7 +1119,7 @@ def build_trial_cmd(config: dict, model_path: str, ctx_len: int, hw: "HostHardwa
         cmd.append("-prexp")
         cmd.extend(["-prexp-t", str(config.get("prefetch_threads", 8))])
     if config.get("flash_attn", 0) == 1:
-        cmd.extend(["-fa", "1"])
+        cmd.extend(["-fa", "on"])
     if config.get("cache_type_k"):
         cmd.extend(["-ctk", str(config.get("cache_type_k"))])
     if config.get("cache_type_v"):
@@ -1106,81 +1127,27 @@ def build_trial_cmd(config: dict, model_path: str, ctx_len: int, hw: "HostHardwa
 
     eff_draft_path = draft_model_path or config.get("model_draft")
     spec_type = config.get("spec_type", "none")
+    spec_arg = _format_canonical_spec_arg(config)
     if eff_draft_path and os.path.exists(eff_draft_path):
         cmd.extend(["-md", eff_draft_path])
         cmd.extend(["-ngld", str(config.get("n_gpu_layers_draft", 999))])
-        if spec_type != "none":
-            cmd.extend(["--spec-type", spec_type])
-        if config.get("n_draft"):
-            cmd.extend(["--draft", str(config.get("n_draft"))])
-        if config.get("p_min"):
-            cmd.extend(["--p-min", str(config.get("p_min"))])
+        if spec_arg:
+            cmd.extend(["--spec-type", spec_arg])
         if config.get("spec_autotune", 1) == 1:
             cmd.append("--spec-autotune")
-        if config.get("spec_ckpt_mode"):
-            cmd.extend(["--spec-ckpt-mode", str(config.get("spec_ckpt_mode"))])
-    elif spec_type in ["ngram-mod", "suffix"]:
-        cmd.extend(["--spec-type", spec_type])
-        if config.get("n_draft"):
-            cmd.extend(["--draft", str(config.get("n_draft"))])
+        ckpt = config.get("spec_ckpt_mode")
+        if ckpt in ("auto", "per-step", "gpu-fallback", "cpu"):
+            cmd.extend(["--spec-ckpt-mode", str(ckpt)])
+    elif spec_type in ("ngram-mod", "suffix", "mtp") and spec_arg:
+        cmd.extend(["--spec-type", spec_arg])
+        if config.get("spec_autotune", 1) == 1:
+            cmd.append("--spec-autotune")
     return cmd
 
 
 def execute_live_trial(config: dict, model_path: str, ctx_len: int, hw: HostHardwareProfile, draft_model_path: str = None) -> dict:
     """Executes a real llama-cli benchmark on host hardware and records measured throughput and latency."""
-    cmd = [
-        "./build/bin/llama-cli",
-        "-m", model_path,
-        "-p", "Artificial intelligence is",
-        "-n", "16",
-        "--temp", "0",
-        "-c", str(ctx_len),
-        "-t", str(config.get("threads", min(14, hw.physical_cores))),
-        "-tb", str(config.get("threads_batch", min(14, hw.physical_cores))),
-        "-b", str(config.get("batch_size", 2048)),
-        "-ub", str(config.get("ubatch_size", 512))
-    ]
-    if config.get("n_gpu_layers", 0) > 0 and hw.has_gpu:
-        cmd.extend(["-ngl", str(config.get("n_gpu_layers", 999))])
-    if config.get("split_mode") and config.get("split_mode") != "none" and hw.gpu_count >= 2:
-        cmd.extend(["-sm", config.get("split_mode")])
-    if config.get("tensor_override_strategy") and config.get("tensor_override_strategy") != "none":
-        cmd.extend(["-ot", config.get("tensor_override_strategy")])
-    if config.get("numa_mode") and config.get("numa_mode") != "none" and hw.numa_nodes > 1:
-        cmd.extend(["--numa", config.get("numa_mode")])
-    if config.get("defer_ple", 0) == 1:
-        cmd.append("--defer-ple")
-    if config.get("defer_experts", 0) == 1:
-        cmd.append("--defer-experts")
-    if config.get("prefetch_experts", 0) == 1:
-        cmd.append("-prexp")
-        cmd.extend(["-prexp-t", str(config.get("prefetch_threads", 8))])
-    if config.get("flash_attn", 0) == 1:
-        cmd.extend(["-fa", "1"])
-    if config.get("cache_type_k"):
-        cmd.extend(["-ctk", str(config.get("cache_type_k"))])
-    if config.get("cache_type_v"):
-        cmd.extend(["-ctv", str(config.get("cache_type_v"))])
-
-    eff_draft_path = draft_model_path or config.get("model_draft")
-    spec_type = config.get("spec_type", "none")
-    if eff_draft_path and os.path.exists(eff_draft_path):
-        cmd.extend(["-md", eff_draft_path])
-        cmd.extend(["-ngld", str(config.get("n_gpu_layers_draft", 999))])
-        if spec_type != "none":
-            cmd.extend(["--spec-type", spec_type])
-        if config.get("n_draft"):
-            cmd.extend(["--draft", str(config.get("n_draft"))])
-        if config.get("p_min"):
-            cmd.extend(["--p-min", str(config.get("p_min"))])
-        if config.get("spec_autotune", 1) == 1:
-            cmd.append("--spec-autotune")
-        if config.get("spec_ckpt_mode"):
-            cmd.extend(["--spec-ckpt-mode", str(config.get("spec_ckpt_mode"))])
-    elif spec_type in ["ngram-mod", "suffix"]:
-        cmd.extend(["--spec-type", spec_type])
-        if config.get("n_draft"):
-            cmd.extend(["--draft", str(config.get("n_draft"))])
+    cmd = build_trial_cmd(config, model_path, ctx_len, hw, draft_model_path=draft_model_path)
 
     env = os.environ.copy()
     env["GGML_CUDA_NO_PINNED"] = "1"
@@ -1300,6 +1267,9 @@ def run_mab_multicontext_search(
     Executes staged Multi-Armed Bandit optimization across progressive context lengths up to the maximum context.
     Provides stage duration expectations (ETA) and minimal stage-by-stage progress reporting.
     """
+    global GLOBAL_MAB_PROFILE
+    if mab_profile:
+        GLOBAL_MAB_PROFILE = mab_profile
     if context_lengths is None:
         if mab_profile and "tested_context_lengths" in mab_profile:
             context_lengths = mab_profile["tested_context_lengths"]
@@ -1412,6 +1382,19 @@ def run_mab_multicontext_search(
         stage_param_space = copy.deepcopy(param_space)
         stage_param_space["ctx_size"]["values"] = [ctx_len]
         stage_param_space["ctx_size"]["default"] = ctx_len
+
+        if not draft_model_path and not (mab_profile and mab_profile.get("has_builtin_mtp")):
+            if "spec_type" in stage_param_space:
+                stage_param_space["spec_type"]["values"] = [
+                    v for v in stage_param_space["spec_type"]["values"]
+                    if v in ("none", "ngram-mod", "suffix")
+                ]
+        elif not draft_model_path and (mab_profile and mab_profile.get("has_builtin_mtp")):
+            if "spec_type" in stage_param_space:
+                stage_param_space["spec_type"]["values"] = [
+                    v for v in stage_param_space["spec_type"]["values"]
+                    if v in ("none", "ngram-mod", "mtp", "suffix")
+                ]
 
         bandit = CombinatorialBandit(stage_param_space, c_explore=1.414, thompson=True)
         stage_population = []
@@ -1596,7 +1579,8 @@ def format_pareto_report(
     param_space: dict,
     multi_context_stages: list = None,
     modes: list = None,
-    allow_mixed_modes: bool = False
+    allow_mixed_modes: bool = False,
+    model_path: str = None
 ):
     """Generates an architectural Markdown monograph detailing the discovered Pareto frontier."""
     if modes is None:
@@ -1751,10 +1735,11 @@ def format_pareto_report(
     best_p = pareto_points[0] if pareto_points else None
     c_best = best_p.config if best_p else {}
 
-    numa_arg = f"--numa {c_best.get('numa_mode', 'split')} \\\n    " if hw.numa_nodes > 1 else ""
+    eff_model_arg = model_path if model_path else f"models/{model_name}.gguf"
+    numa_arg = f"--numa {c_best.get('numa_mode', 'split')} \\\n    " if (hw.numa_nodes > 1 and c_best.get('numa_mode', 'split') != 'none') else ""
     ngl_arg = f"-ngl {c_best.get('n_gpu_layers', 999)} \\\n    " if hw.has_gpu else "-ngl 0 \\\n    "
-    sm_arg = f"-sm {c_best.get('split_mode', 'graph')} \\\n    " if hw.has_gpu else ""
-    ot_arg = f"-ot \"{c_best.get('tensor_override_strategy')}\" \\\n    " if (hw.has_gpu and c_best.get('tensor_override_strategy') != 'none') else ""
+    sm_arg = f"-sm {c_best.get('split_mode', 'graph')} \\\n    " if (hw.has_gpu and hw.gpu_count >= 2 and c_best.get('split_mode', 'none') != 'none') else ""
+    ot_arg = f"-ot \"{c_best.get('tensor_override_strategy')}\" \\\n    " if (hw.has_gpu and c_best.get('tensor_override_strategy') and c_best.get('tensor_override_strategy') != 'none') else ""
     defer_ple_arg = "--defer-ple \\\n    " if c_best.get("defer_ple", 0) == 1 else ""
     defer_exp_arg = "--defer-experts \\\n    -prexp -prexp-t 8 \\\n    " if c_best.get("defer_experts", 0) == 1 else ""
 
@@ -1762,7 +1747,7 @@ def format_pareto_report(
         "### Configuration A: Peak Multi-Tenant Serving",
         "```bash",
         "./build/bin/llama-server \\",
-        f"    -m models/{model_name}.gguf \\",
+        f"    -m {eff_model_arg} \\",
         f"    {numa_arg}"
         f"{ngl_arg}"
         f"{sm_arg}"
@@ -1779,7 +1764,7 @@ def format_pareto_report(
         "### Configuration B: Ultra-Fast Interactive Dialog with Speculative Decoding",
         "```bash",
         "./build/bin/llama-server \\",
-        f"    -m models/{model_name}.gguf \\",
+        f"    -m {eff_model_arg} \\",
         "    --spec-type ngram-mod:n_max=4,n_min=2,ngram_size_n=8 \\\n"
         "    --spec-autotune \\\n"
         f"    {ngl_arg}"
@@ -1858,16 +1843,20 @@ def main():
     hw.print_summary()
 
     # 2. Ingest GGUF MAB Profile if provided
+    global GLOBAL_MAB_PROFILE
     profile_data = {}
     if args.mab_profile and os.path.exists(args.mab_profile):
         with open(args.mab_profile, "r", encoding="utf-8") as pf:
             profile_data = json.load(pf)
+        GLOBAL_MAB_PROFILE = profile_data
         print(f"[PROFILE] Successfully ingested GGUF profile from {args.mab_profile}")
         arch = profile_data.get("arch", "")
         if arch in ["deepseek4", "deepseek41"]:
             args.model = "deepseek-v4.1"
         elif arch == "deepseek2":
             args.model = "deepseek-v3"
+        elif args.model == "qwen-flash-next" and profile_data.get("model_name"):
+            args.model = Path(profile_data["model_name"]).stem
         print(f"[PROFILE] Target Model Architecture: {args.model.upper()} (File Size: {profile_data.get('file_size_gb', 0):.1f} GB)")
 
     # 3. Determine Context Length Stages
@@ -1905,7 +1894,8 @@ def main():
             hw=hw,
             param_space=param_space,
             modes=[point_mode(p) for p in pareto_points],
-            allow_mixed_modes=args.allow_mixed_modes
+            allow_mixed_modes=args.allow_mixed_modes,
+            model_path=args.model_path
         )
         return
 
@@ -1936,10 +1926,12 @@ def main():
         param_space=param_space,
         multi_context_stages=search_results.get("stages"),
         modes=search_results.get("modes"),
-        allow_mixed_modes=args.allow_mixed_modes
+        allow_mixed_modes=args.allow_mixed_modes,
+        model_path=args.model_path
     )
 
 
 if __name__ == "__main__":
     main()
+
 

@@ -934,7 +934,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
             "title": f"Speculative Draft Companion Model Verified ({spec_kind})",
             "detail": f"Model is structured as a speculative decoding companion ({spec_kind}, {len(tensors)} tensors, {file_size / (1024**3):.2f} GiB). "
                       f"Designed for high-speed multi-token proposal running in tandem with a base model. Embeddings are shared with base model.",
-            "recommendation": f"Pair with compatible base model: `./build/bin/llama-cli -m <base.gguf> -md {os.path.basename(gguf_info.get('primary_file', 'draft.gguf'))} --spec-type {'dflash' if is_dflash else 'mtp'} -fa 1`."
+            "recommendation": f"Pair with compatible base model: `./build/bin/llama-cli -m <base.gguf> -md {os.path.basename(gguf_info.get('primary_file', 'draft.gguf'))} --spec-type {'dflash:n_max=4' if is_dflash else 'mtp:n_max=2'} -fa on`."
         })
     elif has_builtin_mtp:
         findings.append({
@@ -944,7 +944,7 @@ def analyze_and_lint_gguf(gguf_info, hw):
             "title": "Native Multi-Token Prediction (MTP) Speculation Layers Verified",
             "detail": f"Model includes built-in next-n speculative prediction layers (blk.nextn.*, {len(tensors)} total tensors, {file_size / (1024**3):.2f} GiB). "
                       f"Capable of self-speculative draft decoding without requiring an external companion draft model.",
-            "recommendation": f"Launch with native MTP speculative decoding: `./build/bin/llama-cli -m {os.path.basename(gguf_info.get('primary_file', 'model.gguf'))} --spec-type mtp --draft 2 -fa 1`."
+            "recommendation": f"Launch with native MTP speculative decoding: `./build/bin/llama-cli -m {os.path.basename(gguf_info.get('primary_file', 'model.gguf'))} --spec-type mtp:n_max=2,p_min=0.0 -fa on`."
         })
 
     score = max(0, min(100, score))
@@ -1042,10 +1042,9 @@ def print_report(filepath, gguf_info, hw, analysis, show_multi_context=True):
         print("  ./build/bin/llama-cli \\")
         print("      -m <path/to/base_model.gguf> \\")
         print(f"      -md {filepath} \\")
-        print(f"      --spec-type {spec_kind} \\")
-        print("      --spec-autotune 1 \\")
-        print("      --draft 4 \\")
-        print("      -fa 1 \\")
+        print(f"      --spec-type {spec_kind}:n_max=4 \\")
+        print("      --spec-autotune \\")
+        print("      -fa on \\")
         print("      -b 2048 -ub 512 \\")
         if hw["gpu_vram_bytes"] > 0:
             print("      -ngl 999 -ngld 99 \\")

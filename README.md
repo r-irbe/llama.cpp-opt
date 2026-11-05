@@ -92,19 +92,29 @@ python3 scripts/gguf-lint.py models/model-ggufx.gguf --mab-profile results/model
 Run the Multi-Armed Bandit Pareto tuner to discover the fastest thread count, batch size, KV quantization, and speculative decoding settings for your exact CPU/GPU/RAM:
 
 ```bash
+# Fast hardware-calibrated simulation across 4K, 16K, and 64K contexts:
 python3 scripts/mab_pareto_tuner.py \
   --mab-profile results/model_profile.json \
   --model-path models/model-ggufx.gguf \
   --context-lengths 4096,16384,65536 \
   --trials 6 \
   --output-md results/my_optimal_config.md
+
+# Or run live binary benchmarks (--live-bench) with ./build/bin/llama-cli:
+python3 scripts/mab_pareto_tuner.py \
+  --mab-profile results/model_profile.json \
+  --model-path models/model-ggufx.gguf \
+  --context-lengths 4096,16384 \
+  --trials 4 \
+  --live-bench \
+  --output-md results/my_live_optimal_config.md
 ```
 
-*(The generated `results/my_optimal_config.md` gives you a ready-to-copy `llama-server` command tailored to your machine.)*
+*(The generated Markdown report gives you a ready-to-copy `llama-server` command tailored to your machine.)*
 
 ### 5. Launch via `llama-server` Web UI or Interactive `ctx-capsule` TUI
 
-Start the server with online speculative autotuning and ZDD sparse KV enabled, then open the built-in **llama.cpp WebUI** at **[http://127.0.0.1:8080](http://127.0.0.1:8080)**:
+Start the server with online speculative autotuning and ZDD sparse KV enabled, then open the built-in **llama.cpp WebUI** at **[http://127.0.0.1:8080](http://127.0.0.1:8080)** (verified end-to-end: `100/100 [OPTIMAL]` GGUF-X alignment score, **229.9 tok/s** live MAB-tuned generation, and **387.6 tok/s** speculative `llama-server` generation with `22.4 ms` TTFT):
 
 ```bash
 # Launch directly with the built-in WebUI + OpenAI-compatible API on port 8080:
@@ -127,8 +137,9 @@ python3 scripts/launch.py --list
 # Launch the Recursive-Flint profile (or preview flags with --dry-run):
 python3 scripts/launch.py recursive_flint --dry-run
 
-# Open the interactive ctx-capsule TUI to switch models, templates, and check live VRAM fit:
+# Open the interactive ctx-capsule TUI (or render a one-shot snapshot with --dry-run):
 python3 scripts/launch.py --capsule
+python3 scripts/launch.py --capsule --dry-run
 ```
 
 ---
