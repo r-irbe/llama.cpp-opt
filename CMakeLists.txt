@@ -84,6 +84,8 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 option(GGML_RUST_MMAP_ENGINE "ggml: link optional rust-mmap-engine FFI library" OFF)
+set   (GGML_RUST_MMAP_ENGINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rust-mmap-engine" CACHE PATH
+       "Path to rust-mmap-engine root directory")
 
 # Profile-Targeted Optimization (PTO / IRPGO / CS-IRPGO / ThinLTO / Machine Function Splitting)
 set   (GGML_PTO_MODE "OFF" CACHE STRING "ggml: PTO mode (OFF, GENERATE, CS_GENERATE, USE)")
@@ -226,7 +228,18 @@ add_subdirectory(src)
 
 if (GGML_RUST_MMAP_ENGINE)
     target_compile_definitions(llama PUBLIC GGML_USE_RUST_MMAP_ENGINE)
-    target_include_directories(llama PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../rust-mmap-engine/include")
+    target_include_directories(llama PUBLIC "${GGML_RUST_MMAP_ENGINE_DIR}/include")
+    find_library(GGML_RUST_MMAP_ENGINE_LIB
+        NAMES librust_mmap_engine.a rust_mmap_engine librust_mmap_engine.so
+        PATHS "${GGML_RUST_MMAP_ENGINE_DIR}/target/release"
+        NO_DEFAULT_PATH)
+    if (GGML_RUST_MMAP_ENGINE_LIB)
+        target_link_libraries(llama PUBLIC "${GGML_RUST_MMAP_ENGINE_LIB}")
+    else()
+        target_link_directories(llama PUBLIC "${GGML_RUST_MMAP_ENGINE_DIR}/target/release")
+        target_link_libraries(llama PUBLIC rust_mmap_engine)
+    endif()
+    target_link_options(llama PUBLIC "-Wl,-rpath,${GGML_RUST_MMAP_ENGINE_DIR}/target/release")
 endif()
 
 #

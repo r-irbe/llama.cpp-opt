@@ -205,16 +205,18 @@ static __global__ void flash_attn_vec_ext_f16(
         if (zdd_skip && mask != nullptr) {
             const int ncols_valid = ne01 > ic0 ? (ne01 - ic0 < ncols ? ne01 - ic0 : ncols) : 0;
             if (ncols_valid > 0) {
+                const int stride_mask = nb31 / sizeof(half);
                 bool all_inf = true;
-                for (int k = threadIdx.x; k < Dk; k += WARP_SIZE) {
-                    if (FATTN_KQ_STRIDE % Dk != 0 && k_VKQ_0 + k >= ne11) {
-                        break;
-                    }
-                    const float m_first = __half2float(maskh[k]);
-                    const float m_last  = __half2float(maskh[(ncols_valid - 1)*ne11 + k]);
-                    if (m_first > -65000.0f || m_last > -65000.0f) {
-                        all_inf = false;
-                        break;
+                for (int r = 0; r < ncols_valid && all_inf; ++r) {
+                    for (int k = threadIdx.x; k < Dk; k += WARP_SIZE) {
+                        if (FATTN_KQ_STRIDE % Dk != 0 && k_VKQ_0 + k >= ne11) {
+                            break;
+                        }
+                        const float m_val = __half2float(maskh[r*stride_mask + k]);
+                        if (m_val > -65000.0f) {
+                            all_inf = false;
+                            break;
+                        }
                     }
                 }
                 if (__all_sync(0xFFFFFFFF, all_inf)) {

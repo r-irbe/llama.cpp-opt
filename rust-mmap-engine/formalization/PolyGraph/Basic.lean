@@ -58,7 +58,7 @@ def Plan.rowSeq (p : Plan) (g : Limits) (r : Row g) : Nat :=
   if r.val ≤ p.activeLen then g.slotSeq else g.scratchSeq
 
 /-- RoPE/KV position of a row (padding rows get valid positions; outputs discarded). -/
-def Plan.rowPos (p : Plan) (_g : Limits) (r : Row g) : Nat := p.posBase + r.val
+def Plan.rowPos (p : Plan) (g : Limits) (r : Row g) : Nat := p.posBase + r.val
 
 /--
 Attention reachability. A real row attends columns `c ≤ r` that are real
@@ -75,6 +75,16 @@ def Plan.readable (p : Plan) (g : Limits) (r : Row g) : Prop := r.val < p.active
 def sanitize (g : Limits) (p : Plan) : Plan :=
   { p with activeLen := min p.activeLen g.gammaMax }
 
+/-! ## Snake-case aliases and unindexed Nat variants -/
+
+def is_real (p : Plan) (r : Nat) : Prop := r ≤ p.activeLen
+def row_seq (p : Plan) (g : Limits) (r : Nat) : Nat :=
+  if r ≤ p.activeLen then g.slotSeq else g.scratchSeq
+def row_pos (p : Plan) (r : Nat) : Nat := p.posBase + r
+def attends (p : Plan) (r c : Nat) : Prop :=
+  if r ≤ p.activeLen then (c ≤ r ∧ c ≤ p.activeLen) else True
+def readable (p : Plan) (r : Nat) : Prop := r < p.activeLen + 1
+
 /-! ## Theorems (the conformance contract) -/
 
 /-- **Theorem 1 (mask closure).** If a real row attends a column, that column
@@ -86,6 +96,13 @@ theorem mask_closure {g : Limits} (p : Plan) {r c : Row g}
   rw [if_pos hreal] at hatt
   exact hatt.2
 
+theorem mask_closure_nat (p : Plan) (r c : Nat)
+    (hreal : is_real p r) (hatt : attends p r c) : is_real p c := by
+  unfold is_real at hreal ⊢
+  unfold attends at hatt
+  rw [if_pos hreal] at hatt
+  exact hatt.2
+
 /-- **Theorem 2 (sampler window).** Every scored row is a real row. -/
 theorem readable_rows_are_real {g : Limits} (p : Plan) {r : Row g}
     (h : p.readable g r) : p.isReal r := by
@@ -93,27 +110,40 @@ theorem readable_rows_are_real {g : Limits} (p : Plan) {r : Row g}
   unfold Plan.isReal
   omega
 
-/-- **Theorem 3 (KV cell disjointness).** Distinct rows never share a KV cell:
-`(rowSeq, rowPos)` is injective on rows, provided slot and scratch sequences
-differ (a configuration invariant of `Limits`). -/
-theorem kv_cells_disjoint {g : Limits} (hseq : g.slotSeq ≠ g.scratchSeq) (p : Plan)
-    {r c : Row g} (hseq' : p.rowSeq g r = p.rowSeq g c)
+theorem readable_rows_are_real_nat (p : Plan) (r : Nat)
+    (h : readable p r) : is_real p r := by
+  unfold readable at h
+  unfold is_real
+  omega
+
+/-- **Theorem 3 (KV cell disjointness).** Distinct rows never share a KV cell.
+Holds unconditionally because `rowPos r = posBase + r` is strictly monotonic:
+`r ≠ c` guarantees `rowPos r ≠ rowPos c`, regardless of sequence configuration. -/
+theorem kv_cells_disjoint {g : Limits} (p : Plan)
+    {r c : Row g} (_hseq : p.rowSeq g r = p.rowSeq g c)
     (hpos : p.rowPos g r = p.rowPos g c) : r = c := by
-  unfold Plan.rowSeq at hseq'
   unfold Plan.rowPos at hpos
-  by_cases hr : r.val ≤ p.activeLen
-  · by_cases hc : c.val ≤ p.activeLen
-    · rw [if_pos hr, if_pos hc] at hseq'
-      have hv : r.val = c.val := by omega
-      exact Fin.eq_of_val_eq hv
-    · rw [if_pos hr, if_neg hc] at hseq'
-      exact absurd hseq' hseq
-  · by_cases hc : c.val ≤ p.activeLen
-    · rw [if_neg hr, if_pos hc] at hseq'
-      exact absurd hseq'.symm hseq
-    · rw [if_neg hr, if_neg hc] at hseq'
-      have hv : r.val = c.val := by omega
-      exact Fin.eq_of_val_eq hv
+  have hv : r.val = c.val := by omega
+  exact Fin.eq_of_val_eq hv
+
+theorem kv_cells_disjoint_contra {g : Limits} (p : Plan) {r c : Row g} (hneq : r ≠ c) :
+    ¬ (p.rowSeq g r = p.rowSeq g c ∧ p.rowPos g r = p.rowPos g c) := by
+  intro ⟨_, hpos⟩
+  unfold Plan.rowPos at hpos
+  apply hneq
+  have hv : r.val = c.val := by omega
+  exact Fin.eq_of_val_eq hv
+
+theorem kv_cells_disjoint_nat (p : Plan) (g : Limits) (r c : Nat) (hneq : r ≠ c) :
+    ¬ (row_seq p g r = row_seq p g c ∧ row_pos p r = row_pos p c) := by
+  intro ⟨_, hpos⟩
+  unfold row_pos at hpos
+  omega
+
+theorem kv_cells_disjoint_conditioned {g : Limits} (_hseq : g.slotSeq ≠ g.scratchSeq) (p : Plan)
+    {r c : Row g} (hseq' : p.rowSeq g r = p.rowSeq g c)
+    (hpos : p.rowPos g r = p.rowPos g c) : r = c :=
+  kv_cells_disjoint p hseq' hpos
 
 /-- **Theorem 4 (sanitize preserves validity).** Clamping lands the plan
 inside the geometry. -/

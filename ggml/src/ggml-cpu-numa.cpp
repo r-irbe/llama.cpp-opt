@@ -45,11 +45,11 @@ namespace fs = std::filesystem;
 #ifndef MPOL_INTERLEAVE
 #define MPOL_INTERLEAVE 3
 #endif
-#ifndef MPOL_MF_MOVE
-#define MPOL_MF_MOVE 1
-#endif
 #ifndef MPOL_MF_STRICT
-#define MPOL_MF_STRICT 2
+#define MPOL_MF_STRICT 1
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE 2
 #endif
 #endif
 

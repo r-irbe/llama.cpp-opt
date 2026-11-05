@@ -65,24 +65,30 @@ public:
     void retire(void * ptr, void (*deleter)(void *)) {
         if (!ptr || !deleter) return;
         const uint64_t current_epoch = m_global_epoch.load(std::memory_order_relaxed);
+        bool should_reclaim = false;
+        {
+            std::lock_guard<std::mutex> lock(m_retire_mutex);
+            m_retired.push_back({ptr, deleter, current_epoch});
+            should_reclaim = (m_retired.size() >= 256);
+        }
 
-        std::lock_guard<std::mutex> lock(m_retire_mutex);
-        m_retired.push_back({ptr, deleter, current_epoch});
-
-        if (m_retired.size() >= 256) {
+        if (should_reclaim) {
             try_advance_and_reclaim();
         }
     }
 
     void try_advance_and_reclaim() {
+        std::lock_guard<std::mutex> lock(m_retire_mutex);
         const uint64_t current_epoch = m_global_epoch.load(std::memory_order_acquire);
 
         // Find the minimum active epoch across all registered readers
         uint64_t min_reader_epoch = current_epoch;
+        bool can_advance = true;
         for (size_t i = 0; i < MAX_READERS; ++i) {
             const uint64_t r_epoch = m_readers[i].active_epoch.load(std::memory_order_acquire);
-            if (r_epoch != INACTIVE_EPOCH && r_epoch < min_reader_epoch) {
-                min_reader_epoch = r_epoch;
+            if (r_epoch != INACTIVE_EPOCH) {
+                if (r_epoch < min_reader_epoch) min_reader_epoch = r_epoch;
+                if (r_epoch < current_epoch) can_advance = false;
             }
         }
 
@@ -98,8 +104,10 @@ public:
         });
         m_retired.erase(it, m_retired.end());
 
-        // Increment global epoch
-        m_global_epoch.fetch_add(1, std::memory_order_acq_rel);
+        // Increment global epoch only if no active readers are lagging
+        if (can_advance) {
+            m_global_epoch.fetch_add(1, std::memory_order_acq_rel);
+        }
     }
 
     uint64_t global_epoch() const {
@@ -362,7 +370,9 @@ public:
             ccd_suffix_node * child = shard.root.child_head.exchange(nullptr, std::memory_order_acq_rel);
             while (child != nullptr) {
                 ccd_suffix_node * next = child->next_sibling;
-                ccd_suffix_node::delete_tree_recursive(child);
+                m_ebr.retire(child, [](void * p) {
+                    ccd_suffix_node::delete_tree_recursive(static_cast<ccd_suffix_node *>(p));
+                });
                 child = next;
             }
             shard.tokens.clear();

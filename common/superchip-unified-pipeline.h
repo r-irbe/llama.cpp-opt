@@ -372,10 +372,13 @@ public:
 
         // If a specific CXL node is provided, bind memory pages using mbind(MPOL_BIND)
         if (preferred_cxl_node >= 0 && preferred_cxl_node < 1024) {
-            unsigned long nodemask = (1UL << preferred_cxl_node);
+            constexpr size_t BITS_PER_LONG = 8 * sizeof(unsigned long);
+            constexpr size_t NUM_LONGS = (1024 + BITS_PER_LONG - 1) / BITS_PER_LONG;
+            unsigned long nodemask[NUM_LONGS] = {0};
+            nodemask[preferred_cxl_node / BITS_PER_LONG] |= (1UL << (preferred_cxl_node % BITS_PER_LONG));
 #if defined(__NR_mbind)
             // MPOL_BIND = 2, MPOL_MF_MOVE = 2
-            syscall(__NR_mbind, alloc.ptr, nbytes, 2 /* MPOL_BIND */, &nodemask, sizeof(nodemask) * 8, 2);
+            syscall(__NR_mbind, alloc.ptr, nbytes, 2 /* MPOL_BIND */, nodemask, 1024, 2 /* MPOL_MF_MOVE */);
 #endif
         }
 #else

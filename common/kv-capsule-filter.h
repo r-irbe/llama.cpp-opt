@@ -340,14 +340,17 @@ struct ContextCapsule {
         int hits = 0;
         for (int32_t i = 0; i < query_len; ++i) {
             if (fuse_index.contains((uint64_t)(uint32_t)query_tokens[i])) {
-                if (++hits >= min_token_hits) return true;
+                hits++;
             }
             if (i + 1 < query_len && fuse_index.contains(make_bigram_key(query_tokens[i], query_tokens[i + 1]))) {
-                if (++hits >= min_token_hits) return true;
+                hits++;
             }
         }
-        if (mode == "fuse8_only") {
+        if (hits < min_token_hits) {
             return false;
+        }
+        if (mode == "fuse8_only") {
+            return true;
         }
         const uint64_t q_simhash = compute_token_span_simhash64(query_tokens, query_len);
         return simhash64_cosine_estimate(q_simhash, simhash_64) >= min_cosine;

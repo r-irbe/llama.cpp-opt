@@ -183,12 +183,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (ncols_valid > 0) {
             const half * tm = (const half *) tile_mask;
             bool all_inf = true;
-            for (int k = threadIdx.x; k < KQ_per_iter; k += WARP_SIZE) {
-                const float m_first = __half2float(tm[k]);
-                const float m_last  = __half2float(tm[(ncols_valid - 1)*(KQ_per_iter + 8) + k]);
-                if (m_first > -65000.0f || m_last > -65000.0f) {
-                    all_inf = false;
-                    break;
+            for (int r = 0; r < ncols_valid && all_inf; ++r) {
+                for (int k = threadIdx.x; k < KQ_per_iter; k += WARP_SIZE) {
+                    const float m_val = __half2float(tm[r*(KQ_per_iter + 8) + k]);
+                    if (m_val > -65000.0f) {
+                        all_inf = false;
+                        break;
+                    }
                 }
             }
             if (__all_sync(0xFFFFFFFF, all_inf)) {
@@ -214,12 +215,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (ncols_valid > 0) {
             const half * tm = (const half *) tile_mask;
             bool all_inf = true;
-            for (int k = threadIdx.x; k < KQ_per_iter; k += WARP_SIZE) {
-                const float m_first = __half2float(tm[k]);
-                const float m_last  = __half2float(tm[(ncols_valid - 1)*(KQ_per_iter + 8) + k]);
-                if (m_first > -65000.0f || m_last > -65000.0f) {
-                    all_inf = false;
-                    break;
+            for (int r = 0; r < ncols_valid && all_inf; ++r) {
+                for (int k = threadIdx.x; k < KQ_per_iter; k += WARP_SIZE) {
+                    const float m_val = __half2float(tm[r*(KQ_per_iter + 8) + k]);
+                    if (m_val > -65000.0f) {
+                        all_inf = false;
+                        break;
+                    }
                 }
             }
             if (__all_sync(0xFFFFFFFF, all_inf)) {

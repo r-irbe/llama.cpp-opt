@@ -1767,8 +1767,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
 #else // !__linux__
 // WDDM limits the size of a single pinned allocation and the total pinned memory of a process.
 // GGML_CUDA_PINNED_CAP_GIB caps the total; requests beyond the cap fall back to pageable memory.
-static size_t g_cuda_pinned_bytes = 0;
-static int    g_cuda_pinned_count = 0;
+static std::atomic<size_t> g_cuda_pinned_bytes{0};
+static std::atomic<int>    g_cuda_pinned_count{0};
 
 static size_t ggml_cuda_pinned_cap() {
     static const size_t cap = [] {
@@ -1783,14 +1783,15 @@ static void * ggml_cuda_host_malloc(size_t size) {
     if (!ggml_backend_cuda_host_pinning_enabled()) {
         return nullptr;
     }
-    if (size > ggml_cuda_pinned_cap() - g_cuda_pinned_bytes) {
+    const size_t pinned_bytes = g_cuda_pinned_bytes.load(std::memory_order_relaxed);
+    if (size > ggml_cuda_pinned_cap() - pinned_bytes) {
         static bool logged = false;
         if (!logged) {
             logged = true;
             GGML_CUDA_LOG_INFO("%s: pinned cap %zu GiB: %.2f MiB request refused with %.2f GiB pinned "
                                "in %d buffers; requests that do not fit stay pageable\n", __func__,
                                ggml_cuda_pinned_cap() >> 30, size / 1024.0 / 1024.0,
-                               g_cuda_pinned_bytes/(1024.*1024.*1024.), g_cuda_pinned_count);
+                               pinned_bytes/(1024.*1024.*1024.), g_cuda_pinned_count.load(std::memory_order_relaxed));
         }
         return nullptr;
     }
@@ -1818,20 +1819,27 @@ static void * ggml_cuda_host_malloc(size_t size) {
         return nullptr;
     }
 
-    g_cuda_pinned_bytes += size;
-    g_cuda_pinned_count += 1;
+    g_cuda_pinned_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_cuda_pinned_count.fetch_add(1, std::memory_order_relaxed);
     if (size >= ((size_t) 1 << 30)) {
         GGML_CUDA_LOG_INFO("%s: pinned %.2f MiB (buffer %d, total %.2f GiB)\n", __func__,
-                           size / 1024.0 / 1024.0, g_cuda_pinned_count,
-                           g_cuda_pinned_bytes/(1024.*1024.*1024.));
+                           size / 1024.0 / 1024.0, g_cuda_pinned_count.load(std::memory_order_relaxed),
+                           g_cuda_pinned_bytes.load(std::memory_order_relaxed)/(1024.*1024.*1024.));
     }
     return ptr;
 }
 
 GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     CUDA_CHECK(cudaFreeHost(buffer->context));
-    g_cuda_pinned_bytes -= std::min(g_cuda_pinned_bytes, buffer->size);
-    g_cuda_pinned_count -= g_cuda_pinned_count > 0 ? 1 : 0;
+    size_t cur_bytes = g_cuda_pinned_bytes.load(std::memory_order_relaxed);
+    while (cur_bytes > 0 && !g_cuda_pinned_bytes.compare_exchange_weak(
+            cur_bytes, cur_bytes > buffer->size ? cur_bytes - buffer->size : 0,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {}
+
+    int cur_count = g_cuda_pinned_count.load(std::memory_order_relaxed);
+    while (cur_count > 0 && !g_cuda_pinned_count.compare_exchange_weak(
+            cur_count, cur_count - 1,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {}
 }
 
 #endif // __linux__

@@ -337,9 +337,14 @@ bool llama_io_uring_read_fd(
                 inflight--;
                 head++;
                 continue;
+            } else if (cqe->res == 0) {
+                // Premature EOF encountered
+                had_error = true;
+            } else {
+                const size_t remaining_bytes = file_size > completed_bytes ? file_size - completed_bytes : 0;
+                completed_bytes += std::min<size_t>(static_cast<size_t>(cqe->res), remaining_bytes);
             }
 
-            completed_bytes += cqe->res;
             inflight--;
             head++;
         }

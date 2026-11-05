@@ -66,9 +66,7 @@ bool llm_build_context::llama_graph_build_zdd_skip_mask(
         return false;
     }
 
-    if (lctx.inp_KQ_mask != nullptr) {
-        llama_graph_apply_zdd_fattn_op_params(lctx.inp_KQ_mask, true);
-    }
+    // Note: apply zdd_skip flag to destination flash_attn node KQV, not inp_KQ_mask
 
     const uint32_t total_blocks = (uint32_t)((n_kv + llama::kv::zdd::KV_BLOCK_TOKENS - 1) / llama::kv::zdd::KV_BLOCK_TOKENS);
     if (total_blocks == 0) {

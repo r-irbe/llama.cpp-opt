@@ -260,21 +260,64 @@ public:
         nodes_.push_back({0xFFFF, 1, 1, 1}); // Node 1
     }
 
+    uint32_t get_node(uint16_t var, uint32_t low, uint32_t high, uint16_t cluster_id) {
+        if (high == ZDD_BASE_EMPTY) {
+            return low;
+        }
+        for (size_t i = 2; i < nodes_.size(); ++i) {
+            if (nodes_[i].var == var && nodes_[i].low == low && nodes_[i].high == high) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        uint32_t node_idx = static_cast<uint32_t>(nodes_.size());
+        nodes_.push_back({var, low, high, cluster_id});
+        return node_idx;
+    }
+
+    uint32_t zdd_union(uint32_t p, uint32_t q) {
+        if (p == ZDD_BASE_EMPTY) return q;
+        if (q == ZDD_BASE_EMPTY) return p;
+        if (p == q) return p;
+
+        uint16_t p_var = nodes_[p].var;
+        uint16_t q_var = nodes_[q].var;
+
+        if (p_var < q_var) {
+            uint32_t lo = zdd_union(nodes_[p].low, q);
+            return get_node(p_var, lo, nodes_[p].high, nodes_[p].weight);
+        } else if (p_var > q_var) {
+            uint32_t lo = zdd_union(p, nodes_[q].low);
+            return get_node(q_var, lo, nodes_[q].high, nodes_[q].weight);
+        } else {
+            uint32_t lo = zdd_union(nodes_[p].low, nodes_[q].low);
+            uint32_t hi = zdd_union(nodes_[p].high, nodes_[q].high);
+            return get_node(p_var, lo, hi, nodes_[p].weight != 0 ? nodes_[p].weight : nodes_[q].weight);
+        }
+    }
+
     // Insert an expert combination into the ZDD returning the root index
     uint32_t insert_combination(const std::vector<uint16_t> & sorted_expert_ids, uint16_t cluster_id) {
-        return insert_recursive(sorted_expert_ids, 0, cluster_id);
+        uint32_t comb = insert_recursive(sorted_expert_ids, 0, cluster_id);
+        if (root_ == ZDD_BASE_EMPTY) {
+            root_ = comb;
+        } else {
+            root_ = zdd_union(root_, comb);
+        }
+        return root_;
     }
 
     // Traverse the ZDD in O(k) steps (<50 ns) to resolve pre-clustered NVMe block ID
     int32_t resolve_cluster(const std::vector<uint16_t> & active_experts) const {
         uint32_t curr = root_;
         size_t idx = 0;
+        int32_t matched_cluster = -1;
 
         while (curr > ZDD_BASE_UNIT && curr < nodes_.size()) {
             const zdd_node & n = nodes_[curr];
             if (idx < active_experts.size() && active_experts[idx] == n.var) {
                 // Variable matches active expert: branch high
                 idx++;
+                matched_cluster = static_cast<int32_t>(n.weight);
                 curr = n.high;
             } else {
                 // Variable not in active set: branch low
@@ -283,7 +326,7 @@ public:
         }
 
         if (curr == ZDD_BASE_UNIT) {
-            return static_cast<int32_t>(last_matched_cluster_);
+            return matched_cluster >= 0 ? matched_cluster : static_cast<int32_t>(last_matched_cluster_);
         }
         return -1; // No matching cluster found
     }
@@ -307,14 +350,7 @@ private:
         uint32_t high = insert_recursive(experts, depth + 1, cluster_id);
         uint32_t low = ZDD_BASE_EMPTY;
 
-        // Zero-suppression rule: if high == 0, return low
-        if (high == ZDD_BASE_EMPTY) {
-            return low;
-        }
-
-        uint32_t node_idx = static_cast<uint32_t>(nodes_.size());
-        nodes_.push_back({var, low, high, cluster_id});
-        return node_idx;
+        return get_node(var, low, high, cluster_id);
     }
 };
 
@@ -460,12 +496,13 @@ public:
     }
 
     // Single-thread branchless tANS symbol decode step
-    inline uint8_t decode_symbol(uint32_t & state, const uint8_t * & bitstream_ptr, uint32_t & bit_buf, int & bits_in_buf) const {
+    inline uint8_t decode_symbol(uint32_t & state, const uint8_t * & bitstream_ptr, const uint8_t * bitstream_end, uint32_t & bit_buf, int & bits_in_buf) const {
         const auto & entry = dec_table_[state & (NUM_STATES - 1)];
         uint8_t sym = entry.symbol;
 
         // Refill bit buffer if needed
         while (bits_in_buf < entry.nb_bits) {
+            if (bitstream_ptr >= bitstream_end) return 0;
             bit_buf |= (static_cast<uint32_t>(*bitstream_ptr++) << bits_in_buf);
             bits_in_buf += 8;
         }
@@ -479,18 +516,19 @@ public:
     }
 
     // Simulated 32-lane warp-cooperative streaming decompression
-    void decompress_warp_block(const uint8_t * compressed_stream, size_t n_symbols, uint8_t * out_symbols) const {
+    void decompress_warp_block(const uint8_t * compressed_stream, size_t n_symbols, uint8_t * out_symbols, size_t stream_bytes = 0) const {
         if (!compressed_stream || !out_symbols || n_symbols == 0) return;
 
         // In CUDA, 32 warp threads execute lockstep SIMT instructions directly into register files.
         // On CPU host, process in 32-symbol unrolled chunks to mirror in-warp cache and register residency.
         const uint8_t * bit_ptr = compressed_stream;
+        const uint8_t * bit_end = stream_bytes > 0 ? (compressed_stream + stream_bytes) : (compressed_stream + (n_symbols * 4 + 64));
         uint32_t bit_buf = 0;
         int bits_in_buf = 0;
         uint32_t state = 512; // Initial canonical state
 
         for (size_t i = 0; i < n_symbols; ++i) {
-            out_symbols[i] = decode_symbol(state, bit_ptr, bit_buf, bits_in_buf);
+            out_symbols[i] = decode_symbol(state, bit_ptr, bit_end, bit_buf, bits_in_buf);
         }
     }
 

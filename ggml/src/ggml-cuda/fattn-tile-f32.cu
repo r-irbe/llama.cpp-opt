@@ -146,9 +146,14 @@ static __global__ void flash_attn_tile_ext_f32(
             const int ncols_valid = ne01 > ic0 ? (ne01 - ic0 < ncols ? ne01 - ic0 : ncols) : 0;
             if (ncols_valid > 0) {
                 const int k = threadIdx.x;
-                const float m_first = __half2float(maskh[k_VKQ_0 + k]);
-                const float m_last  = __half2float(maskh[(ncols_valid - 1)*stride_mask + k_VKQ_0 + k]);
-                const bool is_inf   = m_first <= -65000.0f && m_last <= -65000.0f;
+                bool is_inf = true;
+                for (int r = 0; r < ncols_valid; ++r) {
+                    const float m_val = __half2float(maskh[r*stride_mask + k_VKQ_0 + k]);
+                    if (m_val > -65000.0f) {
+                        is_inf = false;
+                        break;
+                    }
+                }
                 if (__all_sync(0xFFFFFFFF, is_inf)) {
                     continue;
                 }

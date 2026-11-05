@@ -205,12 +205,13 @@ static __global__ void flash_attn_ext_f16(
             if (ncols_valid > 0) {
                 const int stride_mask = nb31 / sizeof(half);
                 bool all_inf = true;
-                for (int k = threadIdx.x; k < FATTN_KQ_STRIDE; k += WARP_SIZE) {
-                    const float m_first = __half2float(maskh[k_VKQ_0 + k]);
-                    const float m_last  = __half2float(maskh[(ncols_valid - 1)*stride_mask + k_VKQ_0 + k]);
-                    if (m_first > -65000.0f || m_last > -65000.0f) { // not f16 -inf
-                        all_inf = false;
-                        break;
+                for (int r = 0; r < ncols_valid && all_inf; ++r) {
+                    for (int k = threadIdx.x; k < FATTN_KQ_STRIDE; k += WARP_SIZE) {
+                        const float m_val = __half2float(maskh[r*stride_mask + k_VKQ_0 + k]);
+                        if (m_val > -65000.0f) { // not f16 -inf
+                            all_inf = false;
+                            break;
+                        }
                     }
                 }
                 if (__all_sync(0xFFFFFFFF, all_inf)) {
