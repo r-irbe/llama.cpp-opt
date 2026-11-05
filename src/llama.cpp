@@ -5778,7 +5778,19 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 
         if (ggml::cpu::numa::is_numa_expert()) {
             const int n_nodes = (int) ggml::cpu::numa::topology().size();
-            if (n_nodes > 1) {
+            // Per-expert binding puts a whole expert slice on one node. With a skewed
+            // router (a few hot experts) that turns the hot experts' home nodes into
+            // hotspots and every other core reads them remotely: measured 11.05 tok/s
+            // versus 17.06 tok/s for page-striped interleave on 2xEPYC NPS4 with 384
+            // experts. The bind path stays wired for expert-scheduled kernels but is
+            // opt-in; without an interleave baseline it is still the only placement.
+            const char * bind_env = getenv("GGML_NUMA_EXPERT_BIND");
+            const bool explicit_bind = bind_env && strcmp(bind_env, "0") != 0 && strcmp(bind_env, "off") != 0;
+            const bool attempt_bind = n_nodes > 1 && (explicit_bind || !ggml::cpu::numa::default_interleave_active());
+            if (!attempt_bind) {
+                LLAMA_LOG_INFO("%s: routed MoE experts stay page-striped on the MPOL_INTERLEAVE baseline "
+                        "(set GGML_NUMA_EXPERT_BIND=1 to bind each expert slice to one node instead)\n", __func__);
+            } else if (n_nodes > 1) {
                 int bound_count = 0;
                 for (auto & layer : model.layers) {
                     if (layer.ffn_gate_exps && layer.ffn_gate_exps->data && ggml_backend_buffer_is_host(layer.ffn_gate_exps->buffer)) {
@@ -5792,8 +5804,8 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                     }
                 }
                 if (ggml::cpu::numa::default_interleave_active()) {
-                    LLAMA_LOG_INFO("%s: per-expert mbind succeeded on %d routed MoE expert tensors across %d NUMA nodes; "
-                            "the rest stay on the MPOL_INTERLEAVE baseline (strategy expert)\n",
+                    LLAMA_LOG_INFO("%s: per-expert mbind succeeded on %d routed MoE expert tensors across %d NUMA nodes "
+                            "(GGML_NUMA_EXPERT_BIND opt-in); the rest stay on the MPOL_INTERLEAVE baseline (strategy expert)\n",
                             __func__, bound_count, n_nodes);
                 } else {
                     LLAMA_LOG_INFO("%s: bound %d routed MoE expert tensors across %d NUMA nodes (strategy expert)\n",
