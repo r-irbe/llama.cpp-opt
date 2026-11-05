@@ -112,36 +112,71 @@ python3 scripts/launch.py --model models/starter-model-ggufx.gguf --capsule
 
 ![What You Gain Across Four Real-World Customer Journeys](docs/assets/customer-journeys-impact.png)
 
-Choose the scenario below that best matches what you are building or solving. Click any journey to see the recommended setup and ready-to-run command.
+> **Fair Comparison: What Upstream Already Has vs. What `llama.cpp-opt` Adds**
+>
+> Upstream [`llama.cpp`](https://github.com/ggerganov/llama.cpp) and [`ik_llama.cpp`](https://github.com/ikawrakow/ik_llama.cpp) already provide draft-model (`-md`), basic n-gram (`ngram-simple`, `ngram-mod`), and single-stage `mtp` speculative decoding, `-ctk/-ctv` KV quantization, and basic `--numa` flags. `llama.cpp-opt` builds directly on those foundations and resolves the bottlenecks that appear in production:
+>
+> | Area | What Upstream `llama.cpp` / `ik_llama.cpp` Provides | What `llama.cpp-opt` Adds on Top |
+> | :--- | :--- | :--- |
+> | **Speculative Decoding** | Draft models (`-md`), `ngram-simple` / `ngram-mod`, single-stage `mtp`, fixed `n_max` / `p_min` | **1. PolyGraph shape-pinned verification (`--spec-verify-pinned`)**: Pads variable draft batches to a fixed shape on a disjoint scratch KV sequence so CUDA Graphs never rebuild (`0` graph re-captures; Lean 4 verified).<br>**2. Feature-level `DFlash2` (`--spec-type dflash`) & 2-stage fallback chains (`ngram-mod -> mtp`)**: Drafts up to 9 tokens in one pass without a separate draft model (**`99.5 tok/s`, `2.09x`** vs. non-speculative `47.8 tok/s` on `Qwen3.8-27B`, and **`54.8 tok/s`, `1.54x`** with `MTP` on 177B `Qwen3.8-Flash-Next`).<br>**3. Counterfactual online auto-tuner (`--spec-autotune`)**: Scores all candidate draft lengths $1..K$ in one pass, gates on token entropy, and throttles drafting when multi-slot server concurrency saturates. |
+> | **Multi-Agent Prompts** | Per-slot prompt caching (`--cache-reuse`) | **Cohort Prefix Sharing (`--cohort-prefix-sharing`)**: Deduplicates shared system/repo prefixes across 8-32 concurrent server slots in locked KV memory (**`22.2x`** faster TTFT: `94,087 tok/s` vs. `4,240 tok/s`). |
+> | **Long-Context Memory** | `-ctk q8_0 / q4_0` KV cache quantization (~2x-4x savings) | **3-Stage 1M Context Pipeline (`--zdd-sparse-kv` + `--evidence-filter`)**: Combines `-ctk q8_0` with ZDD 64-token sparse page deduplication, CUDA FlashAttention tile skipping, and pre-attention evidence filtering for up to **`23.8x`** memory reduction. |
+> | **Hybrid GPU + Multi-CPU** | `--numa distribute / isolate / numactl` & standard `mmap` | **Socket-Pinned MoE Experts (`--numa-split`) + Direct NVMe Streaming (`--npmc`)**: Pins MoE experts to local CPU socket RAM with 2 MiB HugePages (**`+45%` to `+109%`** faster hybrid decode), adds native Ada `MXFP8` kernels, and streams 4 KB-aligned **GGUF-X** files via `io_uring` `O_DIRECT` at up to **`18.8 GB/s`**. |
+
+Choose the scenario below that best matches what you are building or solving.
+
+### Visual Guide: Speculative Decoding & Hybrid GPU+CPU Serving (Journeys 1 & 4)
+
+![How llama.cpp-opt Extends Speculative Decoding & Hybrid GPU+CPU Serving](docs/assets/speculative-and-numa-mechanics.png)
 
 <details open>
-<summary><b>1. Solo Developer on a Laptop or Single GPU -- Fast Local Coding Without API Bills</b></summary>
+<summary><b>1. Solo Developer on a Laptop or Single GPU -- Up to 2.09x Faster Local Coding Without CUDA Graph Stalls</b></summary>
 
 - **Who this is for**: Individual developers, researchers, or privacy-conscious users running on a laptop or a single 8-24 GB desktop GPU.
-- **Problem solved**: Cloud API costs add up quickly during heavy coding sessions, and standard local runners pause noticeably before typing out long code blocks.
-- **How we solve it**: Enables *flash attention* (`-fa on`) to keep memory usage low and *ngram speculative decoding*[^speculative] (`--spec-type ngram_simple`) to guess repeated code patterns (imports, variable names, boilerplate) and verify them in one step, boosting output speed by **1.25x to 1.50x** without needing a second model.
+- **Problem solved**: While upstream `llama.cpp` includes draft-model and basic n-gram speculation, variable draft lengths change batch shapes on every token (breaking CUDA Graph reuse), fixed `n_max` settings waste compute when prompts shift from boilerplate code to dense reasoning, and external draft models consume extra VRAM.
+- **How we solve it**: Combines **PolyGraph shape-pinned verification** (`--spec-verify-pinned`, which keeps CUDA Graph batch shapes constant with zero graph rebuilds), **feature-level `DFlash2` / `MTP` / 2-stage fallback chains** (`--spec-type dflash` or `--spec-type ngram-mod:n_max=8 --spec-type mtp:n_max=2`), and **online counterfactual auto-tuning** (`--spec-autotune`), delivering **2.09x faster decode (`99.5 tok/s` vs. `47.8 tok/s`)** on `Qwen3.8-27B` and **1.54x (`54.8 tok/s`)** on 177B `Qwen3.8-Flash-Next` with identical mathematical output.
 
 ```bash
 ./build/bin/llama-server \
   -m models/starter-model.gguf \
   -c 32768 -ngl 99 -fa on \
   --spec-type ngram_simple:n_max=16 \
+  --spec-verify-pinned --spec-autotune \
   --host 127.0.0.1 --port 8080
 ```
 </details>
 
 <details>
-<summary><b>2. Engineering Teams & Multi-Agent Coding Swarms -- Instant Responses on Shared Prompts</b></summary>
+<summary><b>4. Private AI Server on a Budget -- Run Massive 300B-2.4T Models on 1 GPU + System RAM</b></summary>
+
+- **Who this is for**: Organizations and labs that need frontier open-weight models (DeepSeek-V3/R1 671B, Kimi-K2 1T, MiniMax-M2.7 229B) on-premises without spending $100,000+ on an 8x H100/A100 server.
+- **Problem solved**: When a model does not fit in GPU memory and spills into system RAM on multi-CPU servers, standard OS memory placement and generic `--numa` modes still suffer from cross-socket expert reads (*NUMA*[^numa] traffic), Transparent HugePage (THP) fragmentation, and OS page-cache locks.
+- **How we solve it**: Keeps the heavily used attention layers and shared MoE router on your single GPU while pinning Mixture-of-Experts weights to local CPU socket RAM (`--numa-split`) or streaming 4 KB-aligned **GGUF-X** weights directly from NVMe SSDs via `io_uring` `O_DIRECT` (`--npmc`, up to **18.8 GB/s**). Our automatic launcher inspects your server topology and configures the split for you.
+
+```bash
+# Automatically detect GPUs, CPU sockets/NUMA nodes, and RAM, then launch with live telemetry
+python3 scripts/launch.py \
+  --model /path/to/large-moe-model.gguf \
+  --capsule
+```
+</details>
+
+### Visual Guide: Multi-Agent Prefix Sharing & 1M Context Compression (Journeys 2 & 3)
+
+![How llama.cpp-opt Eliminates Redundant Work & Memory Bottlenecks](docs/assets/memory-and-prefix-sharing.png)
+
+<details>
+<summary><b>2. Engineering Teams & Multi-Agent Coding Swarms -- 22.2x Faster First Token on Shared Prompts</b></summary>
 
 - **Who this is for**: Teams running 4 to 32 concurrent AI agents (code reviewers, test generators, bug finders) or shared internal team servers.
-- **Problem solved**: Normally, if 16 agents share the same 8,000-token repository summary or system prompt, the server re-reads those 8,000 tokens 16 separate times, causing a long wait before any agent starts replying.
-- **How we solve it**: `--cohort-prefix-sharing` computes the shared prompt prefix once, locks it in memory, and lets all parallel slots (`-np 8`) reuse it immediately. In benchmarks, this speeds up prompt processing up to **22x** (reaching **94,087 tokens/sec** across 16 parallel requests).
+- **Problem solved**: Normally, if 16 agents share the same 8,000-token repository summary or system prompt, each slot re-evaluates or copies those 8,000 tokens separately, causing a long wait before any agent starts replying and saturating the GPU if speculative decoding stays active across all slots.
+- **How we solve it**: `--cohort-prefix-sharing` computes the shared prompt prefix once in a locked KV sequence and fans it out across all parallel slots (`-np 8`), while `--spec-autotune` automatically throttles speculative drafting when concurrent slot count crosses the throughput knee. In benchmarks, this speeds up prompt processing by **22.2x** (**94,087 tokens/sec** vs. **4,240 tokens/sec** across 16 parallel requests).
 
 ```bash
 ./build/bin/llama-server \
   -m models/starter-model.gguf \
   -c 65536 -np 8 -ngl 99 -fa on \
-  --cohort-prefix-sharing \
+  --cohort-prefix-sharing --spec-autotune \
   --slot-save-path ./cache/slots \
   --host 0.0.0.0 --port 8080
 ```
@@ -151,8 +186,8 @@ Choose the scenario below that best matches what you are building or solving. Cl
 <summary><b>3. Whole-Codebase & Long-Document Analysis -- Fit 128K to 1M Tokens on One 24 GB GPU</b></summary>
 
 - **Who this is for**: Analysts, legal/financial reviewers, and engineers feeding entire repositories, books, or audit logs into a single prompt.
-- **Problem solved**: A 128K to 1M token prompt normally requires tens of gigabytes of GPU memory just to store the conversation history (*KV cache*[^kv-cache]), crashing a 24 GB card long before the model can answer.
-- **How we solve it**: Combines quantized working memory (`-ctk q8_0 -ctv q8_0`), sparse memory compression (`--zdd-sparse-kv`), and automatic filtering of low-value filler text (`--evidence-filter`). This cuts working memory by up to **24x** while keeping retrieval accuracy intact.
+- **Problem solved**: Even with upstream's `-ctk q8_0` KV quantization (which halves memory), a 512K to 1M token prompt still exceeds a 24 GB GPU's memory and slows down attention linearly.
+- **How we solve it**: Stacks three stages on top of `-ctk q8_0 -ctv q8_0`: **ZDD 64-token sparse page deduplication + CUDA FlashAttention all-row tile skipping** (`--zdd-sparse-kv`) and **pre-attention evidence filtering** (`--evidence-filter`). Together they cut working memory by up to **23.8x** while keeping retrieval accuracy intact.
 
 ```bash
 ./build/bin/llama-server \
@@ -164,21 +199,6 @@ Choose the scenario below that best matches what you are building or solving. Cl
 ```
 </details>
 
-<details>
-<summary><b>4. Private AI Server on a Budget -- Run Massive 300B-2.4T Models on 1 GPU + System RAM</b></summary>
-
-- **Who this is for**: Organizations and labs that need frontier open-weight models (DeepSeek-V3/R1 671B, Kimi-K2 1T, MiniMax-M2.7 229B) on-premises without spending $100,000+ on an 8x H100/A100 server.
-- **Problem solved**: When a model does not fit in GPU memory and spills into system RAM on multi-CPU servers, standard inference engines suffer from slow cross-socket memory transfers (*NUMA*[^numa] traffic) and slow disk reads.
-- **How we solve it**: Keeps the heavily used attention layers on your single GPU while distributing Mixture-of-Experts weights across CPU memory nodes (`--numa-split`) or streaming cold weights directly from NVMe SSDs (`--npmc`). Our automatic launcher inspects your server topology and configures the split for you.
-
-```bash
-# Automatically detect GPUs, CPU sockets/NUMA nodes, and RAM, then launch with live telemetry
-python3 scripts/launch.py \
-  --model /path/to/large-moe-model.gguf \
-  --capsule
-```
-</details>
-
 ---
 
 ## Verified Real-World Impact
@@ -186,21 +206,15 @@ python3 scripts/launch.py \
 All optimizations are tested on real models and hardware with automated quality checks to ensure output accuracy matches standard baselines.
 
 <details>
-<summary><b>How does it work under the hood? (Visual guide to shared prefixes & 1M context compression)</b></summary>
-
-![How llama.cpp-opt Eliminates Redundant Work & Memory Bottlenecks](docs/assets/memory-and-prefix-sharing.png)
-</details>
-
-<details>
 <summary><b>View summary table of measured speedups and memory savings</b></summary>
 
-| What You Are Doing | Standard Baseline | With `llama.cpp-opt` | Practical Benefit |
+| What You Are Doing | Standard / Upstream Baseline | With `llama.cpp-opt` | Practical Benefit |
 | :--- | :--- | :--- | :--- |
-| **35B-122B MoE on 1 GPU + Dual-CPU RAM** | 6.6 - 14.1 tok/s | **9.6 - 29.5 tok/s** | **Up to +109% faster** generation on hybrid CPU+GPU servers |
-| **16 Agents Sharing an 8K Prompt** | 4,240 tok/s | **94,087 tok/s** | **22.2x faster** first-token response for agent swarms |
-| **Long Context on a Single 24 GB GPU** | ~42K tokens max | **Up to 1,000,000 tokens** | **23.8x more context** on the same graphics card |
-| **Single-User Coding & Reasoning** | 1.0x baseline speed | **1.25x - 1.50x speed** | Faster code/text output with zero quality loss (`--spec-type`) |
-| **Loading Large Models from NVMe SSD** | OS page-cache thrashing | **Up to 18.8 GB/s direct read** | Predictable latencies when running models larger than RAM |
+| **Single-GPU Speculative Decoding (`Qwen3.8-27B` / `177B MoE`)** | 47.8 tok/s (`27B`) / 35.6 tok/s (`177B`) | **99.5 tok/s (`DFlash2`) / 54.8 tok/s (`MTP`)** | **1.54x - 2.09x faster** decode with PolyGraph zero CUDA Graph rebuilds |
+| **35B-122B MoE on 1 GPU + Dual-CPU RAM** | 6.6 - 14.1 tok/s (default OS split) | **9.6 - 29.5 tok/s (`--numa-split`)** | **Up to +109% faster** generation on hybrid CPU+GPU servers |
+| **16 Agents Sharing an 8K Prompt** | 4,240 tok/s (per-slot prefill) | **94,087 tok/s (`--cohort-prefix-sharing`)** | **22.2x faster** first-token response for agent swarms |
+| **Long Context on a Single 24 GB GPU** | ~42K tokens max (FP16 KV) | **Up to 1,000,000 tokens (`--zdd-sparse-kv`)** | **23.8x more context** on the same graphics card |
+| **Loading Large Models from NVMe SSD** | OS page-cache thrashing | **Up to 18.8 GB/s (`--npmc` `O_DIRECT`)** | Predictable latencies when running models larger than RAM |
 
 For full per-model tables across 15 production models (3.8B to 2.4T parameters) and Lean 4 formal verification proofs of our memory and concurrency invariants, see [`docs/ARCHITECTURE_AND_BENCHMARK_SYNTHESIS.md`](docs/ARCHITECTURE_AND_BENCHMARK_SYNTHESIS.md).
 </details>
