@@ -1020,6 +1020,11 @@ bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nod
 static std::atomic<bool> g_numa_replicate_shared{false};
 static std::mutex g_replica_mutex;
 static std::unordered_map<const struct ggml_tensor *, std::vector<void *>> g_tensor_replicas;
+// Number of tensors that currently own replicas. Read (relaxed) on every matmul
+// call to keep the non-replicated path free of syscalls and locks.
+static std::atomic<int>      g_replica_tensor_count{0};
+static std::atomic<uint64_t> g_replica_epoch{1};
+static std::atomic<size_t>   g_replica_hits{0};
 
 bool is_numa_replicate_shared() {
     static int env_checked = -1;
@@ -1173,26 +1178,75 @@ bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes) {
         return true;
     }
 
+    // Every NUMA node 0..n-1 gets a private, node-bound copy. (Previously node 0
+    // reused tensor->data, which is 4 KiB-interleaved across all 8 nodes under
+    // MPOL_INTERLEAVE, making 7/8 of node 0's reads remote!)
     std::vector<void *> replicas(n_numa_nodes, nullptr);
-    replicas[0] = tensor->data;
 
     const size_t bits_per_word = 8 * sizeof(unsigned long);
-    for (int node = 1; node < n_numa_nodes; ++node) {
+    int created = 0;
+    int mismatched = 0;
+    int first_errno = 0;
+    std::vector<int> placed_on;
+
+    for (int node = 0; node < n_numa_nodes; ++node) {
         void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (ptr == MAP_FAILED) {
+            if (!first_errno) first_errno = errno;
             continue;
         }
 
         std::vector<unsigned long> nodemask((node / bits_per_word) + 1, 0);
         nodemask[node / bits_per_word] = 1UL << (node % bits_per_word);
-        syscall(__NR_mbind, ptr, size, MPOL_BIND, nodemask.data(), nodemask.size() * bits_per_word, MPOL_MF_MOVE | MPOL_MF_STRICT);
+        const unsigned long maxnode = nodemask.size() * bits_per_word;
+
+        // The mapping has no pages yet, so this only installs the policy for the
+        // faults that the memcpy is about to take. (Issuing MPOL_MF_MOVE against an
+        // unpopulated range moves nothing - that was the original bug here.)
+        if (syscall(__NR_mbind, ptr, size, MPOL_BIND, nodemask.data(), maxnode, 0) != 0) {
+            if (!first_errno) first_errno = errno;
+        }
         madvise(ptr, size, MADV_HUGEPAGE);
 
         memcpy(ptr, tensor->data, size);
+        if (size >= (2u << 20)) {
+            madvise(ptr, size, MADV_COLLAPSE);
+        }
+
+        // Pages exist now: enforce the placement and learn where they landed.
+        if (syscall(__NR_mbind, ptr, size, MPOL_BIND, nodemask.data(), maxnode,
+                    MPOL_MF_MOVE | MPOL_MF_STRICT) != 0) {
+            if (!first_errno) first_errno = errno;
+        }
+
+        int actual = page_node(ptr);
+        if (actual >= 0 && actual != node) {
+            ++mismatched;
+            fprintf(stderr, "ggml_numa: replica for node %d landed on node %d (placement not honoured)\n", node, actual);
+        }
+        if (actual >= 0) placed_on.push_back(actual);
+
         replicas[node] = ptr;
+        ++created;
+    }
+
+    if (created == 0) {
+        fprintf(stderr, "ggml_numa: could not replicate %s (%.1f MiB): %s\n",
+                tensor->name, size / (1024.0 * 1024.0), strerror(first_errno ? first_errno : ENOMEM));
+        return false;
     }
 
     g_tensor_replicas[tensor] = std::move(replicas);
+    g_replica_epoch.fetch_add(1, std::memory_order_relaxed);
+    g_replica_tensor_count.fetch_add(1, std::memory_order_relaxed);
+
+    static std::atomic<int> s_logged{0};
+    if (s_logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+        fprintf(stderr, "ggml_numa: replicated %d tensors at %.1f MiB each to %d nodes "
+                "(%d node-local copies created, %d placement mismatches, first errno=%s)\n",
+                g_replica_tensor_count.load(std::memory_order_relaxed), size / (1024.0 * 1024.0),
+                n_numa_nodes, created, mismatched, first_errno ? strerror(first_errno) : "none");
+    }
     return true;
 #else
     (void)tensor;
@@ -1200,6 +1254,74 @@ bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes) {
     return false;
 #endif
 }
+
+bool has_tensor_replicas() {
+    return g_replica_tensor_count.load(std::memory_order_relaxed) > 0;
+}
+
+size_t replica_hit_count() {
+    return g_replica_hits.load(std::memory_order_relaxed);
+}
+
+void reset_replica_hit_count() {
+    g_replica_hits.store(0, std::memory_order_relaxed);
+}
+
+int current_thread_numa_node() {
+#if defined(__gnu_linux__)
+    static thread_local int tls_node = -1;
+    static thread_local uint32_t tls_calls = 0;
+    if (tls_node < 0 || ((++tls_calls & 4095u) == 0u)) {
+        unsigned cpu = 0;
+        unsigned node = 0;
+        if (syscall(__NR_getcpu, &cpu, &node, nullptr) != 0) {
+            return -1;
+        }
+        tls_node = (int) node;
+    }
+    return tls_node;
+#else
+    return -1;
+#endif
+}
+
+const void * numa_local_ptr(const struct ggml_tensor * tensor, const void * ptr) {
+    if (g_replica_tensor_count.load(std::memory_order_relaxed) == 0) {
+        return ptr; // no replicas in the process: one relaxed load, no syscall
+    }
+    if (!tensor || !ptr || !tensor->data) {
+        return ptr;
+    }
+    // Fast thread-local 1-entry cache for the active matmul tensor before checking
+    // the replica table (read-only after model load; mutex only needed during load/free).
+    static thread_local const struct ggml_tensor * tls_last_tensor = nullptr;
+    static thread_local int                        tls_last_node   = -1;
+    static thread_local uint64_t                   tls_last_epoch  = 0;
+    static thread_local void *                     tls_last_rep    = nullptr;
+
+    const int node = current_thread_numa_node();
+    if (node < 0) {
+        return ptr;
+    }
+
+    const uint64_t epoch = g_replica_epoch.load(std::memory_order_relaxed);
+    void * replica = nullptr;
+    if (tensor == tls_last_tensor && node == tls_last_node && epoch == tls_last_epoch) {
+        replica = tls_last_rep;
+    } else {
+        replica = get_tensor_numa_replica(tensor, node);
+        tls_last_tensor = tensor;
+        tls_last_node   = node;
+        tls_last_epoch  = epoch;
+        tls_last_rep    = replica;
+    }
+    if (!replica || replica == tensor->data) {
+        return ptr;
+    }
+    g_replica_hits.fetch_add(1, std::memory_order_relaxed);
+    return (const char *) replica + ((const char *) ptr - (const char *) tensor->data);
+}
+
 
 void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id) {
     if (!tensor || node_id < 0) return tensor ? tensor->data : nullptr;
@@ -1218,13 +1340,15 @@ void free_tensor_numa_replicas(const struct ggml_tensor * tensor) {
     auto it = g_tensor_replicas.find(tensor);
     if (it != g_tensor_replicas.end()) {
         size_t size = ggml_nbytes(tensor);
-        for (size_t node = 1; node < it->second.size(); ++node) {
+        for (size_t node = 0; node < it->second.size(); ++node) {
             void * ptr = it->second[node];
-            if (ptr != nullptr && ptr != MAP_FAILED) {
+            if (ptr != nullptr && ptr != MAP_FAILED && ptr != tensor->data) {
                 munmap(ptr, size);
             }
         }
         g_tensor_replicas.erase(it);
+        g_replica_epoch.fetch_add(1, std::memory_order_relaxed);
+        g_replica_tensor_count.fetch_sub(1, std::memory_order_relaxed);
     }
 #else
     (void)tensor;
@@ -1237,14 +1361,16 @@ void free_all_numa_replicas() {
     for (auto & kv : g_tensor_replicas) {
         if (!kv.first) continue;
         size_t size = ggml_nbytes(kv.first);
-        for (size_t node = 1; node < kv.second.size(); ++node) {
+        for (size_t node = 0; node < kv.second.size(); ++node) {
             void * ptr = kv.second[node];
-            if (ptr != nullptr && ptr != MAP_FAILED) {
+            if (ptr != nullptr && ptr != MAP_FAILED && ptr != kv.first->data) {
                 munmap(ptr, size);
             }
         }
     }
     g_tensor_replicas.clear();
+    g_replica_epoch.fetch_add(1, std::memory_order_relaxed);
+    g_replica_tensor_count.store(0, std::memory_order_relaxed);
 #endif
 }
 
@@ -1289,6 +1415,26 @@ bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_node
 
 void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id) {
     return ggml::cpu::numa::get_tensor_numa_replica(tensor, node_id);
+}
+
+bool ggml_cpu_numa_has_replicas(void) {
+    return ggml::cpu::numa::has_tensor_replicas();
+}
+
+size_t ggml_cpu_numa_replica_hits(void) {
+    return ggml::cpu::numa::replica_hit_count();
+}
+
+void ggml_cpu_numa_reset_replica_hits(void) {
+    ggml::cpu::numa::reset_replica_hit_count();
+}
+
+int ggml_cpu_numa_current_node(void) {
+    return ggml::cpu::numa::current_thread_numa_node();
+}
+
+const void * ggml_cpu_numa_local_ptr(const struct ggml_tensor * tensor, const void * ptr) {
+    return ggml::cpu::numa::numa_local_ptr(tensor, ptr);
 }
 
 void ggml_cpu_numa_free_tensor_replicas(const struct ggml_tensor * tensor) {

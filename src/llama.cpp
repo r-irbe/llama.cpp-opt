@@ -430,6 +430,11 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    if (ggml_cpu_numa_has_replicas()) {
+        const size_t hits = ggml_cpu_numa_replica_hits();
+        LLAMA_LOG_INFO("%s: NUMA replicas were addressed %zu times by worker threads (%s)\n", __func__, hits,
+                hits ? "node-local weight reads" : "INERT - replicas were never used");
+    }
     ggml_cpu_numa_free_all_replicas();
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
@@ -4372,7 +4377,8 @@ struct expert_tensors {
 static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_loader & ml, const llama_model & model,
         ggml_type cache_type_k, ggml_type cache_type_v, ggml_type idx_type_k, uint32_t max_ctx_size, int mla_attn, int n_seq_max, int n_ubatch,
         int amb, int worst_case_tokens, bool flash_attn, bool swa_compress,
-        std::vector<expert_tensors> & experts) {
+        std::vector<expert_tensors> & experts, size_t * shexp_weight_bytes = nullptr,
+        size_t * host_override_bytes = nullptr) {
     int n_layer = model.hparams.n_layer;
     // looped models have one KV slot per logical layer
     const double kv_loops = model.hparams.n_layer_all > (uint32_t) n_layer
@@ -4407,10 +4413,33 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
         }
     }
 
+    // -ot patterns that keep weights in host memory: the shared-expert placement
+    // decision needs the bytes the GPU will not be asked to hold.
+    std::vector<std::regex> host_override_res;
+    if (host_override_bytes && ml.tensor_buft_overrides) {
+        for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+            if (o->buft && ggml_backend_buft_is_host(o->buft)) {
+                try {
+                    host_override_res.emplace_back(o->pattern);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_WARN("%s: ignoring override pattern '%s': %s\n", __func__, o->pattern, e.what());
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < ml.n_tensors; ++i) {
         auto t = ml.get_weight(i)->tensor;
         std::string name(t->name);
         auto size = ggml_nbytes(t);
+        if (!host_override_res.empty()) {
+            for (const auto & re : host_override_res) {
+                if (std::regex_search(name, re)) {
+                    *host_override_bytes += size;
+                    break;
+                }
+            }
+        }
         if (name == "token_embd.weight") {
             embd_size = size;
             continue;
@@ -4538,6 +4567,9 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             }
             else if (ttype == LLM_TENSOR_FFN_UP_SHEXP || ttype == LLM_TENSOR_FFN_GATE_SHEXP || ttype == LLM_TENSOR_FFN_DOWN_SHEXP) {
                 ffn_shexp[il] += t->ne[1] * n_ubatch * sizeof(float);
+                if (shexp_weight_bytes && name.find(".weight") != std::string::npos) {
+                    *shexp_weight_bytes += ggml_nbytes(t);
+                }
             }
             else if (ttype == LLM_TENSOR_FFN_UP || ttype == LLM_TENSOR_FFN_GATE || ttype == LLM_TENSOR_FFN_DOWN) {
                 ffn_dense[il] += t->ne[1] * n_ubatch * sizeof(float);
@@ -4852,8 +4884,10 @@ static bool llm_load_tensors(
     // placement is already handled above, so skipping this block is safe.
     if (device_count > 0 && !model.devices.empty()) {
         std::vector<expert_tensors> experts;
+        size_t shexp_weight_bytes = 0;
+        size_t host_override_bytes  = 0;
         auto [layer_sizes, max_compute] = get_layer_sizes(ml, model, cache_type_k, cache_type_v, idx_type_k, max_ctx_size, mla_attn, n_seq_max, n_ubatch,
-                amb, worst_case_tokens, flash_attn, swa_compress, experts);
+                amb, worst_case_tokens, flash_attn, swa_compress, experts, &shexp_weight_bytes, &host_override_bytes);
         size_t required_mem = 0;
         for (int i = 0; i <= n_layer; ++i) {
             required_mem += layer_sizes[i];
@@ -4875,6 +4909,48 @@ static bool llm_load_tensors(
         }
         LLAMA_LOG_INFO("Memory required for model tensors + cache: %.f MiB\n", required_mem/(1024.*1024.));
         LLAMA_LOG_INFO("Memory available on all devices - compute: %.f MiB\n", available_mem/(1024.*1024.));
+
+        // Shared-expert placement. The shexp FFN (one dense expert per layer) is read by
+        // every token in every layer, so it belongs in HBM when the device can hold it;
+        // on host memory it is only fast when it is replicated per NUMA node, which the
+        // loader wires up below (GGML_NUMA_REPLICATE_SHARED). GGML_SHEXP_PLACEMENT=cpu
+        // forces the host path, =auto falls back to it only when the GPU has no room,
+        // and the default leaves placement to -ngl / -ot exactly as before.
+        if (const char * shexp_placement = getenv("GGML_SHEXP_PLACEMENT")) {
+            if (shexp_weight_bytes > 0 && strcmp(shexp_placement, "gpu") != 0) {
+                const bool want_cpu = strcmp(shexp_placement, "cpu") == 0;
+                const double reserve = 512.0 * 1024 * 1024;
+                const double gpu_need = double(required_mem) - double(host_override_bytes);
+                const bool fits_on_gpu = double(available_mem) >= gpu_need + reserve;
+                const bool to_cpu = want_cpu || (strcmp(shexp_placement, "auto") == 0 && !fits_on_gpu);
+                LLAMA_LOG_INFO("%s: shared experts %.1f MiB, host-resident by -ot %.1f MiB, "
+                        "GPU needs %.1f MiB of %.1f MiB free -> %s\n", __func__,
+                        shexp_weight_bytes/(1024.*1024.), host_override_bytes/(1024.*1024.),
+                        gpu_need/(1024.*1024.), available_mem/(1024.*1024.),
+                        to_cpu ? "host memory + per-node replicas" : "GPU");
+                if (to_cpu) {
+                    // The local vector replaces ml.tensor_buft_overrides wholesale further
+                    // down, so carry the operator's own -ot entries over before adding ours.
+                    if (overrides.empty() && ml.tensor_buft_overrides) {
+                        for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                            overrides.push_back(*o);
+                        }
+                    }
+                    auto & o = overrides.emplace_back();
+                    o.pattern = strdup("(ffn_(up|down|gate)_shexp\\.(weight|scale))");
+                    o.buft = ggml_backend_cpu_buffer_type();
+                    // Host-resident shexp defaults to per-node replicas unless the operator
+                    // explicitly set GGML_NUMA_REPLICATE_SHARED=0.
+                    if (const char * rep_env = getenv("GGML_NUMA_REPLICATE_SHARED")) {
+                        if (strcmp(rep_env, "0") != 0 && strcmp(rep_env, "false") != 0 && strcmp(rep_env, "no") != 0) {
+                            ggml::cpu::numa::set_numa_replicate_shared(true);
+                        }
+                    } else {
+                        ggml::cpu::numa::set_numa_replicate_shared(true);
+                    }
+                }
+            }
+        }
         // Do not adjust the splits if the use has provided their own
         if (required_mem > available_mem && !tensor_split) {
             float sum = 0;
@@ -5758,21 +5834,65 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             const int n_nodes = (int) ggml::cpu::numa::topology().size();
             if (n_nodes > 1) {
                 int replicated_count = 0;
+                size_t replicated_bytes = 0;
+                auto replicate = [&](struct ggml_tensor * t, bool always) {
+                    if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                        return;
+                    }
+                    // A copy costs (n_nodes-1) x nbytes of RAM; below a few MiB the
+                    // per-node win cannot pay for that unless the caller insists.
+                    if (!always && ggml_nbytes(t) < (8ull << 20)) {
+                        return;
+                    }
+                    if (ggml::cpu::numa::replicate_tensor_numa(t, n_nodes)) {
+                        ++replicated_count;
+                        replicated_bytes += ggml_nbytes(t);
+                    }
+                };
+
+                // The shared-expert FFN: one dense expert per layer, read by every token.
                 for (auto & layer : model.layers) {
-                    if (layer.ffn_gate_shexp && layer.ffn_gate_shexp->data && ggml_backend_buffer_is_host(layer.ffn_gate_shexp->buffer)) {
-                        ggml_cpu_numa_replicate_tensor(layer.ffn_gate_shexp, n_nodes);
-                        replicated_count++;
+                    replicate(layer.ffn_gate_shexp, true);
+                    replicate(layer.ffn_up_shexp,   true);
+                    replicate(layer.ffn_down_shexp, true);
+                }
+
+                // Anything else the operator wants node-local: host-resident, read-mostly
+                // weights such as a CPU output head or the routers. Routed experts are not
+                // candidates - replicating 269 GiB to 8 nodes is not a trade, it is a bill.
+                if (const char * patterns = getenv("GGML_NUMA_REPLICATE_PATTERNS")) {
+                    std::vector<std::regex> res;
+                    std::string list(patterns);
+                    size_t pos = 0;
+                    while (pos <= list.size()) {
+                        const size_t comma = list.find(',', pos);
+                        const std::string one = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                        if (!one.empty()) {
+                            try {
+                                res.emplace_back(one);
+                            } catch (const std::exception & e) {
+                                LLAMA_LOG_WARN("%s: ignoring NUMA replication pattern '%s': %s\n", __func__, one.c_str(), e.what());
+                            }
+                        }
+                        if (comma == std::string::npos) break;
+                        pos = comma + 1;
                     }
-                    if (layer.ffn_up_shexp && layer.ffn_up_shexp->data && ggml_backend_buffer_is_host(layer.ffn_up_shexp->buffer)) {
-                        ggml_cpu_numa_replicate_tensor(layer.ffn_up_shexp, n_nodes);
-                        replicated_count++;
-                    }
-                    if (layer.ffn_down_shexp && layer.ffn_down_shexp->data && ggml_backend_buffer_is_host(layer.ffn_down_shexp->buffer)) {
-                        ggml_cpu_numa_replicate_tensor(layer.ffn_down_shexp, n_nodes);
-                        replicated_count++;
+                    for (struct ggml_context * ctx : model.ctxs) {
+                        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                            for (const auto & re : res) {
+                                if (std::regex_search(t->name, re)) {
+                                    replicate(t, false);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
-                LLAMA_LOG_INFO("%s: replicated %d shared expert tensors across %d NUMA nodes\n", __func__, replicated_count, n_nodes);
+
+                LLAMA_LOG_INFO("%s: replicated %d tensors (%.1f MiB per node copy, %.1f GiB extra RAM across %d nodes) - "
+                        "set GGML_NUMA_REPLICATE_PATTERNS to add host-resident read-mostly weights\n",
+                        __func__, replicated_count, replicated_bytes / (1024.0 * 1024.0),
+                        replicated_bytes * n_nodes / (1024.0 * 1024.0 * 1024.0), n_nodes);
             }
         }
 

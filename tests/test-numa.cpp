@@ -274,6 +274,78 @@ int main() {
         }
     }
 
+    printf("numa tensor replication (per-node copies + compute-path lookup)\n");
+    {
+        if (topology().size() < 2) {
+            printf("  skipped: needs at least 2 NUMA nodes\n");
+        } else {
+            const int n_nodes = (int) topology().size();
+
+            check(!has_tensor_replicas(), "no replicas registered initially");
+            check(replica_hit_count() == 0, "replica hit counter starts at zero");
+
+            // a 8 MiB host tensor in a real CPU buffer, like a host-resident weight
+            ggml_init_params ip = { 4 * 1024 * 1024, nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            check(ctx != nullptr, "ggml context for the replication probe");
+            if (ctx) {
+                ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) ((8ull << 20) / sizeof(float)));
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+                check(buf != nullptr && t->data != nullptr, "8 MiB host buffer for the probe tensor");
+                if (buf && t->data) {
+                    const size_t n_elems = (size_t) ggml_nelements(t);
+                    float * d = (float *) t->data;
+                    for (size_t i = 0; i < n_elems; ++i) d[i] = (float)(i % 1024);
+
+                    // inert without replicas
+                    const char * mid = (const char *) t->data + 4096;
+                    check(numa_local_ptr(t, mid) == (const void *) mid, "numa_local_ptr is inert while nothing is replicated");
+
+                    check(replicate_tensor_numa(t, n_nodes), "replicate_tensor_numa duplicates a host tensor");
+                    check(has_tensor_replicas(), "has_tensor_replicas reports the new replica");
+                    reset_replica_hit_count();
+
+                    bool contents_ok = true;
+                    bool placement_ok = true;
+                    for (int node = 0; node < n_nodes; ++node) {
+                        void * rep = get_tensor_numa_replica(t, node);
+                        check(rep != nullptr && rep != t->data, "node " + std::to_string(node) + " owns a distinct copy");
+                        if (!rep || rep == t->data) {
+                            contents_ok = placement_ok = false;
+                            continue;
+                        }
+                        contents_ok &= memcmp(rep, t->data, ggml_nbytes(t)) == 0;
+                        const int actual = page_node(rep);
+                        if (actual != node) {
+                            printf("    copy for node %d has its first page on node %d\n", node, actual);
+                            placement_ok = false;
+                        }
+                    }
+                    check(contents_ok, "every replica is byte-identical to the original");
+                    check(placement_ok, "every replica is bound to its own NUMA node");
+
+                    // and the ping that matters: the pointer a matmul would use
+                    const int here = current_thread_numa_node();
+                    check(here >= 0, "current_thread_numa_node() reports the calling thread's node");
+                    const void * want = get_tensor_numa_replica(t, here);
+                    check(want != nullptr && want != t->data, "this thread's node has a dedicated replica target");
+                    check(numa_local_ptr(t, mid) == (const void *)((const char *) want + 4096),
+                          "numa_local_ptr maps an interior pointer into this node's copy");
+                    check(replica_hit_count() == 1u,
+                          "replica hit counter records node-local replica lookup");
+
+                    free_tensor_numa_replicas(t);
+                    check(!has_tensor_replicas(), "free_tensor_numa_replicas clears the registry");
+                    check(numa_local_ptr(t, mid) == (const void *) mid, "numa_local_ptr is inert again after freeing");
+                }
+                if (buf) {
+                    ggml_backend_buffer_free(buf);
+                }
+                ggml_free(ctx);
+            }
+        }
+    }
+
     printf("hardware topology simulations (nps0, nps1, nps2, nps4, naples, intel snc)\n");
     {
         // 1. NPS0 / UMA: 1 node total (Node 0, Socket 0)

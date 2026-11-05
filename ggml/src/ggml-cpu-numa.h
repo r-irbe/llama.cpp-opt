@@ -109,6 +109,22 @@ void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id);
 void free_tensor_numa_replicas(const struct ggml_tensor * tensor);
 void free_all_numa_replicas();
 
+// True when at least one tensor owns per-node replicas. Hot-path safe: one
+// relaxed atomic load, no lock, no syscall.
+bool has_tensor_replicas();
+
+// Number of times a matmul actually addressed a node-local replica (test/debug).
+size_t replica_hit_count();
+void reset_replica_hit_count();
+
+// NUMA node the calling thread is currently running on (-1 when unavailable).
+int current_thread_numa_node();
+
+// Translate a tensor-relative pointer to the calling thread's node-local replica.
+// Returns `ptr` unchanged when the tensor has no replicas, when the thread cannot
+// report a node, or when the original is used for that node.
+const void * numa_local_ptr(const struct ggml_tensor * tensor, const void * ptr);
+
 } // namespace ggml::cpu::numa
 #else
 #include <stdbool.h>
@@ -145,6 +161,15 @@ bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_node
 void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id);
 void ggml_cpu_numa_free_tensor_replicas(const struct ggml_tensor * tensor);
 void ggml_cpu_numa_free_all_replicas(void);
+
+// Replica-aware base pointer for the CPU matmul paths: returns the calling
+// thread's node-local copy of `ptr` (tensor-relative), or `ptr` when the tensor
+// has no replicas. Cheap enough to call once per matmul op per thread.
+const void * ggml_cpu_numa_local_ptr(const struct ggml_tensor * tensor, const void * ptr);
+bool   ggml_cpu_numa_has_replicas(void);
+size_t ggml_cpu_numa_replica_hits(void);
+void   ggml_cpu_numa_reset_replica_hits(void);
+int    ggml_cpu_numa_current_node(void);
 
 #ifdef __cplusplus
 }
