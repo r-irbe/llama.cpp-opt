@@ -38,23 +38,97 @@ Measured on a single **24 GB NVIDIA RTX 4090** + **Dual AMD EPYC 7453** (56 core
 
 ---
 
-## Quick Usage (`llama.cpp-opt` Tools)
+## 5-Minute End-to-End Quickstart (Works on Any Laptop or Single-GPU Desktop)
 
-You can use standard `llama-server` / `llama-cli` binaries directly, or use the declarative launcher and interactive TUI to apply hardware-tested presets:
+Want to experience the full `llama.cpp-opt` workflow on a standard machine (16–32 GB RAM, with or without a GPU) in a few minutes? Follow these 5 steps from build to web UI:
+
+### 1. Build (Standard + Profile-Targeted Optimization)
 
 ```bash
-# 1. List ready-to-run model profiles:
+git clone https://github.com/r-irbe/llama.cpp-opt.git
+cd llama.cpp-opt
+
+# Standard build (add -DGGML_CUDA=ON if you have an NVIDIA GPU):
+cmake -B build -DGGML_NATIVE=ON -DGGML_CUDA=ON
+./scripts/build-guard.sh cmake --build build --config Release -j$(nproc)
+
+# (Optional) Build profile-guided (PTO + ThinLTO) binaries into build-pto/ for up to 2.19x faster CPU prefill:
+./scripts/pto-build.sh use
+```
+
+### 2. Download a Fast MoE or Flint Hybrid GGUF Model
+
+Pick a model that fits your machine's memory budget:
+- **Laptop / 8–16 GB RAM (`~2.5 GB`)**: `LFM2-8B-A1B` or `Qwen3-30B-A3B` (compact MoE with only 1B–3B active parameters per token).
+- **Single 16–24 GB GPU Workstation (`~16–24 GB`)**: `Recursive-Flint-32B` (`flint` hybrid linear + sliding-window attention, configured in [`scripts/configs/hierarchy/models/recursive_flint.toml`](scripts/configs/hierarchy/models/recursive_flint.toml)) or `Qwen3.8-27B-UD-Q4_K_XL`.
+
+```bash
+mkdir -p models
+
+# Option A: Fast compact MoE for laptops & smaller desktops (~5 GB, 1B active params):
+./scripts/hf.sh --repo LiquidAI/LFM2-8B-A1B-GGUF --file LFM2-8B-A1B-Q4_K_M.gguf --outdir models
+
+# Option B: Or place Recursive-Flint-32B / any MoE GGUF in models/:
+# cp /path/to/Recursive-Flint-32B-Q6_K.gguf models/model.gguf
+```
+
+### 3. Convert to `GGUF-X` (`NPMC`) & Score Hardware Alignment
+
+Repack the GGUF into a 2 MiB HugeTLB-aligned `GGUF-X` container (groups MoE expert weights contiguously, removes DRAM bank conflicts, and verifies a **100/100** hardware score):
+
+```bash
+# Convert to GGUF-X and automatically validate 100/100 alignment score:
+python3 scripts/gguf-pack-npmc.py models/LFM2-8B-A1B-Q4_K_M.gguf \
+  -o models/model-ggufx.gguf \
+  --embed-superblock \
+  --validate
+
+# Inspect hardware fit, KV cache scaling up to 256K, and export an autotuner profile:
+python3 scripts/gguf-lint.py models/model-ggufx.gguf --mab-profile results/model_profile.json
+```
+
+### 4. Auto-Tune Serving Parameters for Your Hardware
+
+Run the Multi-Armed Bandit Pareto tuner to discover the fastest thread count, batch size, KV quantization, and speculative decoding settings for your exact CPU/GPU/RAM:
+
+```bash
+python3 scripts/mab_pareto_tuner.py \
+  --mab-profile results/model_profile.json \
+  --model-path models/model-ggufx.gguf \
+  --context-lengths 4096,16384,65536 \
+  --trials 6 \
+  --output-md results/my_optimal_config.md
+```
+
+*(The generated `results/my_optimal_config.md` gives you a ready-to-copy `llama-server` command tailored to your machine.)*
+
+### 5. Launch via `llama-server` Web UI or Interactive `ctx-capsule` TUI
+
+Start the server with online speculative autotuning and ZDD sparse KV enabled, then open the built-in **llama.cpp WebUI** at **[http://127.0.0.1:8080](http://127.0.0.1:8080)**:
+
+```bash
+# Launch directly with the built-in WebUI + OpenAI-compatible API on port 8080:
+./build/bin/llama-server \
+  -m models/model-ggufx.gguf \
+  -c 32768 -ngl 99 \
+  -ctk q8_0 -ctv q8_0 -fa on \
+  --zdd-sparse-kv \
+  --spec-type ngram-mod:n_max=6,n_min=2 \
+  --spec-autotune \
+  --host 127.0.0.1 --port 8080
+```
+
+Or use the declarative launcher / interactive `ctx-capsule` TUI to manage profiles (`recursive_flint`, `qwen38_27b`, `deepseek-v4.1-1017-ud-q4kxl`, etc.):
+
+```bash
+# List all pre-configured model & hardware profiles:
 python3 scripts/launch.py --list
 
-# 2. Preview or launch a configured profile:
-python3 scripts/launch.py deepseek-v4.1-1017-ud-q4kxl --dry-run
-python3 scripts/launch.py ds41-1017-np4-512k-swarm --dry-run
+# Launch the Recursive-Flint profile (or preview flags with --dry-run):
+python3 scripts/launch.py recursive_flint --dry-run
 
-# 3. Open the interactive ctx-capsule TUI to switch models, templates, and view VRAM fit:
+# Open the interactive ctx-capsule TUI to switch models, templates, and check live VRAM fit:
 python3 scripts/launch.py --capsule
-
-# 4. (Optional) Build profile-guided (PTO + ThinLTO) binaries for maximum CPU/GPU dispatch speed:
-./scripts/pto-build.sh all
 ```
 
 ---
