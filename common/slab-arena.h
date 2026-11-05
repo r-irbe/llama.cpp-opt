@@ -108,6 +108,7 @@ public:
             m_descriptors[i].borrower_model_id = 0;
         }
         m_raw_storage = nullptr;
+        m_storage_offset = 0;
     }
 
     ~UniversalSlabArena() {
@@ -118,6 +119,7 @@ public:
     void attach_storage(void * buffer, size_t total_bytes) {
         assert(total_bytes >= TotalSlabs * SlabSizeBytes);
         m_raw_storage = reinterpret_cast<uint8_t *>(buffer);
+        m_storage_offset = reinterpret_cast<uint8_t *>(buffer) - reinterpret_cast<const uint8_t *>(this);
     }
 
     // Pointer-free acquisition: Returns slab_id in O(1) lock-free CAS
@@ -174,6 +176,11 @@ public:
         // Clear preemption bit if set
         m_preemption_bitmask[w].fetch_and(~mask, std::memory_order_relaxed);
 
+        // Clear descriptor metadata happens-before releasing the allocation bit
+        m_descriptors[slab_id].owner_model_id = 0;
+        m_descriptors[slab_id].borrower_model_id = 0;
+        m_descriptors[slab_id].allocated_bytes = 0;
+
         uint64_t current = m_allocation_bitmask[w].load(std::memory_order_relaxed);
         while (current & mask) {
             uint64_t candidate = current & ~mask;
@@ -181,9 +188,6 @@ public:
                     current, candidate,
                     std::memory_order_release,
                     std::memory_order_relaxed)) {
-                m_descriptors[slab_id].owner_model_id = 0;
-                m_descriptors[slab_id].borrower_model_id = 0;
-                m_descriptors[slab_id].allocated_bytes = 0;
                 return true;
             }
         }
@@ -223,8 +227,12 @@ public:
 
     // Translate slab_id + relative offset to zero-copy data pointer (pure mathematical indexing)
     inline void * get_slab_address(uint16_t slab_id, size_t offset_bytes = 0) const {
-        if (slab_id >= TotalSlabs || !m_raw_storage) return nullptr;
-        return reinterpret_cast<void *>(m_raw_storage + (static_cast<size_t>(slab_id) * SlabSizeBytes) + offset_bytes);
+        if (slab_id >= TotalSlabs || offset_bytes >= SlabSizeBytes) return nullptr;
+        const uint8_t * base = m_storage_offset != 0
+            ? reinterpret_cast<const uint8_t *>(this) + m_storage_offset
+            : m_raw_storage;
+        if (!base) return nullptr;
+        return const_cast<void *>(reinterpret_cast<const void *>(base + (static_cast<size_t>(slab_id) * SlabSizeBytes) + offset_bytes));
     }
 
     // Resolve a pointer-free SlabHandle to its live memory address
@@ -255,6 +263,7 @@ public:
 
 private:
     uint8_t *                              m_raw_storage = nullptr;
+    ptrdiff_t                              m_storage_offset = 0;
     size_t                                 m_num_mask_words = 0;
     alignas(64) std::atomic<uint64_t>      m_allocation_bitmask[TotalSlabs / 64];
     alignas(64) std::atomic<uint64_t>      m_preemption_bitmask[TotalSlabs / 64];
@@ -280,7 +289,8 @@ public:
 
     bool open_or_create(const std::string & path, bool initialize_new = false) {
         close_mapping();
-        const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        const int flags = initialize_new ? (O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW) : (O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        const int fd = ::open(path.c_str(), flags, 0600);
         if (fd < 0) return false;
         const size_t total_bytes = sizeof(SharedLayout);
         if (initialize_new) {

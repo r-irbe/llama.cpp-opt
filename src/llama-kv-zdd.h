@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cassert>
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
@@ -39,6 +40,7 @@ struct alignas(16) ZddNode {
 /// and 2M nodes per manager — far beyond the 10M-token target. One packed
 /// word gives single-compare interning and AVX-512-batchable key ops.
 static constexpr uint64_t zdd_key_pack(uint32_t var, uint32_t low, uint32_t high) {
+    assert(var < (1U << 21) && low < (1U << 21) && high < (1U << 21));
     return ((uint64_t)(var & 0x1FFFFFu) << 42) |
            ((uint64_t)(low & 0x1FFFFFu) << 21) |
             (uint64_t)(high & 0x1FFFFFu);
@@ -79,9 +81,9 @@ public:
             return low;
         }
 
-        // Block ids beyond the manager capacity would silently alias under
-        // the packed 21-bit key — guard the capacity explicitly.
-        if (var >= n_max_blocks) {
+        // Block ids beyond the manager capacity or 21-bit pack width would silently alias
+        // under the packed 21-bit key — guard the capacity and bounds explicitly.
+        if (var >= n_max_blocks || var >= (1U << 21) || low >= (1U << 21) || high >= (1U << 21)) {
             return ZDD_EMPTY;
         }
 
@@ -140,17 +142,40 @@ public:
     /// Traverse ZDD to extract all active block IDs in O(k) steps (<50 ns)
     void extract_active_blocks(uint32_t root, std::vector<uint32_t> & out_blocks) const {
         out_blocks.clear();
-        uint32_t curr = root;
-        while (curr > ZDD_BASE) {
+        if (root <= ZDD_BASE || root >= nodes.size()) return;
+        if (nodes[root].low == ZDD_EMPTY) {
+            uint32_t curr = root;
+            while (curr > ZDD_BASE && curr < nodes.size()) {
+                const auto & n = nodes[curr];
+                if (n.high != ZDD_EMPTY) {
+                    out_blocks.push_back(n.var);
+                    curr = n.high;
+                } else {
+                    curr = n.low;
+                }
+            }
+            return;
+        }
+
+        std::vector<uint32_t> stack;
+        stack.push_back(root);
+        std::vector<bool> visited(nodes.size(), false);
+        while (!stack.empty()) {
+            uint32_t curr = stack.back();
+            stack.pop_back();
+            if (curr <= ZDD_BASE || curr >= nodes.size() || visited[curr]) continue;
+            visited[curr] = true;
             const auto & n = nodes[curr];
-            // Follow high edge to extract chosen block
             if (n.high != ZDD_EMPTY) {
                 out_blocks.push_back(n.var);
-                curr = n.high;
-            } else {
-                curr = n.low;
+                if (n.high > ZDD_BASE) stack.push_back(n.high);
+            }
+            if (n.low != ZDD_EMPTY && n.low > ZDD_BASE) {
+                stack.push_back(n.low);
             }
         }
+        std::sort(out_blocks.begin(), out_blocks.end());
+        out_blocks.erase(std::unique(out_blocks.begin(), out_blocks.end()), out_blocks.end());
     }
 
     /// Build standard long-context active block set:
@@ -260,6 +285,10 @@ public:
         // Minato Zero-Suppression Rule
         if (high == ZDD_EMPTY) {
             return low;
+        }
+
+        if (var >= (1U << 21) || low >= (1U << 21) || high >= (1U << 21)) {
+            return ZDD_EMPTY;
         }
 
         const uint64_t key = zdd_key_pack(var, low, high);

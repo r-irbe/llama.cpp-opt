@@ -249,10 +249,10 @@ class common_disruptor_ring {
     // Cache Line 0 (128-byte aligned): Producer state & shadow gating copy
     alignas(128) std::atomic<int64_t> m_cursor{-1};        // highest published sequence
     std::atomic<int64_t>             m_claimed{-1};       // claimed sequence for batch reservation
-    int64_t                          m_cached_gating{-1}; // shadow copy of consumer cursor
-    uint64_t                         m_producer_shadow_hits{0};
-    uint64_t                         m_producer_remote_polls{0};
-    uint8_t                          m_pad0[128 - 2 * sizeof(std::atomic<int64_t>) - sizeof(int64_t) - 2 * sizeof(uint64_t)];
+    std::atomic<int64_t>             m_cached_gating{-1}; // shadow copy of consumer cursor
+    std::atomic<uint64_t>            m_producer_shadow_hits{0};
+    std::atomic<uint64_t>            m_producer_remote_polls{0};
+    uint8_t                          m_pad0[128 - 3 * sizeof(std::atomic<int64_t>) - 2 * sizeof(std::atomic<uint64_t>)];
 
     // Cache Line 1 (128-byte aligned): Consumer state & shadow published copy
     alignas(128) std::atomic<int64_t> m_consumer_cursor{-1}; // sequence processed by consumer
@@ -274,11 +274,11 @@ public:
     void clear() {
         m_cursor.store(-1, std::memory_order_relaxed);
         m_claimed.store(-1, std::memory_order_relaxed);
-        m_cached_gating = -1;
+        m_cached_gating.store(-1, std::memory_order_relaxed);
         m_consumer_cursor.store(-1, std::memory_order_relaxed);
         m_cached_published = -1;
-        m_producer_shadow_hits = 0;
-        m_producer_remote_polls = 0;
+        m_producer_shadow_hits.store(0, std::memory_order_relaxed);
+        m_producer_remote_polls.store(0, std::memory_order_relaxed);
         m_consumer_shadow_hits = 0;
         m_consumer_remote_polls = 0;
     }
@@ -291,46 +291,57 @@ public:
 
     // Reserve a single slot in the ring buffer. Returns sequence number, or -1 if full.
     int64_t claim() {
-        const int64_t next_seq = m_claimed.load(std::memory_order_relaxed) + 1;
-        const int64_t wrap_point = next_seq - static_cast<int64_t>(Capacity);
+        int64_t current = m_claimed.load(std::memory_order_relaxed);
+        while (true) {
+            const int64_t next_seq = current + 1;
+            const int64_t wrap_point = next_seq - static_cast<int64_t>(Capacity);
 
-        // Check local shadow copy first to prevent cross-socket cache line invalidation
-        if (wrap_point > m_cached_gating) {
-            m_cached_gating = m_consumer_cursor.load(std::memory_order_acquire);
-            m_producer_remote_polls++;
-            if (wrap_point > m_cached_gating) {
-                return -1; // Ring buffer full
+            // Check local shadow copy first to prevent cross-socket cache line invalidation
+            int64_t cached = m_cached_gating.load(std::memory_order_relaxed);
+            if (wrap_point > cached) {
+                cached = m_consumer_cursor.load(std::memory_order_acquire);
+                m_cached_gating.store(cached, std::memory_order_relaxed);
+                m_producer_remote_polls.fetch_add(1, std::memory_order_relaxed);
+                if (wrap_point > cached) {
+                    return -1; // Ring buffer full
+                }
+            } else {
+                m_producer_shadow_hits.fetch_add(1, std::memory_order_relaxed);
             }
-        } else {
-            m_producer_shadow_hits++;
-        }
 
-        m_claimed.store(next_seq, std::memory_order_relaxed);
-        return next_seq;
+            if (m_claimed.compare_exchange_weak(current, next_seq, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return next_seq;
+            }
+        }
     }
 
     // Reserve a batch of n slots in the ring buffer. Returns true on success, false if space is insufficient.
     bool claim_batch(size_t n, int64_t & start_seq, int64_t & end_seq) {
         if (n == 0 || n > Capacity) return false;
 
-        const int64_t current_claimed = m_claimed.load(std::memory_order_relaxed);
-        const int64_t proposed_end = current_claimed + static_cast<int64_t>(n);
-        const int64_t wrap_point = proposed_end - static_cast<int64_t>(Capacity);
+        int64_t current_claimed = m_claimed.load(std::memory_order_relaxed);
+        while (true) {
+            const int64_t proposed_end = current_claimed + static_cast<int64_t>(n);
+            const int64_t wrap_point = proposed_end - static_cast<int64_t>(Capacity);
 
-        if (wrap_point > m_cached_gating) {
-            m_cached_gating = m_consumer_cursor.load(std::memory_order_acquire);
-            m_producer_remote_polls++;
-            if (wrap_point > m_cached_gating) {
-                return false;
+            int64_t cached = m_cached_gating.load(std::memory_order_relaxed);
+            if (wrap_point > cached) {
+                cached = m_consumer_cursor.load(std::memory_order_acquire);
+                m_cached_gating.store(cached, std::memory_order_relaxed);
+                m_producer_remote_polls.fetch_add(1, std::memory_order_relaxed);
+                if (wrap_point > cached) {
+                    return false;
+                }
+            } else {
+                m_producer_shadow_hits.fetch_add(1, std::memory_order_relaxed);
             }
-        } else {
-            m_producer_shadow_hits++;
-        }
 
-        start_seq = current_claimed + 1;
-        end_seq = proposed_end;
-        m_claimed.store(proposed_end, std::memory_order_relaxed);
-        return true;
+            if (m_claimed.compare_exchange_weak(current_claimed, proposed_end, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                start_seq = current_claimed + 1;
+                end_seq = proposed_end;
+                return true;
+            }
+        }
     }
 
     // Access element at claimed sequence for in-place writing
@@ -468,14 +479,16 @@ public:
     }
 
     // Telemetry & Verification Metrics
-    uint64_t producer_shadow_hits() const { return m_producer_shadow_hits; }
-    uint64_t producer_remote_polls() const { return m_producer_remote_polls; }
+    uint64_t producer_shadow_hits() const { return m_producer_shadow_hits.load(std::memory_order_relaxed); }
+    uint64_t producer_remote_polls() const { return m_producer_remote_polls.load(std::memory_order_relaxed); }
     uint64_t consumer_shadow_hits() const { return m_consumer_shadow_hits; }
     uint64_t consumer_remote_polls() const { return m_consumer_remote_polls; }
     
     double producer_shadow_hit_rate() const {
-        uint64_t total = m_producer_shadow_hits + m_producer_remote_polls;
-        return total > 0 ? (100.0 * m_producer_shadow_hits / total) : 0.0;
+        uint64_t hits = m_producer_shadow_hits.load(std::memory_order_relaxed);
+        uint64_t polls = m_producer_remote_polls.load(std::memory_order_relaxed);
+        uint64_t total = hits + polls;
+        return total > 0 ? (100.0 * hits / total) : 0.0;
     }
 
     double consumer_shadow_hit_rate() const {

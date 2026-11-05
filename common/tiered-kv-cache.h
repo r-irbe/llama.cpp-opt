@@ -61,6 +61,9 @@ public:
 
         // Allocate Tier 2 NVMe simulated backing memory (aligned to 4096-byte sectors)
         m_tier2_storage.resize(cfg.max_tier2_blocks * m_block_bytes, 0);
+        for (size_t s = cfg.max_tier2_blocks; s > 0; --s) {
+            m_tier2_free_slots.push_back(s - 1);
+        }
 
         if (cfg.enable_background_pretoucher) {
             m_pretoucher_thread = std::thread(&common_tiered_kv_cache::pretoucher_loop, this);
@@ -89,7 +92,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_tier_mutex);
             m_block_tiers.erase(bid);
-            m_tier2_slots.erase(bid);
+            auto it = m_tier2_slots.find(bid);
+            if (it != m_tier2_slots.end()) {
+                m_tier2_free_slots.push_back(it->second);
+                m_tier2_slots.erase(it);
+            }
             m_tier3_storage.erase(bid);
         }
         m_paged_cache.release_block(bid);
@@ -107,12 +114,18 @@ public:
     // Demote block from Tier 1 (Host NUMA) to Tier 2 (Local NVMe direct block)
     bool demote_to_tier2(int32_t bid, const uint8_t * src_bytes = nullptr) {
         std::lock_guard<std::mutex> lock(m_tier_mutex);
-        if (m_tier2_slots.size() >= m_cfg.max_tier2_blocks) {
-            return false; // Tier 2 storage full
+        size_t slot_idx = 0;
+        auto it = m_tier2_slots.find(bid);
+        if (it != m_tier2_slots.end()) {
+            slot_idx = it->second;
+        } else {
+            if (m_tier2_free_slots.empty()) {
+                return false; // Tier 2 storage full
+            }
+            slot_idx = m_tier2_free_slots.back();
+            m_tier2_free_slots.pop_back();
+            m_tier2_slots[bid] = slot_idx;
         }
-
-        size_t slot_idx = m_tier2_slots.size();
-        m_tier2_slots[bid] = slot_idx;
 
         uint8_t * dest = m_tier2_storage.data() + slot_idx * m_block_bytes;
         if (src_bytes) {
@@ -134,6 +147,7 @@ public:
         const uint8_t * src = m_tier2_storage.data() + it->second * m_block_bytes;
         m_tier3_storage[bid] = std::vector<uint8_t>(src, src + m_block_bytes);
 
+        m_tier2_free_slots.push_back(it->second);
         m_tier2_slots.erase(it);
         m_block_tiers[bid] = KV_TIER_3_COLD_ARCHIVE;
         return true;
@@ -150,6 +164,7 @@ public:
         const uint8_t * src = m_tier2_storage.data() + it->second * m_block_bytes;
         std::memcpy(dest_bytes, src, m_block_bytes);
 
+        m_tier2_free_slots.push_back(it->second);
         m_tier2_slots.erase(it);
         m_block_tiers[bid] = KV_TIER_1_HOST_NUMA;
         return true;
@@ -210,6 +225,7 @@ private:
     std::mutex m_tier_mutex;
     std::unordered_map<int32_t, kv_cache_tier> m_block_tiers;
     std::unordered_map<int32_t, size_t> m_tier2_slots;
+    std::vector<size_t> m_tier2_free_slots;
     std::vector<uint8_t> m_tier2_storage;
     std::unordered_map<int32_t, std::vector<uint8_t>> m_tier3_storage;
 

@@ -4064,8 +4064,10 @@ void server_context::apply_checkpoint(server_slot & slot) {
                         return false;
                     }
                     if (cur.data.empty() && !cur.spill_path.empty() && use_capsule_filter && !query_token_vec.empty()) {
-                        const int32_t q_len = std::min<int32_t>((int32_t)query_token_vec.size(), std::max<int32_t>(1, (int32_t)cur.n_tokens));
-                        if (!cur.capsule.matches_token_span(query_token_vec.data(), q_len, slot.capsule_filter_mode)) {
+                        const size_t offset = (size_t)cur.pos_min < query_token_vec.size() ? (size_t)cur.pos_min : 0;
+                        const int32_t remaining = (int32_t)(query_token_vec.size() - offset);
+                        const int32_t q_len = std::min<int32_t>(remaining, std::max<int32_t>(1, (int32_t)cur.n_tokens));
+                        if (!cur.capsule.matches_token_span(query_token_vec.data() + offset, q_len, slot.capsule_filter_mode)) {
                             slot.capsule_filter_skips++;
                             capsule_filter_skips++;
                             return false;
@@ -4599,7 +4601,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     && slot.prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
                     // process the image
                     size_t n_tokens_out = 0;
-                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
+                    llama_pos p1 = slot.cache_tokens.pos_next();
                     server_mtp_warmup mtp_media_warmup {
                         ctx,
                         slot.uses_mtp() && slot.spec ? &slot : nullptr,
