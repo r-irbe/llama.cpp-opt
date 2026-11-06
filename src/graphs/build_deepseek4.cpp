@@ -544,7 +544,22 @@ static ggml_tensor * dsv4_comp_get_k(
         return ggml_reshape_4d(ctx, dsv4_cache_view_3d(ctx, cache, n_embd_head, n_kv), n_embd_head, 1, n_kv, 1);
     }
 
-    return dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size, comp.sinfo.s0, (int64_t) comp.sinfo.n_stream());
+    const auto & sinfo = comp.sinfo;
+    bool contiguous = true;
+    for (size_t s = 1; s < sinfo.n_stream(); ++s) {
+        if (sinfo.strm[s] != sinfo.strm[s - 1] + 1) { contiguous = false; break; }
+    }
+    if (contiguous) {
+        return dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size, comp.sinfo.s0, (int64_t) comp.sinfo.n_stream());
+    }
+
+    // Non-adjacent slots (e.g. streams 0 and 2): gather each stream's view in batch order.
+    ggml_tensor * out = nullptr;
+    for (size_t s = 0; s < sinfo.n_stream(); ++s) {
+        ggml_tensor * v = dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size, (int64_t) sinfo.strm[s], 1);
+        out = out ? ggml_concat(ctx, out, v, 3) : v;
+    }
+    return out;
 }
 
 static ggml_tensor * dsv4_comp_cpy_k(

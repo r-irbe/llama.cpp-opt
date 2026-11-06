@@ -3055,6 +3055,7 @@ struct ggml_compute_state_shared {
     void * abort_callback_data;
 
     atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
+    atomic_int current_chunk_socket[8]; // per-socket chunk counters for NUMA locality-scheduled mul_mat_id
 
     enum ggml_status ec;
 };
@@ -18363,7 +18364,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = (const char*)ggml_cpu_numa_local_ptr(src0, src0->data) + (0 + i02 * nb02 + i03 * nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -18534,10 +18535,11 @@ static int ggml_compute_forward_mul_mat(
                 GGML_ASSERT(dst_next->type == GGML_TYPE_F32);
                 GGML_ASSERT(src0_next->ne[0] == ne00);
                 //if (ith == 0) printf("Fusing %s\n", src0_next->name);
+                const void * src0_next_data = ggml_cpu_numa_local_ptr(src0_next, src0_next->data);
                 if (!iqk_mul_mat_4d(src0_next->ne[1], ne11, ne00,
                     src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
                     dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
-                    src0_next->type, src0_next->data, src0_next->nb[1],
+                    src0_next->type, src0_next_data, src0_next->nb[1],
                     vec_dot_type, wdata, row_size,
                     (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
                 ++node_n;
@@ -18749,8 +18751,18 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    const int n_sockets_mm = ggml_cpu_numa_socket_count();
+    const bool use_socket_sched_mm = ggml_cpu_numa_has_expert_socket_binding(src0) && (n_sockets_mm >= 2) && (n_sockets_mm <= 8) && (nth >= n_sockets_mm);
+
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
+        if (use_socket_sched_mm) {
+            for (int s = 0; s < n_sockets_mm; ++s) {
+                const int s_start = (s * nth) / n_sockets_mm;
+                const int s_end   = ((s + 1) * nth) / n_sockets_mm;
+                atomic_store(&params->shared->current_chunk_socket[s], s_end - s_start);
+            }
+        }
     }
 
     ggml_barrier(params->shared);
@@ -18760,6 +18772,56 @@ static void ggml_compute_forward_mul_mat_id(
     if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
+        const char * src0_base   = (const char *) ggml_cpu_numa_local_ptr(src0, src0->data);
+
+        if (use_socket_sched_mm) {
+            const int my_sock     = ggml_cpu_numa_thread_socket(ith, nth);
+            const int s_start     = (my_sock * nth) / n_sockets_mm;
+            const int s_end       = ((my_sock + 1) * nth) / n_sockets_mm;
+            const int nth_sock    = MAX(1, s_end - s_start);
+            const int local_ith   = ith - s_start;
+            const int chunks_per_expert = MAX(1, MIN(nth_sock, (int)(ne01 / 32)));
+
+            for (int pass = 0; pass < n_sockets_mm; ++pass) {
+                const int sock = (my_sock + pass) % n_sockets_mm;
+                int total_sock_chunks = 0;
+                for (int a = sock; a < n_as; a += n_sockets_mm) {
+                    if (matrix_row_counts[a] > 0) total_sock_chunks += chunks_per_expert;
+                }
+                if (total_sock_chunks == 0) continue;
+
+                int chunk_id = (pass == 0)
+                    ? local_ith
+                    : atomic_fetch_add(&params->shared->current_chunk_socket[sock], 1);
+                int last_a = sock;
+                int last_acc = 0;
+                while (chunk_id < total_sock_chunks) {
+                    int acc = last_acc, cur_a = -1, local_chunk = 0;
+                    for (int a = last_a; a < n_as; a += n_sockets_mm) {
+                        if (matrix_row_counts[a] == 0) continue;
+                        if (chunk_id < acc + chunks_per_expert) {
+                            cur_a = a;
+                            local_chunk = chunk_id - acc;
+                            break;
+                        }
+                        acc += chunks_per_expert;
+                    }
+                    if (cur_a < 0) break;
+                    last_a = cur_a;
+                    last_acc = acc;
+
+                    const char * src0_cur = src0_base + cur_a*nb02;
+                    if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
+                                src0->type, src0_cur, nb01,
+                                vec_dot_type, (const char *)wdata_mm, row_size_mm,
+                                (float *)dst->data, nb1, nb2,
+                                matrix_rows + cur_a*ne12, local_chunk, chunks_per_expert)) goto IQK_MulMat_Not_Available0;
+
+                    chunk_id = atomic_fetch_add(&params->shared->current_chunk_socket[sock], 1);
+                }
+            }
+            return;
+        }
 
         const int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
 
@@ -18768,11 +18830,13 @@ static void ggml_compute_forward_mul_mat_id(
             if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
         }
 
+        int last_a = 0;
+        int last_acc = 0;
         int chunk_id = ith;
         while (chunk_id < total_chunks) {
             // Map global chunk_id to (expert_index, local_chunk_index)
-            int acc = 0, cur_a = -1, local_chunk = 0;
-            for (int a = 0; a < n_as; a++) {
+            int acc = last_acc, cur_a = -1, local_chunk = 0;
+            for (int a = last_a; a < n_as; a++) {
                 if (matrix_row_counts[a] == 0) continue;
                 if (chunk_id < acc + chunks_per_expert) {
                     cur_a = a;
@@ -18781,8 +18845,11 @@ static void ggml_compute_forward_mul_mat_id(
                 }
                 acc += chunks_per_expert;
             }
+            if (cur_a < 0) break;
+            last_a = cur_a;
+            last_acc = acc;
 
-            const char * src0_cur = (const char *) ggml_cpu_numa_local_ptr(src0, src0->data) + cur_a*nb02;
+            const char * src0_cur = src0_base + cur_a*nb02;
 
             if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
                         src0->type, src0_cur, nb01,
@@ -19080,8 +19147,18 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
 #if defined GGML_EXPERT_CHUNKING
 
+    const int n_sockets_ug = ggml_cpu_numa_socket_count();
+    const bool use_socket_sched_ug = ggml_cpu_numa_has_expert_socket_binding(src0_1) && (n_sockets_ug >= 2) && (n_sockets_ug <= 8) && (nth >= n_sockets_ug);
+
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
+        if (use_socket_sched_ug) {
+            for (int s = 0; s < n_sockets_ug; ++s) {
+                const int s_start = (s * nth) / n_sockets_ug;
+                const int s_end   = ((s + 1) * nth) / n_sockets_ug;
+                atomic_store(&params->shared->current_chunk_socket[s], s_end - s_start);
+            }
+        }
     }
 
     ggml_barrier(params->shared);
@@ -19091,6 +19168,73 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     const void * wdata_ug    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size_ug = ggml_row_size(vec_dot_type, ne10);
     const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
+    const char * src0_1_base = (const char *) ggml_cpu_numa_local_ptr(src0_1, src0_1->data);
+    const char * src0_2_base = src0_2 ? (const char *) ggml_cpu_numa_local_ptr(src0_2, src0_2->data) : NULL;
+
+    if (use_socket_sched_ug) {
+        const int my_sock            = ggml_cpu_numa_thread_socket(ith, nth);
+        const int s_start            = (my_sock * nth) / n_sockets_ug;
+        const int s_end              = ((my_sock + 1) * nth) / n_sockets_ug;
+        const int nth_sock           = MAX(1, s_end - s_start);
+        const int local_ith          = ith - s_start;
+        const int chunks_per_expert_ug = MAX(1, MIN(nth_sock, (int)(nr0_base / 32)));
+
+        for (int pass = 0; pass < n_sockets_ug; ++pass) {
+            const int sock = (my_sock + pass) % n_sockets_ug;
+            int total_sock_chunks = 0;
+            for (int a = sock; a < n_as; a += n_sockets_ug) {
+                if (matrix_row_counts[a] > 0) total_sock_chunks += chunks_per_expert_ug;
+            }
+            if (total_sock_chunks == 0) continue;
+
+            int chunk_id_ug = (pass == 0)
+                ? local_ith
+                : atomic_fetch_add(&params->shared->current_chunk_socket[sock], 1);
+            int last_a = sock;
+            int last_acc = 0;
+            while (chunk_id_ug < total_sock_chunks) {
+                int acc = last_acc, cur_a = -1, local_chunk = 0;
+                for (int a = last_a; a < n_as; a += n_sockets_ug) {
+                    if (matrix_row_counts[a] == 0) continue;
+                    if (chunk_id_ug < acc + chunks_per_expert_ug) {
+                        cur_a = a;
+                        local_chunk = chunk_id_ug - acc;
+                        break;
+                    }
+                    acc += chunks_per_expert_ug;
+                }
+                if (cur_a < 0) break;
+                last_a = cur_a;
+                last_acc = acc;
+
+                const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
+                if (src0_2) {
+                    src0_1_cur = src0_1_base + cur_a*nb02;
+                    src0_2_cur = src0_2_base + cur_a*nb02;
+                    up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
+                    gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+                } else {
+                    src0_2_cur = src0_1_base + cur_a*nb02;
+                    src0_1_cur = src0_2_cur + nb02/2;
+                    if (up_b) {
+                        GGML_ASSERT(!gate_b);
+                        gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                        up_b_cur   = gate_b_cur + nb41/2;
+                    }
+                }
+
+                if (!iqk_moe_fused_up_gate(nr0_base, matrix_row_counts[cur_a], ne00, ne11, dst->op_params[0],
+                                    type, src0_1_cur, src0_2_cur, nb01,
+                                    vec_dot_type, (const char *)wdata_ug, row_size_ug,
+                                    up_b_cur, gate_b_cur,
+                                    (float *)dst->data, nb1, nb2,
+                                    matrix_rows + cur_a*ne12, limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
+
+                chunk_id_ug = atomic_fetch_add(&params->shared->current_chunk_socket[sock], 1);
+            }
+        }
+        return;
+    }
 
     const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
 
@@ -19121,12 +19265,12 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
+            src0_1_cur = src0_1_base + cur_a*nb02;
+            src0_2_cur = src0_2_base + cur_a*nb02;
             up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
             gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = src0_1_base + cur_a*nb02;
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
@@ -19150,6 +19294,8 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     ggml_barrier(params->shared);
 
     const float limit = *(const float *)(dst->op_params + 1);
+    const char * src0_1_base = (const char *) ggml_cpu_numa_local_ptr(src0_1, src0_1->data);
+    const char * src0_2_base = src0_2 ? (const char *) ggml_cpu_numa_local_ptr(src0_2, src0_2->data) : NULL;
 
     // so GGML_TENSOR_BINARY_OP_LOCALS works
 
@@ -19163,12 +19309,12 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
+            src0_1_cur = src0_1_base + cur_a*nb02;
+            src0_2_cur = src0_2_base + cur_a*nb02;
             up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
             gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = src0_1_base + cur_a*nb02;
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
@@ -19257,8 +19403,11 @@ static void ggml_compute_forward_mul_mat_up_gate(
 
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
+    const void * src0_1_data = ggml_cpu_numa_local_ptr(src0_1, src0_1->data);
+    const void * src0_2_data = ggml_cpu_numa_local_ptr(src0_2, src0_2->data);
+
     if (!iqk_moe_fused_up_gate(ne01, ne11, ne00, ne11, dst->op_params[0],
-                         type, src0_1->data, src0_2->data, nb01,
+                         type, src0_1_data, src0_2_data, nb01,
                          vec_dot_type, (const char *)wdata, row_size,
                          NULL, NULL,
                          (float *)dst->data, nb1, nb2,
@@ -29921,6 +30070,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.abort_callback          =*/ NULL,
         /*.abort_callback_data     =*/ NULL,
         /*.current_chunk           =*/ 0,
+        /*.current_chunk_socket    =*/ { 0 },
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
     };
 

@@ -948,6 +948,11 @@ int detect_path_numa_node(const char * path, const std::string & sysfs_root) {
     return 0; // Default to Node 0
 }
 
+static std::mutex g_expert_bind_mutex;
+static std::unordered_map<const struct ggml_tensor *, int> g_expert_bind_mode; // 1 = node_round_robin, 2 = socket_striped
+static std::atomic<int> g_expert_bound_tensors{0};
+static std::atomic<int> g_expert_global_mode{0}; // 0 = none, 1 = node, 2 = socket
+
 bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nodes) {
 #if defined(__gnu_linux__)
     if (!tensor || !tensor->data || tensor->ne[2] <= 1 || n_numa_nodes <= 1) {
@@ -1009,12 +1014,164 @@ bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nod
                                 : "slices fell back to MPOL_PREFERRED, no migration happened");
     }
 
+    if (n_ok > 0) {
+        std::lock_guard<std::mutex> lock(g_expert_bind_mutex);
+        g_expert_bind_mode[tensor] = 1;
+        g_expert_bound_tensors.fetch_add(1, std::memory_order_relaxed);
+        g_expert_global_mode.store(1, std::memory_order_relaxed);
+    }
+
     return n_ok > 0;
 #else
     (void)tensor;
     (void)n_numa_nodes;
     return false;
 #endif
+}
+
+bool bind_tensor_experts_socket_striped(struct ggml_tensor * tensor) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data || tensor->ne[2] <= 1) {
+        return false;
+    }
+
+    const auto & topo = topology();
+    if (topo.size() < 2) {
+        return false;
+    }
+
+    // Collect distinct physical socket IDs in topology order; if the machine is single-socket
+    // multi-NUMA (e.g. 1S NPS4), partition into 2 balanced NUMA halves so socket-striped mode
+    // still avoids single-node hotspots while pooling multiple memory controllers per partition.
+    std::vector<int> sockets;
+    for (const auto & n : topo) {
+        if (n.socket_id >= 0 && std::find(sockets.begin(), sockets.end(), n.socket_id) == sockets.end()) {
+            sockets.push_back(n.socket_id);
+        }
+    }
+
+    const size_t bits_per_word = 8 * sizeof(unsigned long);
+    int max_node_id = 0;
+    for (const auto & n : topo) {
+        max_node_id = std::max(max_node_id, n.id);
+    }
+    const size_t mask_words = max_node_id / bits_per_word + 1;
+
+    std::vector<std::vector<unsigned long>> partition_masks;
+    if (sockets.size() >= 2) {
+        partition_masks.resize(sockets.size(), std::vector<unsigned long>(mask_words, 0));
+        for (size_t s = 0; s < sockets.size(); ++s) {
+            for (const auto & n : topo) {
+                if (n.socket_id == sockets[s] && n.id >= 0) {
+                    partition_masks[s][n.id / bits_per_word] |= 1UL << (n.id % bits_per_word);
+                }
+            }
+        }
+    } else {
+        // Single-socket multi-NUMA fallback: 2 halves
+        partition_masks.resize(2, std::vector<unsigned long>(mask_words, 0));
+        for (size_t i = 0; i < topo.size(); ++i) {
+            const size_t part = (i >= topo.size() / 2) ? 1 : 0;
+            const int nid = topo[i].id;
+            if (nid >= 0) {
+                partition_masks[part][nid / bits_per_word] |= 1UL << (nid % bits_per_word);
+            }
+        }
+    }
+
+    const int n_parts = (int) partition_masks.size();
+    const int n_experts = (int) tensor->ne[2];
+    const size_t expert_stride = tensor->nb[2];
+    const uintptr_t page_mask = ~(4096ULL - 1);
+
+    static std::atomic<bool> s_logged_socket_bind{false};
+    if (!s_logged_socket_bind.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "ggml_numa: --numa expert binding %d experts socket-striped across %d socket domains "
+                "(MPOL_INTERLEAVE within each socket's local memory controllers, first tensor=%s)\n",
+                n_experts, n_parts, tensor->name);
+    }
+
+    int n_ok = 0;
+    int n_fail = 0;
+    int first_errno = 0;
+
+    for (int e = 0; e < n_experts; ++e) {
+        const int part = e % n_parts;
+        const uintptr_t start_addr = (uintptr_t) tensor->data + (size_t) e * expert_stride;
+        const uintptr_t end_addr   = start_addr + expert_stride;
+
+        const uintptr_t page_start = start_addr & page_mask;
+        const uintptr_t page_end   = (end_addr + 4095ULL) & page_mask;
+        const size_t len           = page_end - page_start;
+        if (len == 0) continue;
+
+        long ret = syscall(__NR_mbind, (void *) page_start, len, MPOL_INTERLEAVE,
+                           partition_masks[part].data(), mask_words * bits_per_word, MPOL_MF_MOVE);
+        if (ret == 0) {
+            n_ok++;
+        } else {
+            n_fail++;
+            if (first_errno == 0) {
+                first_errno = errno;
+            }
+        }
+    }
+
+    static std::atomic<bool> s_logged_socket_bind_result{false};
+    if (n_fail > 0 && !s_logged_socket_bind_result.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "ggml_numa: --numa expert socket-striped mbind(MPOL_INTERLEAVE, MPOL_MF_MOVE) refused for %d/%d slices (first errno=%d %s)\n",
+                n_fail, n_ok + n_fail, first_errno, strerror(first_errno));
+    }
+
+    if (n_ok > 0) {
+        std::lock_guard<std::mutex> lock(g_expert_bind_mutex);
+        g_expert_bind_mode[tensor] = 2;
+        g_expert_bound_tensors.fetch_add(1, std::memory_order_relaxed);
+        g_expert_global_mode.store(2, std::memory_order_relaxed);
+    }
+
+    return n_ok > 0;
+#else
+    (void) tensor;
+    return false;
+#endif
+}
+
+bool has_any_expert_binding() {
+    return g_expert_bound_tensors.load(std::memory_order_relaxed) > 0;
+}
+
+bool has_expert_socket_binding(const struct ggml_tensor * tensor) {
+    if (g_expert_bound_tensors.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    if (!tensor) {
+        return g_expert_global_mode.load(std::memory_order_relaxed) == 2;
+    }
+    // Fast lock-free check when all bound tensors share the same mode (the common case)
+    const int gmode = g_expert_global_mode.load(std::memory_order_relaxed);
+    if (gmode == 2) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_bind_mutex);
+    auto it = g_expert_bind_mode.find(tensor);
+    return it != g_expert_bind_mode.end() && it->second == 2;
+}
+
+int get_tensor_expert_home_socket(const struct ggml_tensor * tensor, int expert_idx) {
+    (void) tensor;
+    if (expert_idx < 0) return -1;
+    const int n_sock = std::max(1, socket_count());
+    const int n_parts = (n_sock >= 2) ? n_sock : (topology().size() >= 2 ? 2 : 1);
+    return expert_idx % n_parts;
+}
+
+int get_tensor_expert_home_node(const struct ggml_tensor * tensor, int expert_idx) {
+    (void) tensor;
+    if (expert_idx < 0) return -1;
+    const auto & topo = topology();
+    if (topo.empty()) return -1;
+    return topo[expert_idx % topo.size()].id;
 }
 
 static std::atomic<bool> g_numa_replicate_shared{false};
@@ -1255,6 +1412,128 @@ bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes) {
 #endif
 }
 
+bool replicate_tensor_socket(struct ggml_tensor * tensor) {
+#if defined(__gnu_linux__)
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+    const auto & topo = topology();
+    if (topo.size() < 2) {
+        return false;
+    }
+    const size_t size = ggml_nbytes(tensor);
+    if (size < 4096) return false;
+
+    std::lock_guard<std::mutex> lock(g_replica_mutex);
+    auto it = g_tensor_replicas.find(tensor);
+    if (it != g_tensor_replicas.end() && !it->second.empty()) {
+        return true;
+    }
+
+    // Collect distinct physical socket IDs in topology order; if the machine is single-socket
+    // multi-NUMA (e.g. 1S NPS4), partition into 2 balanced NUMA halves.
+    std::vector<int> sockets;
+    for (const auto & n : topo) {
+        if (n.socket_id >= 0 && std::find(sockets.begin(), sockets.end(), n.socket_id) == sockets.end()) {
+            sockets.push_back(n.socket_id);
+        }
+    }
+
+    const size_t bits_per_word = 8 * sizeof(unsigned long);
+    int max_node_id = 0;
+    for (const auto & n : topo) {
+        max_node_id = std::max(max_node_id, n.id);
+    }
+    const size_t mask_words = max_node_id / bits_per_word + 1;
+    const unsigned long maxnode = mask_words * bits_per_word;
+
+    std::vector<std::vector<unsigned long>> part_masks;
+    std::vector<int> node_to_part(max_node_id + 1, 0);
+
+    if (sockets.size() >= 2) {
+        part_masks.resize(sockets.size(), std::vector<unsigned long>(mask_words, 0));
+        for (size_t s = 0; s < sockets.size(); ++s) {
+            for (const auto & n : topo) {
+                if (n.socket_id == sockets[s] && n.id >= 0) {
+                    part_masks[s][n.id / bits_per_word] |= 1UL << (n.id % bits_per_word);
+                    node_to_part[n.id] = (int) s;
+                }
+            }
+        }
+    } else {
+        part_masks.resize(2, std::vector<unsigned long>(mask_words, 0));
+        for (size_t i = 0; i < topo.size(); ++i) {
+            const int part = (i >= topo.size() / 2) ? 1 : 0;
+            const int nid = topo[i].id;
+            if (nid >= 0) {
+                part_masks[part][nid / bits_per_word] |= 1UL << (nid % bits_per_word);
+                node_to_part[nid] = part;
+            }
+        }
+    }
+
+    const int n_parts = (int) part_masks.size();
+    std::vector<void *> part_ptrs(n_parts, nullptr);
+    int created = 0;
+    int first_errno = 0;
+
+    for (int p = 0; p < n_parts; ++p) {
+        void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED) {
+            if (!first_errno) first_errno = errno;
+            continue;
+        }
+
+        // Install MPOL_INTERLEAVE across all NUMA nodes belonging to this socket before first fault
+        if (syscall(__NR_mbind, ptr, size, MPOL_INTERLEAVE, part_masks[p].data(), maxnode, 0) != 0) {
+            if (!first_errno) first_errno = errno;
+        }
+        madvise(ptr, size, MADV_HUGEPAGE);
+
+        memcpy(ptr, tensor->data, size);
+
+        // Enforce socket-local interleave placement across the populated pages
+        if (syscall(__NR_mbind, ptr, size, MPOL_INTERLEAVE, part_masks[p].data(), maxnode, MPOL_MF_MOVE) != 0) {
+            if (!first_errno) first_errno = errno;
+        }
+
+        part_ptrs[p] = ptr;
+        ++created;
+    }
+
+    if (created == 0) {
+        fprintf(stderr, "ggml_numa: could not socket-replicate %s (%.1f MiB): %s\n",
+                tensor->name, size / (1024.0 * 1024.0), strerror(first_errno ? first_errno : ENOMEM));
+        return false;
+    }
+
+    // Map every NUMA node 0..max_node_id to its socket's shared copy so numa_local_ptr()
+    // resolves in O(1) without knowing whether replication was per-node or per-socket.
+    std::vector<void *> replicas(max_node_id + 1, nullptr);
+    for (const auto & n : topo) {
+        if (n.id >= 0 && n.id <= max_node_id) {
+            replicas[n.id] = part_ptrs[node_to_part[n.id]];
+        }
+    }
+
+    g_tensor_replicas[tensor] = std::move(replicas);
+    g_replica_epoch.fetch_add(1, std::memory_order_relaxed);
+    g_replica_tensor_count.fetch_add(1, std::memory_order_relaxed);
+
+    static std::atomic<int> s_logged_sock{0};
+    if (s_logged_sock.fetch_add(1, std::memory_order_relaxed) == 0) {
+        fprintf(stderr, "ggml_numa: socket-replicated %d tensors at %.1f MiB each across %d socket domains "
+                "(%d socket-interleaved copies created across %zu NUMA nodes, first errno=%s)\n",
+                g_replica_tensor_count.load(std::memory_order_relaxed), size / (1024.0 * 1024.0),
+                n_parts, created, topo.size(), first_errno ? strerror(first_errno) : "none");
+    }
+    return true;
+#else
+    (void) tensor;
+    return false;
+#endif
+}
+
 bool has_tensor_replicas() {
     return g_replica_tensor_count.load(std::memory_order_relaxed) > 0;
 }
@@ -1283,6 +1562,33 @@ int current_thread_numa_node() {
 #else
     return -1;
 #endif
+}
+
+int current_thread_socket() {
+    const int node = current_thread_numa_node();
+    if (node < 0) return -1;
+    static thread_local int tls_cached_node = -1;
+    static thread_local int tls_cached_sock = -1;
+    if (node == tls_cached_node && tls_cached_sock >= 0) {
+        return tls_cached_sock;
+    }
+    const auto & topo = topology();
+    const int n_sock = socket_count(topo);
+    int sock = 0;
+    if (n_sock >= 2) {
+        int s = node_socket(topo, node);
+        sock = (s >= 0) ? s : 0;
+    } else if (topo.size() >= 2) {
+        for (size_t i = 0; i < topo.size(); ++i) {
+            if (topo[i].id == node) {
+                sock = (i >= topo.size() / 2) ? 1 : 0;
+                break;
+            }
+        }
+    }
+    tls_cached_node = node;
+    tls_cached_sock = sock;
+    return sock;
 }
 
 const void * numa_local_ptr(const struct ggml_tensor * tensor, const void * ptr) {
@@ -1340,10 +1646,13 @@ void free_tensor_numa_replicas(const struct ggml_tensor * tensor) {
     auto it = g_tensor_replicas.find(tensor);
     if (it != g_tensor_replicas.end()) {
         size_t size = ggml_nbytes(tensor);
+        std::vector<void *> freed;
         for (size_t node = 0; node < it->second.size(); ++node) {
             void * ptr = it->second[node];
-            if (ptr != nullptr && ptr != MAP_FAILED && ptr != tensor->data) {
+            if (ptr != nullptr && ptr != MAP_FAILED && ptr != tensor->data &&
+                std::find(freed.begin(), freed.end(), ptr) == freed.end()) {
                 munmap(ptr, size);
+                freed.push_back(ptr);
             }
         }
         g_tensor_replicas.erase(it);
@@ -1361,10 +1670,13 @@ void free_all_numa_replicas() {
     for (auto & kv : g_tensor_replicas) {
         if (!kv.first) continue;
         size_t size = ggml_nbytes(kv.first);
+        std::vector<void *> freed;
         for (size_t node = 0; node < kv.second.size(); ++node) {
             void * ptr = kv.second[node];
-            if (ptr != nullptr && ptr != MAP_FAILED && ptr != kv.first->data) {
+            if (ptr != nullptr && ptr != MAP_FAILED && ptr != kv.first->data &&
+                std::find(freed.begin(), freed.end(), ptr) == freed.end()) {
                 munmap(ptr, size);
+                freed.push_back(ptr);
             }
         }
     }
@@ -1386,6 +1698,72 @@ bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx) {
 
 bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes) {
     return ggml::cpu::numa::bind_tensor_experts_round_robin(tensor, n_numa_nodes);
+}
+
+bool ggml_cpu_numa_bind_tensor_experts_socket(struct ggml_tensor * tensor) {
+    return ggml::cpu::numa::bind_tensor_experts_socket_striped(tensor);
+}
+
+int ggml_cpu_numa_expert_home_socket(const struct ggml_tensor * tensor, int expert_idx) {
+    return ggml::cpu::numa::get_tensor_expert_home_socket(tensor, expert_idx);
+}
+
+int ggml_cpu_numa_expert_home_node(const struct ggml_tensor * tensor, int expert_idx) {
+    return ggml::cpu::numa::get_tensor_expert_home_node(tensor, expert_idx);
+}
+
+bool ggml_cpu_numa_has_expert_socket_binding(const struct ggml_tensor * tensor) {
+    return ggml::cpu::numa::has_expert_socket_binding(tensor);
+}
+
+bool ggml_cpu_numa_has_any_expert_binding(void) {
+    return ggml::cpu::numa::has_any_expert_binding();
+}
+
+int ggml_cpu_numa_socket_count(void) {
+    const int s = ggml::cpu::numa::socket_count();
+    if (s >= 2) return s;
+    return ggml::cpu::numa::topology().size() >= 2 ? 2 : 1;
+}
+
+int ggml_cpu_numa_node_count(void) {
+    return (int) ggml::cpu::numa::topology().size();
+}
+
+int ggml_cpu_numa_current_socket(void) {
+    return ggml::cpu::numa::current_thread_socket();
+}
+
+int ggml_cpu_numa_thread_node(int thread_idx, int n_threads) {
+    const auto & topo = ggml::cpu::numa::topology();
+    const int n_active = (int) topo.size();
+    if (n_active <= 0) return 0;
+    const int eff_threads = n_threads > 0 ? n_threads : n_active;
+    int active_idx;
+    if (eff_threads >= n_active && thread_idx >= 0 && thread_idx < eff_threads) {
+        active_idx = (int) (((int64_t) thread_idx * n_active) / eff_threads);
+    } else {
+        active_idx = (thread_idx >= 0 ? thread_idx : 0) % n_active;
+    }
+    return topo[active_idx % n_active].id;
+}
+
+int ggml_cpu_numa_thread_socket(int thread_idx, int n_threads) {
+    const auto & topo = ggml::cpu::numa::topology();
+    const int n_active = (int) topo.size();
+    if (n_active <= 1) return 0;
+    const int eff_threads = n_threads > 0 ? n_threads : n_active;
+    int active_idx;
+    if (eff_threads >= n_active && thread_idx >= 0 && thread_idx < eff_threads) {
+        active_idx = (int) (((int64_t) thread_idx * n_active) / eff_threads);
+    } else {
+        active_idx = (thread_idx >= 0 ? thread_idx : 0) % n_active;
+    }
+    const auto & n = topo[active_idx % n_active];
+    if (ggml::cpu::numa::socket_count(topo) >= 2 && n.socket_id >= 0) {
+        return n.socket_id;
+    }
+    return (active_idx >= n_active / 2) ? 1 : 0;
 }
 
 bool ggml_cpu_numa_set_default_interleave(int n_numa_nodes) {
@@ -1411,6 +1789,10 @@ size_t ggml_cpu_numa_prefault_tensor_interleaved(struct ggml_tensor * tensor, in
 
 bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes) {
     return ggml::cpu::numa::replicate_tensor_numa(tensor, n_numa_nodes);
+}
+
+bool ggml_cpu_numa_replicate_tensor_socket(struct ggml_tensor * tensor) {
+    return ggml::cpu::numa::replicate_tensor_socket(tensor);
 }
 
 void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id) {

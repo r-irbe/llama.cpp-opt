@@ -337,11 +337,68 @@ int main() {
                     free_tensor_numa_replicas(t);
                     check(!has_tensor_replicas(), "free_tensor_numa_replicas clears the registry");
                     check(numa_local_ptr(t, mid) == (const void *) mid, "numa_local_ptr is inert again after freeing");
+
+                    // Socket-level replication test (1 replica per socket, interleaved across socket's nodes)
+                    if (socket_count(topology()) >= 2) {
+                        check(replicate_tensor_socket(t), "replicate_tensor_socket creates per-socket copies");
+                        check(has_tensor_replicas(), "has_tensor_replicas reports active socket replicas");
+                        void * rep_n0 = get_tensor_numa_replica(t, 0);
+                        check(rep_n0 != nullptr && rep_n0 != t->data, "socket 0 replica is distinct from base tensor");
+                        bool sock_share_ok = true;
+                        bool sock_place_ok = true;
+                        for (const auto & n : topology()) {
+                            void * r = get_tensor_numa_replica(t, n.id);
+                            if (!r) { sock_share_ok = false; continue; }
+                            if (n.socket_id == topology()[0].socket_id) {
+                                if (r != rep_n0) sock_share_ok = false;
+                            } else {
+                                if (r == rep_n0) sock_share_ok = false;
+                            }
+                            const int pn = page_node(r);
+                            if (pn >= 0 && node_socket(topology(), pn) != n.socket_id) {
+                                sock_place_ok = false;
+                            }
+                        }
+                        check(sock_share_ok, "nodes on the same socket share one replica and remote sockets own a separate replica");
+                        check(sock_place_ok, "each socket replica's pages reside on its own socket's NUMA nodes");
+                        free_tensor_numa_replicas(t);
+                        check(!has_tensor_replicas(), "free_tensor_numa_replicas cleanly unmaps shared socket replicas once");
+                    }
                 }
                 if (buf) {
                     ggml_backend_buffer_free(buf);
                 }
                 ggml_free(ctx);
+            }
+
+            // Socket-striped MoE expert binding + locality-scheduled mul_mat_id test
+            if (socket_count(topology()) >= 2) {
+                ggml_init_params ip_moe = { 64 * 1024 * 1024, nullptr, false };
+                ggml_context * ctx_moe = ggml_init(ip_moe);
+                check(ctx_moe != nullptr, "ggml context for socket-striped MoE probe");
+                if (ctx_moe) {
+                    // 8 experts, each 256 x 256 F32 (256 KiB per expert, 64 pages per expert)
+                    ggml_tensor * exps = ggml_new_tensor_3d(ctx_moe, GGML_TYPE_F32, 256, 256, 8);
+                    float * ed = (float *) exps->data;
+                    for (int64_t i = 0; i < ggml_nelements(exps); ++i) {
+                        ed[i] = (float)((i % 17) - 8) * 0.01f;
+                    }
+                    check(bind_tensor_experts_socket_striped(exps), "bind_tensor_experts_socket_striped succeeds on 8-expert 3D tensor");
+                    check(has_expert_socket_binding(exps), "has_expert_socket_binding reports true after socket-striped bind");
+                    check(ggml_cpu_numa_expert_home_socket(exps, 0) == 0 && ggml_cpu_numa_expert_home_socket(exps, 1) == 1,
+                          "even/odd experts map to socket 0 / socket 1");
+
+                    bool exp_sock_ok = true;
+                    const size_t slice_bytes = exps->nb[2];
+                    for (int e = 0; e < 8; ++e) {
+                        const int pn = page_node((const char *) exps->data + (size_t) e * slice_bytes);
+                        if (pn >= 0 && node_socket(topology(), pn) != (e % socket_count(topology()))) {
+                            exp_sock_ok = false;
+                        }
+                    }
+                    check(exp_sock_ok, "every expert slice resides on its assigned home socket's NUMA nodes");
+                    ggml_free(ctx_moe);
+                }
             }
         }
     }

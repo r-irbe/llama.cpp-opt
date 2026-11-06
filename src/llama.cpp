@@ -5831,20 +5831,26 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         }
 
         if (ggml::cpu::numa::is_numa_replicate_shared()) {
-            const int n_nodes = (int) ggml::cpu::numa::topology().size();
-            if (n_nodes > 1) {
+            const int n_nodes   = (int) ggml::cpu::numa::topology().size();
+            const int n_sockets = ggml_cpu_numa_socket_count();
+            const char * mode_env = getenv("GGML_NUMA_REPLICATE_MODE");
+            const bool use_node_replicas = mode_env && (strcmp(mode_env, "node") == 0 || strcmp(mode_env, "nodes") == 0);
+            const int n_parts = use_node_replicas ? n_nodes : (n_sockets >= 2 ? n_sockets : n_nodes);
+            if (n_parts > 1) {
                 int replicated_count = 0;
                 size_t replicated_bytes = 0;
                 auto replicate = [&](struct ggml_tensor * t, bool always) {
                     if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
                         return;
                     }
-                    // A copy costs (n_nodes-1) x nbytes of RAM; below a few MiB the
-                    // per-node win cannot pay for that unless the caller insists.
+                    // Below a few MiB the per-partition win cannot pay for extra RAM unless the caller insists.
                     if (!always && ggml_nbytes(t) < (8ull << 20)) {
                         return;
                     }
-                    if (ggml::cpu::numa::replicate_tensor_numa(t, n_nodes)) {
+                    const bool ok = use_node_replicas
+                        ? ggml::cpu::numa::replicate_tensor_numa(t, n_nodes)
+                        : ggml::cpu::numa::replicate_tensor_socket(t);
+                    if (ok) {
                         ++replicated_count;
                         replicated_bytes += ggml_nbytes(t);
                     }
@@ -5857,9 +5863,24 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                     replicate(layer.ffn_down_shexp, true);
                 }
 
-                // Anything else the operator wants node-local: host-resident, read-mostly
-                // weights such as a CPU output head or the routers. Routed experts are not
-                // candidates - replicating 269 GiB to 8 nodes is not a trade, it is a bill.
+                // Under --numa mirror or GGML_NUMA_MIRROR_EXPERTS=1, also socket-replicate
+                // routed MoE experts if requested by the operator.
+                const char * mirror_exps_env = getenv("GGML_NUMA_MIRROR_EXPERTS");
+                const bool mirror_exps = mirror_exps_env && (strcmp(mirror_exps_env, "1") == 0 ||
+                                                             strcmp(mirror_exps_env, "true") == 0 ||
+                                                             strcmp(mirror_exps_env, "yes") == 0 ||
+                                                             strcmp(mirror_exps_env, "on") == 0);
+                if (mirror_exps && !use_node_replicas) {
+                    for (auto & layer : model.layers) {
+                        replicate(layer.ffn_gate_exps,    true);
+                        replicate(layer.ffn_up_exps,      true);
+                        replicate(layer.ffn_down_exps,    true);
+                        replicate(layer.ffn_up_gate_exps, true);
+                    }
+                }
+
+                // Anything else the operator wants socket/node-local: host-resident, read-mostly
+                // weights such as a CPU output head or the routers.
                 if (const char * patterns = getenv("GGML_NUMA_REPLICATE_PATTERNS")) {
                     std::vector<std::regex> res;
                     std::string list(patterns);
@@ -5889,27 +5910,32 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                     }
                 }
 
-                LLAMA_LOG_INFO("%s: replicated %d tensors (%.1f MiB per node copy, %.1f GiB extra RAM across %d nodes) - "
+                LLAMA_LOG_INFO("%s: replicated %d tensors (%.1f MiB per copy, %.1f GiB extra RAM across %d %s) - "
                         "set GGML_NUMA_REPLICATE_PATTERNS to add host-resident read-mostly weights\n",
                         __func__, replicated_count, replicated_bytes / (1024.0 * 1024.0),
-                        replicated_bytes * n_nodes / (1024.0 * 1024.0 * 1024.0), n_nodes);
+                        replicated_bytes * n_parts / (1024.0 * 1024.0 * 1024.0), n_parts,
+                        use_node_replicas ? "NUMA nodes" : "sockets");
             }
         }
 
         if (ggml::cpu::numa::is_numa_expert()) {
-            const int n_nodes = (int) ggml::cpu::numa::topology().size();
-            // Per-expert binding puts a whole expert slice on one node. With a skewed
-            // router (a few hot experts) that turns the hot experts' home nodes into
-            // hotspots and every other core reads them remotely: measured 11.05 tok/s
-            // versus 17.06 tok/s for page-striped interleave on 2xEPYC NPS4 with 384
-            // experts. The bind path stays wired for expert-scheduled kernels but is
-            // opt-in; without an interleave baseline it is still the only placement.
+            const int n_nodes   = (int) ggml::cpu::numa::topology().size();
+            const int n_sockets = ggml_cpu_numa_socket_count();
+            // Socket-striped expert binding: bind expert e to Socket (e % n_sockets) with
+            // MPOL_INTERLEAVE across all nodes of that socket (e.g. 4 nodes / 8 DDR4 channels
+            // per socket on 2xEPYC NPS4), paired with socket-local MoE chunk scheduling in
+            // ggml_compute_forward_mul_mat_id(_up_gate). This avoids both the single-node
+            // 2-channel bottleneck of per-node MPOL_BIND and the 50% cross-socket xGMI traffic
+            // of global 8-node MPOL_INTERLEAVE.
+            // GGML_NUMA_EXPERT_BIND=0|off opts out; GGML_NUMA_EXPERT_BIND=node selects legacy per-node binding.
             const char * bind_env = getenv("GGML_NUMA_EXPERT_BIND");
-            const bool explicit_bind = bind_env && strcmp(bind_env, "0") != 0 && strcmp(bind_env, "off") != 0;
-            const bool attempt_bind = n_nodes > 1 && (explicit_bind || !ggml::cpu::numa::default_interleave_active());
+            const bool disable_bind = bind_env && (strcmp(bind_env, "0") == 0 || strcmp(bind_env, "off") == 0 ||
+                                                   strcmp(bind_env, "false") == 0 || strcmp(bind_env, "no") == 0);
+            const bool node_bind    = bind_env && (strcmp(bind_env, "node") == 0 || strcmp(bind_env, "nodes") == 0);
+            const bool attempt_bind = n_nodes > 1 && !disable_bind && (n_sockets >= 2 || node_bind || !ggml::cpu::numa::default_interleave_active());
             if (!attempt_bind) {
                 LLAMA_LOG_INFO("%s: routed MoE experts stay page-striped on the MPOL_INTERLEAVE baseline "
-                        "(set GGML_NUMA_EXPERT_BIND=1 to bind each expert slice to one node instead)\n", __func__);
+                        "(set GGML_NUMA_EXPERT_BIND=socket or node to bind expert slices)\n", __func__);
 
                 // 470 GB walked in 8 MiB slices with 4 KiB pages is a TLB miss stream, but
                 // collapsing to 2 MiB pages makes the interleave granularity 2 MiB and the
@@ -5932,6 +5958,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                         add(layer.ffn_gate_exps);
                         add(layer.ffn_up_exps);
                         add(layer.ffn_down_exps);
+                        add(layer.ffn_up_gate_exps);
                         add(layer.ffn_gate_shexp);
                         add(layer.ffn_up_shexp);
                         add(layer.ffn_down_shexp);
@@ -5967,20 +5994,26 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 }
             } else if (n_nodes > 1) {
                 int bound_count = 0;
+                auto bind_exp = [&](struct ggml_tensor * t) {
+                    if (!t || !t->data || !ggml_backend_buffer_is_host(t->buffer)) return;
+                    const bool ok = (!node_bind && n_sockets >= 2)
+                        ? ggml_cpu_numa_bind_tensor_experts_socket(t)
+                        : ggml_cpu_numa_bind_tensor_experts(t, n_nodes);
+                    if (ok) bound_count++;
+                };
                 for (auto & layer : model.layers) {
-                    if (layer.ffn_gate_exps && layer.ffn_gate_exps->data && ggml_backend_buffer_is_host(layer.ffn_gate_exps->buffer)) {
-                        if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_gate_exps, n_nodes)) bound_count++;
-                    }
-                    if (layer.ffn_up_exps && layer.ffn_up_exps->data && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
-                        if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_up_exps, n_nodes)) bound_count++;
-                    }
-                    if (layer.ffn_down_exps && layer.ffn_down_exps->data && ggml_backend_buffer_is_host(layer.ffn_down_exps->buffer)) {
-                        if (ggml_cpu_numa_bind_tensor_experts(layer.ffn_down_exps, n_nodes)) bound_count++;
-                    }
+                    bind_exp(layer.ffn_gate_exps);
+                    bind_exp(layer.ffn_up_exps);
+                    bind_exp(layer.ffn_down_exps);
+                    bind_exp(layer.ffn_up_gate_exps);
                 }
-                if (ggml::cpu::numa::default_interleave_active()) {
+                if (!node_bind && n_sockets >= 2) {
+                    LLAMA_LOG_INFO("%s: socket-striped expert mbind(MPOL_INTERLEAVE) succeeded on %d routed MoE expert tensors "
+                            "across %d sockets (%d NUMA nodes) with socket-local MoE scheduling (strategy expert)\n",
+                            __func__, bound_count, n_sockets, n_nodes);
+                } else if (ggml::cpu::numa::default_interleave_active()) {
                     LLAMA_LOG_INFO("%s: per-expert mbind succeeded on %d routed MoE expert tensors across %d NUMA nodes "
-                            "(GGML_NUMA_EXPERT_BIND opt-in); the rest stay on the MPOL_INTERLEAVE baseline (strategy expert)\n",
+                            "(GGML_NUMA_EXPERT_BIND=node); the rest stay on the MPOL_INTERLEAVE baseline (strategy expert)\n",
                             __func__, bound_count, n_nodes);
                 } else {
                     LLAMA_LOG_INFO("%s: bound %d routed MoE expert tensors across %d NUMA nodes (strategy expert)\n",
@@ -6767,9 +6800,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 const int64_t n_stored = &mask_kv_self == &kv_self ? n_tokens : 0;
                 const int64_t live = built.compacted
                     ? (int64_t) mask_kv_self.live_swa() + n_stored : 0;
+                const uint32_t eff_window = built.compacted
+                    ? built.window * std::max<uint32_t>(1, mask_kv_self.n_seq_max_swa)
+                    : built.window;
                 const llama_swa_window_view view = built.compacted
                     ? llama_swa_calc_window_view_compact(live, mask_kv_self.sink_rows,
-                                                         n_tokens, built.window, pad)
+                                                         n_tokens, eff_window, pad)
                     : llama_swa_calc_window_view(n_kv, n_tokens, built.window, pad);
                 GGML_ASSERT(built.active && view.engaged &&
                         "SWA window view must be engaged when KQ_mask_swa_win is present");
@@ -7110,9 +7146,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 const uint32_t pad = llama_kv_cache::get_padding(cparams.flash_attn);
                 const int64_t live = built.compacted
                     ? (int64_t) mask_kv_self.live_swa() + n_tokens : 0;
+                const uint32_t eff_window = built.compacted
+                    ? built.window * std::max<uint32_t>(1, mask_kv_self.n_seq_max_swa)
+                    : built.window;
                 const llama_swa_window_view view = built.compacted
                     ? llama_swa_calc_window_view_compact(live, mask_kv_self.sink_rows,
-                                                         n_tokens, built.window, pad)
+                                                         n_tokens, eff_window, pad)
                     : llama_swa_calc_window_view(n_kv, n_tokens, built.window, pad);
                 GGML_ASSERT(built.active && view.engaged &&
                         "SWA window view must be engaged when KQ_mask_swa_win is present");
@@ -7953,8 +7992,29 @@ static int llama_decode_internal(
                 }
             }
 
+            const bool is_dsv4 = llm_arch_is_dsv4(model.arch);
             if (can_check && any_diff && has_dup) {
-                n_tokens = 1;
+                // Split at the first sequence boundary instead of single tokens, so a
+                // multi-token prefill from one slot stays one ubatch. For DSV4 a mixed
+                // batch is only valid when each sequence appears once (decode shape) and
+                // the stream ids are contiguous; take the longest such prefix.
+                uint32_t run = 1;
+                while (run < n_tokens && batch_all.seq_id[cur_token + run][0] == first_seq_id) {
+                    ++run;
+                }
+                uint32_t best = run;
+                if (is_dsv4 && !has_dup && false) {
+                    llama_seq_id lo = first_seq_id, hi = first_seq_id;
+                    for (uint32_t i = 1; i < n_tokens; ++i) {
+                        const llama_seq_id s = batch_all.seq_id[cur_token + i][0];
+                        lo = std::min(lo, s);
+                        hi = std::max(hi, s);
+                        if ((uint32_t)(hi - lo + 1) == i + 1) {
+                            best = std::max(best, i + 1);
+                        }
+                    }
+                }
+                n_tokens = best;
                 if (!warned_qnext_mixed_repeat) {
                     LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch contains repeated seq_id values; falling back to single-token chunking\n", __func__);
                     warned_qnext_mixed_repeat = true;
@@ -9541,7 +9601,8 @@ static void llama_numa_cuda_pinning_gate(enum ggml_numa_strategy numa) {
         return; // distribute/split/isolate/numactl: no page migration, no conflict
     }
     const bool rep_bind_required = numa == GGML_NUMA_STRATEGY_EXPERT ||
-        (numa == GGML_NUMA_STRATEGY_MIRROR && getenv("GGML_NUMA_REPLICATE_SHARED") != nullptr);
+        numa == GGML_NUMA_STRATEGY_MIRROR ||
+        getenv("GGML_NUMA_REPLICATE_SHARED") != nullptr;
     if (!rep_bind_required) {
         // mirror-as-thread-binding only: pinning is legal, but the operator
         // should know the trade they walked into on the co-tenant box
@@ -9630,10 +9691,15 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
                                 : (numa == GGML_NUMA_STRATEGY_NUMACTL)    ? "numactl"
                                 : (numa == GGML_NUMA_STRATEGY_MIRROR)     ? "mirror"
                                 : "custom";
-        if (numa == GGML_NUMA_STRATEGY_DISTRIBUTE) {
-            // distribute used to log "verified per-node tensor placement" while only
-            // binding worker threads; actually place the pages now
+        if (numa == GGML_NUMA_STRATEGY_DISTRIBUTE || numa == GGML_NUMA_STRATEGY_MIRROR) {
+            // distribute and mirror install page-interleave baseline across NUMA nodes
             llama_numa_install_interleave(topo.size(), strat_name);
+        }
+        if (numa == GGML_NUMA_STRATEGY_MIRROR) {
+            const char * rep_env = getenv("GGML_NUMA_REPLICATE_SHARED");
+            if (!rep_env || (strcmp(rep_env, "0") != 0 && strcmp(rep_env, "false") != 0 && strcmp(rep_env, "no") != 0)) {
+                ggml::cpu::numa::set_numa_replicate_shared(true);
+            }
         }
         LLAMA_LOG_INFO("%s: --numa %s enabled across %zu NUMA nodes\n", __func__, strat_name, topo.size());
     }

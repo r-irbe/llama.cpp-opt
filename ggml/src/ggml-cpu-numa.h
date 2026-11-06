@@ -16,6 +16,15 @@ namespace ggml::cpu::numa {
 // Bind individual expert slices within a 3D tensor to NUMA nodes round-robin via mbind(MPOL_BIND)
 bool bind_tensor_experts_round_robin(struct ggml_tensor * tensor, int n_numa_nodes);
 
+// Bind individual expert slices within a 3D tensor to physical CPU sockets (e % n_sockets)
+// with MPOL_INTERLEAVE across all NUMA nodes belonging to that socket. This eliminates
+// cross-socket xGMI traffic while pooling all memory channels of the home socket per expert.
+bool bind_tensor_experts_socket_striped(struct ggml_tensor * tensor);
+int  get_tensor_expert_home_socket(const struct ggml_tensor * tensor, int expert_idx);
+int  get_tensor_expert_home_node(const struct ggml_tensor * tensor, int expert_idx);
+bool has_expert_socket_binding(const struct ggml_tensor * tensor);
+bool has_any_expert_binding();
+
 // Install a process-wide default memory policy, set_mempolicy(MPOL_INTERLEAVE), over the
 // given number of nodes. Every allocation made by this thread from now on -- and by every
 // thread it creates afterwards -- is then spread page-round-robin across those nodes.
@@ -105,6 +114,12 @@ bool bind_tensor_shared_interleaved(struct ggml_tensor * tensor, int n_numa_node
 // Returns the bytes successfully touched (0 on refusal/failure).
 size_t prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes, int n_threads);
 bool replicate_tensor_numa(struct ggml_tensor * tensor, int n_numa_nodes);
+// Replicate a tensor once per physical CPU socket (1 copy interleaved across each socket's
+// NUMA nodes), populating g_tensor_replicas[tensor][node] with that node's socket copy.
+// On a 2-socket NPS4 machine (8 nodes), this uses 2 copies (1x extra RAM) instead of 8
+// copies (7x extra RAM) while eliminating 100% of cross-socket xGMI traffic and pooling
+// all 4 memory controllers (8 DDR4 channels) within each socket.
+bool replicate_tensor_socket(struct ggml_tensor * tensor);
 void * get_tensor_numa_replica(const struct ggml_tensor * tensor, int node_id);
 void free_tensor_numa_replicas(const struct ggml_tensor * tensor);
 void free_all_numa_replicas();
@@ -117,8 +132,9 @@ bool has_tensor_replicas();
 size_t replica_hit_count();
 void reset_replica_hit_count();
 
-// NUMA node the calling thread is currently running on (-1 when unavailable).
+// NUMA node / physical socket the calling thread is currently running on (-1 when unavailable).
 int current_thread_numa_node();
+int current_thread_socket();
 
 // Translate a tensor-relative pointer to the calling thread's node-local replica.
 // Returns `ptr` unchanged when the tensor has no replicas, when the thread cannot
@@ -140,6 +156,16 @@ bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx);
 
 // C-compatible wrapper for binding expert tensor slices round-robin to NUMA nodes
 bool ggml_cpu_numa_bind_tensor_experts(struct ggml_tensor * tensor, int n_numa_nodes);
+bool ggml_cpu_numa_bind_tensor_experts_socket(struct ggml_tensor * tensor);
+int  ggml_cpu_numa_expert_home_socket(const struct ggml_tensor * tensor, int expert_idx);
+int  ggml_cpu_numa_expert_home_node(const struct ggml_tensor * tensor, int expert_idx);
+bool ggml_cpu_numa_has_expert_socket_binding(const struct ggml_tensor * tensor);
+bool ggml_cpu_numa_has_any_expert_binding(void);
+int  ggml_cpu_numa_socket_count(void);
+int  ggml_cpu_numa_node_count(void);
+int  ggml_cpu_numa_current_socket(void);
+int  ggml_cpu_numa_thread_socket(int thread_idx, int n_threads);
+int  ggml_cpu_numa_thread_node(int thread_idx, int n_threads);
 
 // C-compatible wrapper for installing the process-wide MPOL_INTERLEAVE default policy
 // (deterministic even placement of host tensors across NUMA nodes)
@@ -156,8 +182,9 @@ bool ggml_cpu_numa_bind_tensor_shared(struct ggml_tensor * tensor, int n_numa_no
 // MADV_POPULATE_READ prefault; returns bytes touched (see namespace wrapper)
 size_t ggml_cpu_numa_prefault_tensor_interleaved(struct ggml_tensor * tensor, int n_numa_nodes, int n_threads);
 
-// C-compatible wrapper for replicating shared tensors across NUMA nodes
+// C-compatible wrapper for replicating shared tensors across NUMA nodes or sockets
 bool ggml_cpu_numa_replicate_tensor(struct ggml_tensor * tensor, int n_numa_nodes);
+bool ggml_cpu_numa_replicate_tensor_socket(struct ggml_tensor * tensor);
 void * ggml_cpu_numa_get_tensor_replica(const struct ggml_tensor * tensor, int node_id);
 void ggml_cpu_numa_free_tensor_replicas(const struct ggml_tensor * tensor);
 void ggml_cpu_numa_free_all_replicas(void);
